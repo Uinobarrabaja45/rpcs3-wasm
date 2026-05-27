@@ -1,0 +1,121 @@
+.App {
+  text-align: center;
+}
+
+span.version {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  color: darkgray;
+  font-size: smaller;
+}
+
+/* FPS pill — translucent dark capsule with backdrop blur, safe-area-aware
+   positioning. Lives above the canvas via fixed positioning. */
+.fps-pill {
+  position: fixed;
+  top: max(12px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 6px 12px;
+  background-color: rgba(28, 28, 30, 0.55);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  color: white;
+  border-radius: 999px;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+               "Helvetica Neue", "Segoe UI", Roboto, sans-serif;
+  font-feature-settings: "tnum" 1, "ss01" 1;
+  font-variant-numeric: tabular-nums;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1;
+  z-index: 1100;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35),
+              inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+}
+
+.fps-pill__num {
+  font-variant-numeric: tabular-nums;
+  min-width: 1.6em;
+  text-align: right;
+}
+
+.fps-pill__label {
+  font-size: 11px;
+  font-weight: 500;
+  opacity: 0.7;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+canvas {
+  aspect-ratio: 16 / 9;
+  width: 100%
+}
+
+.global-row {
+  display: flex;
+}
+
+.global-column {
+  margin: 20px;
+  flex: 50%;
+}
+
+.controls-row {
+  display: flex;
+}
+
+.controls-column {
+  flex: 50%;
+}
+
+.boot-panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background-color: rgba(20, 20, 22, 0.85);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  color: white;
+  padding: 20px 24px;
+  border-radius: 12px;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  z-index: 1000;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+  min-width: 320px;
+  text-align: center;
+}
+
+.boot-panel h2 {
+  margin: 0 0 16px 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.boot-panel input[type="file"] {
+  margin: 8px 0;
+  color: white;
+}
+
+.boot-panel button {
+  margin: 4px;
+  padding: 8px 16px;
+  background: rgba(255, 255, 255, 0.1);
+  color: white;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.boot-panel button:hover {
+  background: rgba(255, 255, 255, 0.18);
+}

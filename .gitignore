@@ -126,3 +126,8 @@ CMakeUserPresets.json
 
 .cache/
 .lldbinit
+
+
+
+
+js/rpcs3_browser/node_modules

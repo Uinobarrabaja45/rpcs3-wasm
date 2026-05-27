@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "rpcs3-browser",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["start", "--prefix", "js/rpcs3_browser"],
+      "port": 3030
+    }
+  ]
+}
