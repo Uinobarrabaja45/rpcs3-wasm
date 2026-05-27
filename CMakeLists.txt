@@ -89,8 +89,15 @@ if(MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/MP>")
 endif()
 
-if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT EMSCRIPTEN)
     message(FATAL_ERROR "RPCS3 can only be compiled on 64-bit platforms.")
+endif()
+if(EMSCRIPTEN AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # WASM32 has 4-byte pointers — rpcs3 has 64-bit-pointer assumptions
+    # in places (intptr_t bit-stuffing, JIT code-emit). Tracked as Phase 3
+    # blockers in plan-poc-ps3-webgpu.md. To switch to 64-bit pointers
+    # configure with `-sMEMORY64=1` (experimental, Chrome-only).
+    message(WARNING "EMSCRIPTEN/WASM32 build — 64-bit guard bypassed; expect 32-bit-pointer assumption failures downstream.")
 endif()
 
 if(APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")

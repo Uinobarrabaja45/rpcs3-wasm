@@ -25,12 +25,27 @@ set(RPCS3_JS_SOURCES
     Rpcs3VmJs.h
     InputProviderEmscripten.cpp
     InputProviderEmscripten.h
+    JsDiscBridge.cpp
+    JsDiscBridge.h
 )
 if(ENABLE_WEBGPU)
     list(APPEND RPCS3_JS_SOURCES GSH_WebGPUJs.cpp GSH_WebGPUJs.h)
 endif()
 
+# Phase 3 only: the fs::file_base subclass needs emucore headers
+# (Utilities/File.h pulls util/atomic.hpp etc.). Skipped in the
+# standalone scaffold so JsDiscBridge can still be smoke-tested
+# without linking the full emucore. Flip HAS_EMUCORE=ON when linking
+# the emucore static lib (Phase 3).
+option(HAS_EMUCORE "Link the rpcs3 emucore into the WASM target" OFF)
+if(HAS_EMUCORE)
+    list(APPEND RPCS3_JS_SOURCES JsDiscFile.cpp JsDiscFile.h)
+endif()
+
 add_executable(Rpcs3 ${RPCS3_JS_SOURCES})
+if(HAS_EMUCORE)
+    target_compile_definitions(Rpcs3 PRIVATE HAS_EMUCORE)
+endif()
 # build_wasm.sh rewrites OUTPUT_NAME and -sEXPORT_NAME per-variant.
 set_target_properties(Rpcs3 PROPERTIES OUTPUT_NAME "Rpcs3Dyna")
 
@@ -77,6 +92,12 @@ if(GSH_WEBGPU_VERBOSE_LOG)
 endif()
 
 target_link_options(Rpcs3 PRIVATE "-sEXPORT_NAME=Rpcs3Dyna")
+# -pthread must be set at COMPILE time too (not just link) — otherwise
+# std::thread silently runs the callable inline on the calling thread,
+# which deadlocks any worker that needs MAIN_THREAD_EM_ASM to proxy
+# back to main (Phase 2 disc-bridge diagnostic, every future worker).
+target_compile_options(Rpcs3 PRIVATE "-pthread")
+target_link_options(Rpcs3 PRIVATE "-pthread")
 target_link_options(Rpcs3 PRIVATE "-sPTHREAD_POOL_SIZE=4")
 target_link_options(Rpcs3 PRIVATE "-sWASM_BIGINT")
 target_link_options(Rpcs3 PRIVATE "-sOFFSCREEN_FRAMEBUFFER=1")

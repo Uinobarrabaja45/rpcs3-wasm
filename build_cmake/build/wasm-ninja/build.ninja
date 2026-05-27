@@ -53,7 +53,7 @@ build CMakeFiles/Rpcs3.dir/Main.cpp.o: CXX_COMPILER__Rpcs3_unscanned_Release /Us
   CONFIG = Release
   DEFINES = -DGSH_WEBGPU_VERBOSE_LOG=1 -DHAS_WEBGPU
   DEP_FILE = CMakeFiles/Rpcs3.dir/Main.cpp.o.d
-  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu
+  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu -pthread
   OBJECT_DIR = CMakeFiles/Rpcs3.dir
   OBJECT_FILE_DIR = CMakeFiles/Rpcs3.dir
 
@@ -61,7 +61,7 @@ build CMakeFiles/Rpcs3.dir/Rpcs3VmJs.cpp.o: CXX_COMPILER__Rpcs3_unscanned_Releas
   CONFIG = Release
   DEFINES = -DGSH_WEBGPU_VERBOSE_LOG=1 -DHAS_WEBGPU
   DEP_FILE = CMakeFiles/Rpcs3.dir/Rpcs3VmJs.cpp.o.d
-  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu
+  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu -pthread
   OBJECT_DIR = CMakeFiles/Rpcs3.dir
   OBJECT_FILE_DIR = CMakeFiles/Rpcs3.dir
 
@@ -69,7 +69,15 @@ build CMakeFiles/Rpcs3.dir/InputProviderEmscripten.cpp.o: CXX_COMPILER__Rpcs3_un
   CONFIG = Release
   DEFINES = -DGSH_WEBGPU_VERBOSE_LOG=1 -DHAS_WEBGPU
   DEP_FILE = CMakeFiles/Rpcs3.dir/InputProviderEmscripten.cpp.o.d
-  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu
+  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu -pthread
+  OBJECT_DIR = CMakeFiles/Rpcs3.dir
+  OBJECT_FILE_DIR = CMakeFiles/Rpcs3.dir
+
+build CMakeFiles/Rpcs3.dir/JsDiscBridge.cpp.o: CXX_COMPILER__Rpcs3_unscanned_Release /Users/bank23232525/Documents/works/emu/rpcs3/rpcs3/ui_js/JsDiscBridge.cpp || cmake_object_order_depends_target_Rpcs3
+  CONFIG = Release
+  DEFINES = -DGSH_WEBGPU_VERBOSE_LOG=1 -DHAS_WEBGPU
+  DEP_FILE = CMakeFiles/Rpcs3.dir/JsDiscBridge.cpp.o.d
+  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu -pthread
   OBJECT_DIR = CMakeFiles/Rpcs3.dir
   OBJECT_FILE_DIR = CMakeFiles/Rpcs3.dir
 
@@ -77,7 +85,7 @@ build CMakeFiles/Rpcs3.dir/GSH_WebGPUJs.cpp.o: CXX_COMPILER__Rpcs3_unscanned_Rel
   CONFIG = Release
   DEFINES = -DGSH_WEBGPU_VERBOSE_LOG=1 -DHAS_WEBGPU
   DEP_FILE = CMakeFiles/Rpcs3.dir/GSH_WebGPUJs.cpp.o.d
-  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu
+  FLAGS = -Oz -std=gnu++23 --use-port=emdawnwebgpu -pthread
   OBJECT_DIR = CMakeFiles/Rpcs3.dir
   OBJECT_FILE_DIR = CMakeFiles/Rpcs3.dir
 
@@ -89,10 +97,10 @@ build CMakeFiles/Rpcs3.dir/GSH_WebGPUJs.cpp.o: CXX_COMPILER__Rpcs3_unscanned_Rel
 #############################################
 # Link the executable Rpcs31024.js
 
-build Rpcs31024.js: CXX_EXECUTABLE_LINKER__Rpcs3_Release CMakeFiles/Rpcs3.dir/Main.cpp.o CMakeFiles/Rpcs3.dir/Rpcs3VmJs.cpp.o CMakeFiles/Rpcs3.dir/InputProviderEmscripten.cpp.o CMakeFiles/Rpcs3.dir/GSH_WebGPUJs.cpp.o
+build Rpcs31024.js: CXX_EXECUTABLE_LINKER__Rpcs3_Release CMakeFiles/Rpcs3.dir/Main.cpp.o CMakeFiles/Rpcs3.dir/Rpcs3VmJs.cpp.o CMakeFiles/Rpcs3.dir/InputProviderEmscripten.cpp.o CMakeFiles/Rpcs3.dir/JsDiscBridge.cpp.o CMakeFiles/Rpcs3.dir/GSH_WebGPUJs.cpp.o
   CONFIG = Release
   FLAGS = -Oz
-  LINK_FLAGS = --bind -sMODULARIZE=1 -sEXPORT_ES6=1 "-sEXPORTED_FUNCTIONS=['_main','_initVm','_initVmWebGPU','_recreateWebGPUDevice']" "-sEXPORTED_RUNTIME_METHODS=['ccall','FS','HEAP8','HEAPU8','HEAP32','HEAPF32','WebGPU']" -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sALLOW_MEMORY_GROWTH=0 -sINITIAL_MEMORY=1073741824 -sEXPORT_NAME=Rpcs31024 -sPTHREAD_POOL_SIZE=4 -sWASM_BIGINT -sOFFSCREEN_FRAMEBUFFER=1 -sENVIRONMENT=web,worker -sUSE_WEBGL2=1 --use-port=emdawnwebgpu
+  LINK_FLAGS = --bind -sMODULARIZE=1 -sEXPORT_ES6=1 "-sEXPORTED_FUNCTIONS=['_main','_initVm','_initVmWebGPU','_recreateWebGPUDevice']" "-sEXPORTED_RUNTIME_METHODS=['ccall','FS','HEAP8','HEAPU8','HEAP32','HEAPF32','WebGPU']" -sFORCE_FILESYSTEM -sALLOW_TABLE_GROWTH -sALLOW_MEMORY_GROWTH=0 -sINITIAL_MEMORY=1073741824 -sEXPORT_NAME=Rpcs31024 -pthread -sPTHREAD_POOL_SIZE=4 -sWASM_BIGINT -sOFFSCREEN_FRAMEBUFFER=1 -sENVIRONMENT=web,worker -sUSE_WEBGL2=1 --use-port=emdawnwebgpu
   OBJECT_DIR = CMakeFiles/Rpcs3.dir
   POST_BUILD = :
   PRE_LINK = :

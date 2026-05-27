@@ -18,6 +18,10 @@
 // Usage:
 //   node capture_screenshot.js <game_key> <output_name.png>
 //   node capture_screenshot.js <game_key> <output_name.png> "ram=1024&webgpu=true"
+//   node capture_screenshot.js <game_key> <output_name.png> "ram=1024" "JsDiscBridge: read"
+//   (the 4th arg overrides the default trigger list with a single
+//    substring — capture fires when that substring first appears in a
+//    browser console message)
 //
 // Output path follows Play!'s convention — written to
 // /Users/bank23232525/.gemini/antigravity/scratch/<output_name>.
@@ -36,11 +40,21 @@ if (!game || !outputName) {
 }
 
 const extraParams = process.argv[4] ? `&${process.argv[4]}` : '';
+const customTrigger = process.argv[5] || null;
+// Optional 6th arg = URL mode: "compare" → /?compare=<game> instead of
+// the default /?loadFixedRom=true&game=<game>. The compare URL renders
+// the side-by-side iframe (live WebGPU left, reference image right),
+// which is what the user actually sees when reviewing the POC; the
+// loadFixedRom URL is the single-pane direct view used for automated
+// boot tests.
+const urlMode = process.argv[6] || null;
 // The autoboot path: ?loadFixedRom=true picks the game's rom file from
 // Games.ts (default key: 'demons' → TERRARIA → terraria.iso) and fetches
 // it from http://localhost:8008. Run a static server in your ROM dir
 // before invoking this script (see App.tsx's FIXED_ROM_BASE comment).
-const targetUrl = `http://localhost:3030/?loadFixedRom=true&game=${game}&ignore_log=false&autoInit=true${extraParams}`;
+const targetUrl = urlMode === 'compare'
+    ? `http://localhost:3030/?compare=${game}${extraParams}`
+    : `http://localhost:3030/?loadFixedRom=true&game=${game}&ignore_log=false&autoInit=true${extraParams}`;
 const screenshotPath = path.join('/Users/bank23232525/.gemini/antigravity/scratch', outputName);
 
 console.log(`Target Game: ${game}`);
@@ -84,9 +98,14 @@ function getWsUrl(retries = 30) {
         res.on('end', () => {
             try {
                 const list = JSON.parse(data);
-                // Match on the URL substring — `?loadFixedRom=true&game=<game>`
-                // is uniquely ours, won't collide with any other tab.
-                const target = list.find(t => t.url.includes('game=' + game));
+                // Match on the URL substring — the param we care about
+                // depends on URL mode: compare=<game> for the split-screen
+                // view, game=<game> for the single-pane autoboot. Either
+                // way the game key uniquely identifies our tab.
+                const matchSubstr = urlMode === 'compare'
+                    ? ('compare=' + game)
+                    : ('game=' + game);
+                const target = list.find(t => t.url.includes(matchSubstr));
                 if (target && target.webSocketDebuggerUrl) {
                     console.log('Found target page. WebSocket URL:', target.webSocketDebuggerUrl);
                     connectToDebugger(target.webSocketDebuggerUrl);
@@ -137,16 +156,22 @@ function connectToDebugger(wsUrl) {
                 console.log(`[BROWSER CONSOLE ${type}] ${args}`);
 
                 // Capture-trigger candidates (any of these means the boot
-                // has progressed far enough to be worth snapshotting):
-                //   - "loaded ROM"           — from Actions.ts bootFile.fulfilled
-                //   - "BootDiscImage"        — from Rpcs3VmJs.cpp printf stub
-                //   - "initVmWebGPU completed" — proves the WebGPU surface is up
-                //                               (useful even if no ROM loaded)
-                const triggers = [
-                    'loaded ROM',
-                    'BootDiscImage',
-                    'initVmWebGPU completed',
-                ];
+                // has progressed far enough to be worth snapshotting).
+                // Ordered roughly "latest milestone first" — the FIRST
+                // match wins, so listing later phases earlier means the
+                // capture waits for them when the build has progressed.
+                //   - "JsDiscBridge: read"     — Phase 2 bridge proved bytes round-trip
+                //   - "loaded ROM"             — Actions.ts bootFile.fulfilled
+                //   - "BootDiscImage"          — Rpcs3VmJs.cpp printf
+                //   - "initVmWebGPU completed" — WebGPU surface up (Phase 0/1 baseline)
+                const triggers = customTrigger
+                    ? [customTrigger]
+                    : [
+                          'JsDiscBridge: read',
+                          'loaded ROM',
+                          'BootDiscImage',
+                          'initVmWebGPU completed',
+                      ];
                 if (!captured && triggers.some(t => args.includes(t))) {
                     captured = true;
                     console.log('Detected boot trigger. Capturing screenshot in 1500ms...');

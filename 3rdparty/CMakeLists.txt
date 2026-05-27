@@ -51,7 +51,12 @@ else()
 endif()
 
 # libusb
-if(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
+# EMSCRIPTEN: no USB pass-through in the browser. Provide an empty
+# INTERFACE target so the Emu and ui_js targets link without changes.
+# Tracked in plan-poc-ps3-webgpu.md §4 (build infra: emcc-incompatible deps).
+if(EMSCRIPTEN)
+	add_library(usb-1.0-shared INTERFACE)
+elseif(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
 	pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0>=1.0 )
 	cmake_dependent_option(USE_SYSTEM_LIBUSB "Use system libusb-1.0 as shared library" ON
 			"LIBUSB_FOUND" OFF)
@@ -60,7 +65,9 @@ else()
 	cmake_dependent_option(USE_SYSTEM_LIBUSB "Use system libusb-1.0 as shared library" OFF
 			"LIBUSB_FOUND" OFF)
 endif()
-if(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
+if(EMSCRIPTEN)
+	# already added empty INTERFACE target above
+elseif(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
 	# Always use system libusb as reference implementation isn't supported
 	add_library(usb-1.0-shared INTERFACE)
 	target_link_libraries(usb-1.0-shared INTERFACE PkgConfig::LIBUSB)
@@ -86,7 +93,14 @@ endif()
 
 
 # hidapi
-add_subdirectory(hidapi)
+if(EMSCRIPTEN)
+	# No HID device access in the browser; stub for link parity. Same
+	# rationale as the libusb stub above — Phase 3 build infra.
+	add_library(3rdparty_hidapi INTERFACE)
+	add_library(3rdparty::hidapi ALIAS 3rdparty_hidapi)
+else()
+	add_subdirectory(hidapi)
+endif()
 
 # glslang
 add_subdirectory(glslang EXCLUDE_FROM_ALL)
@@ -97,7 +111,7 @@ add_subdirectory(yaml-cpp)
 
 # OpenGL
 
-if (NOT ANDROID AND NOT APPLE)
+if (NOT ANDROID AND NOT APPLE AND NOT EMSCRIPTEN)
 	find_package(OpenGL REQUIRED OPTIONAL_COMPONENTS EGL)
 
 	add_library(3rdparty_opengl INTERFACE)
@@ -134,7 +148,14 @@ else()
 endif()
 
 # SoundTouch
-add_subdirectory(SoundTouch EXCLUDE_FROM_ALL)
+if(EMSCRIPTEN)
+	# SoundTouch's SSE-optimized path tries to include wasm_simd128.h with
+	# the wrong gating; we don't need pitch/tempo audio processing in the
+	# browser POC anyway. Stub it.
+	add_library(soundtouch INTERFACE)
+else()
+	add_subdirectory(SoundTouch EXCLUDE_FROM_ALL)
+endif()
 
 # libevdev
 set(LIBEVDEV_TARGET 3rdparty_dummy_lib)
@@ -278,7 +299,7 @@ set_property(TARGET ${FAUDIO_TARGET} PROPERTY FOLDER "3rdparty/")
 
 
 # FFMPEG
-if(NOT ANDROID)
+if(NOT ANDROID AND NOT EMSCRIPTEN)
 	add_library(3rdparty_ffmpeg INTERFACE)
 
 	# Select the version of ffmpeg to use, default is builtin
@@ -323,29 +344,63 @@ endif()
 
 # GLEW
 add_library(3rdparty_glew INTERFACE)
-if(NOT MSVC AND NOT ANDROID AND NOT APPLE)
+if(NOT MSVC AND NOT ANDROID AND NOT APPLE AND NOT EMSCRIPTEN)
 	find_package(GLEW REQUIRED)
 	target_link_libraries(3rdparty_glew INTERFACE GLEW::GLEW)
 endif()
 
 
-# LLVM
-add_subdirectory(llvm EXCLUDE_FROM_ALL)
+# EMSCRIPTEN: bypass third-party libs that don't build under emcc.
+# Each empty INTERFACE target preserves the link line for the rest of
+# the build; the corresponding functionality is stubbed/disabled.
+# Tracked in plan-poc-ps3-webgpu.md §4 (build infra).
+if(EMSCRIPTEN)
+	add_library(3rdparty_llvm INTERFACE)
+	add_library(3rdparty_wolfssl INTERFACE)
+	add_library(3rdparty::wolfssl ALIAS 3rdparty_wolfssl)
+	add_library(3rdparty_libcurl INTERFACE)
+	add_library(3rdparty::libcurl ALIAS 3rdparty_libcurl)
+	add_library(3rdparty_miniupnpc INTERFACE)
+	add_library(3rdparty::miniupnpc ALIAS 3rdparty_miniupnpc)
+	add_library(3rdparty_rtmidi INTERFACE)
+	add_library(3rdparty::rtmidi ALIAS 3rdparty_rtmidi)
+	add_library(3rdparty_opencv INTERFACE)
+	add_library(3rdparty::opencv ALIAS 3rdparty_opencv)
 
-# WOLFSSL
-add_subdirectory(wolfssl EXCLUDE_FROM_ALL)
+	# Header-only stubs to satisfy compile of files that #include the
+	# real deps. Bodies don't exist here; link will fail with undefined
+	# symbols until either the source is #ifdef-guarded or stub .cpp
+	# implementations are added. See _emscripten_stubs/include/ for the
+	# header shapes and 3rdparty/_emscripten_stubs/CMakeLists.txt (TODO)
+	# for the planned implementations.
+	target_include_directories(usb-1.0-shared INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/_emscripten_stubs/include")
+	target_include_directories(soundtouch    INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/_emscripten_stubs/include")
+	target_include_directories(3rdparty_miniupnpc INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/_emscripten_stubs/include")
+	target_include_directories(3rdparty_libcurl   INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/_emscripten_stubs/include")
+	target_include_directories(3rdparty_rtmidi    INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/_emscripten_stubs/include")
+	target_include_directories(3rdparty_wolfssl   INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/_emscripten_stubs/include")
+	# execinfo.h is included unguarded as <execinfo.h> from a few files;
+	# expose the stub dir through a target everyone already links.
+	target_include_directories(3rdparty_dummy_lib INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/_emscripten_stubs/include")
+else()
+	# LLVM
+	add_subdirectory(llvm EXCLUDE_FROM_ALL)
 
-# CURL
-add_subdirectory(curl EXCLUDE_FROM_ALL)
+	# WOLFSSL
+	add_subdirectory(wolfssl EXCLUDE_FROM_ALL)
 
-# MINIUPNP
-add_subdirectory(miniupnp EXCLUDE_FROM_ALL)
+	# CURL
+	add_subdirectory(curl EXCLUDE_FROM_ALL)
 
-# RTMIDI
-add_subdirectory(rtmidi EXCLUDE_FROM_ALL)
+	# MINIUPNP
+	add_subdirectory(miniupnp EXCLUDE_FROM_ALL)
 
-# OPENCV
-add_subdirectory(opencv EXCLUDE_FROM_ALL)
+	# RTMIDI
+	add_subdirectory(rtmidi EXCLUDE_FROM_ALL)
+
+	# OPENCV
+	add_subdirectory(opencv EXCLUDE_FROM_ALL)
+endif()
 
 # FUSION
 add_subdirectory(fusion EXCLUDE_FROM_ALL)
@@ -354,35 +409,75 @@ add_subdirectory(fusion EXCLUDE_FROM_ALL)
 add_subdirectory(feralinteractive EXCLUDE_FROM_ALL)
 
 # add nice ALIAS targets for ease of use
-if(USE_SYSTEM_LIBUSB)
+if(EMSCRIPTEN)
+	# Most concrete targets already exist via add_subdirectory calls or
+	# the "USE_X=OFF → INTERFACE stub" branches earlier in this file
+	# (3rdparty_vulkan at line ~201, 3rdparty_libevdev at line ~158,
+	# 3rdparty_openal at line ~252, 3rdparty_sdl3, soundtouch from its
+	# subdir, discord-rpc from its subdir, etc.). Only stub the ones the
+	# EMSCRIPTEN-specific guards above made disappear: ffmpeg, FAudio,
+	# discordRPC if discord-rpc subdir fails, etc.
+	# Source still #includes <libavutil/pixfmt.h>; expose the include dir
+	# from 3rdparty/ffmpeg/include (the headers ship in-tree even though
+	# the prebuilt libs don't).
+	add_library(3rdparty_ffmpeg INTERFACE)
+	target_include_directories(3rdparty_ffmpeg INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg/include")
+	# Aliases — use stable names regardless of which concrete target
+	# variant was selected by the if/else above.
 	add_library(3rdparty::libusb ALIAS usb-1.0-shared)
+	add_library(3rdparty::llvm ALIAS 3rdparty_llvm)
+	add_library(3rdparty::zlib ALIAS 3rdparty_zlib)
+	add_library(3rdparty::zstd ALIAS 3rdparty_zstd)
+	add_library(3rdparty::7zip ALIAS 3rdparty_7zip)
+	add_library(3rdparty::protobuf ALIAS 3rdparty_protobuf)
+	add_library(3rdparty::pugixml ALIAS pugixml)
+	add_library(3rdparty::glslang ALIAS 3rdparty_glslang)
+	add_library(3rdparty::yaml-cpp ALIAS yaml-cpp)
+	add_library(3rdparty::libpng ALIAS ${LIBPNG_TARGET})
+	add_library(3rdparty::opengl ALIAS 3rdparty_opengl)
+	add_library(3rdparty::stblib ALIAS 3rdparty_stblib)
+	add_library(3rdparty::ffmpeg ALIAS 3rdparty_ffmpeg)
+	add_library(3rdparty::glew ALIAS 3rdparty_glew)
+	add_library(3rdparty::discordRPC ALIAS 3rdparty_discordRPC)
+	add_library(3rdparty::faudio ALIAS ${FAUDIO_TARGET})
+	add_library(3rdparty::libevdev ALIAS ${LIBEVDEV_TARGET})
+	add_library(3rdparty::vulkan ALIAS ${VULKAN_TARGET})
+	add_library(3rdparty::openal ALIAS 3rdparty_openal)
+	add_library(3rdparty::soundtouch ALIAS soundtouch)
+	add_library(3rdparty::sdl3 ALIAS ${SDL3_TARGET})
+	add_library(3rdparty::fusion ALIAS Fusion)
+	add_library(3rdparty::feralinteractive ALIAS 3rdparty_feralinteractive)
 else()
-	add_library(3rdparty::libusb ALIAS usb-1.0-static)
+	if(USE_SYSTEM_LIBUSB)
+		add_library(3rdparty::libusb ALIAS usb-1.0-shared)
+	else()
+		add_library(3rdparty::libusb ALIAS usb-1.0-static)
+	endif()
+	add_library(3rdparty::zlib ALIAS 3rdparty_zlib)
+	add_library(3rdparty::zstd ALIAS 3rdparty_zstd)
+	add_library(3rdparty::7zip ALIAS 3rdparty_7zip)
+	add_library(3rdparty::protobuf ALIAS 3rdparty_protobuf)
+	add_library(3rdparty::pugixml ALIAS pugixml)
+	add_library(3rdparty::glslang ALIAS 3rdparty_glslang)
+	add_library(3rdparty::yaml-cpp ALIAS yaml-cpp)
+	add_library(3rdparty::hidapi ALIAS 3rdparty_hidapi)
+	add_library(3rdparty::libpng ALIAS ${LIBPNG_TARGET})
+	add_library(3rdparty::opengl ALIAS 3rdparty_opengl)
+	add_library(3rdparty::stblib ALIAS 3rdparty_stblib)
+	add_library(3rdparty::discordRPC ALIAS 3rdparty_discordRPC)
+	add_library(3rdparty::faudio ALIAS ${FAUDIO_TARGET})
+	add_library(3rdparty::libevdev ALIAS ${LIBEVDEV_TARGET})
+	add_library(3rdparty::vulkan ALIAS ${VULKAN_TARGET})
+	add_library(3rdparty::openal ALIAS 3rdparty_openal)
+	add_library(3rdparty::ffmpeg ALIAS 3rdparty_ffmpeg)
+	add_library(3rdparty::glew ALIAS 3rdparty_glew)
+	add_library(3rdparty::wolfssl ALIAS wolfssl)
+	add_library(3rdparty::libcurl ALIAS 3rdparty_libcurl)
+	add_library(3rdparty::soundtouch ALIAS soundtouch)
+	add_library(3rdparty::sdl3 ALIAS ${SDL3_TARGET})
+	add_library(3rdparty::miniupnpc ALIAS 3rdparty_miniupnpc)
+	add_library(3rdparty::rtmidi ALIAS rtmidi)
+	add_library(3rdparty::opencv ALIAS ${OPENCV_TARGET})
+	add_library(3rdparty::fusion ALIAS Fusion)
+	add_library(3rdparty::feralinteractive ALIAS 3rdparty_feralinteractive)
 endif()
-add_library(3rdparty::zlib ALIAS 3rdparty_zlib)
-add_library(3rdparty::zstd ALIAS 3rdparty_zstd)
-add_library(3rdparty::7zip ALIAS 3rdparty_7zip)
-add_library(3rdparty::protobuf ALIAS 3rdparty_protobuf)
-add_library(3rdparty::pugixml ALIAS pugixml)
-add_library(3rdparty::glslang ALIAS 3rdparty_glslang)
-add_library(3rdparty::yaml-cpp ALIAS yaml-cpp)
-add_library(3rdparty::hidapi ALIAS 3rdparty_hidapi)
-add_library(3rdparty::libpng ALIAS ${LIBPNG_TARGET})
-add_library(3rdparty::opengl ALIAS 3rdparty_opengl)
-add_library(3rdparty::stblib ALIAS 3rdparty_stblib)
-add_library(3rdparty::discordRPC ALIAS 3rdparty_discordRPC)
-add_library(3rdparty::faudio ALIAS ${FAUDIO_TARGET})
-add_library(3rdparty::libevdev ALIAS ${LIBEVDEV_TARGET})
-add_library(3rdparty::vulkan ALIAS ${VULKAN_TARGET})
-add_library(3rdparty::openal ALIAS 3rdparty_openal)
-add_library(3rdparty::ffmpeg ALIAS 3rdparty_ffmpeg)
-add_library(3rdparty::glew ALIAS 3rdparty_glew)
-add_library(3rdparty::wolfssl ALIAS wolfssl)
-add_library(3rdparty::libcurl ALIAS 3rdparty_libcurl)
-add_library(3rdparty::soundtouch ALIAS soundtouch)
-add_library(3rdparty::sdl3 ALIAS ${SDL3_TARGET})
-add_library(3rdparty::miniupnpc ALIAS 3rdparty_miniupnpc)
-add_library(3rdparty::rtmidi ALIAS rtmidi)
-add_library(3rdparty::opencv ALIAS ${OPENCV_TARGET})
-add_library(3rdparty::fusion ALIAS Fusion)
-add_library(3rdparty::feralinteractive ALIAS 3rdparty_feralinteractive)

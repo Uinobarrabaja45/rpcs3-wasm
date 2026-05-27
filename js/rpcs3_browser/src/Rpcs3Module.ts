@@ -314,15 +314,19 @@ export let initRpcs3Module = async function () {
             throw new Error('Neither initVmWebGPU nor initVm exported — WASM build is incomplete');
         }
 
-        // Upload a reference image as the "rendered output" — POC stand-in
-        // for the not-yet-written RSX → WebGPU translator. Driven by
-        // ?game=<key> (the same param Compare.tsx and the fixed-ROM auto-
-        // boot use); fetches GAMES[key].ref from PUBLIC_URL, decodes via
-        // ImageBitmap → 2D canvas → RGBA bytes, and hands them to the
-        // C++ side via setReferenceTexture. Fire-and-forget — failure
-        // doesn't block the rest of init, the canvas just falls back to
-        // the animated clear color.
-        if (useWebGPU && typeof Rpcs3Module.setReferenceTexture === 'function') {
+        // Reference-image upload — POC visual stand-in that uploads a
+        // PNG via setReferenceTexture and draws it via the fullscreen
+        // textured-quad pipeline. This is the "Phase 1 cheat" called out
+        // in plan-poc-ps3-webgpu.md: it makes the compare view show
+        // visual parity *before* real emulation exists.
+        //
+        // Now OPT-IN — gated behind ?cheatTexture=true so the default
+        // compare view shows the honest pre-emulation state (animated
+        // clear color from CGSH_WebGPUJs::Render's else-branch) and only
+        // dev workflows that explicitly want the placeholder enable it.
+        // ?refImage=<path> still works for one-off diagnostic uploads.
+        const cheatTexture = new URLSearchParams(window.location.search).get('cheatTexture') === 'true';
+        if (useWebGPU && typeof Rpcs3Module.setReferenceTexture === 'function' && cheatTexture) {
             const gameKey = new URLSearchParams(window.location.search).get('game');
             const refPath = new URLSearchParams(window.location.search).get('refImage');
             let imageUrl: string | null = null;
