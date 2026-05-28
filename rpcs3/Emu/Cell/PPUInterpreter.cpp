@@ -6814,6 +6814,22 @@ auto UNK()
 				return hle_funcs[index](ppu, op, this_op, nullptr);
 			}
 
+#if defined(__EMSCRIPTEN__)
+			// wasm32: BIND_FUNC's `cia += 4` after an HLE function returns
+			// from within the HLE region lands the thread at the *next* OPD
+			// address (cia % 8 == 0). With `-fno-exceptions` the throw below
+			// lowers to `unreachable` and kills the worker. For HLE-region
+			// addresses, that's the natural "thread finished its HLE entry"
+			// signal — set ret/stop so the cpu_task loop exits cleanly.
+			const u32 hle_base = g_fxo->get<ppu_function_manager>().addr;
+			if (hle_base && ppu.cia >= hle_base && index < hle_funcs.size())
+			{
+				ppu_log.notice("UNK in HLE region (cia=0x%x op=0x%08x) — wasm32 clean exit", ppu.cia, op.opcode);
+				ppu.state += cpu_flag::ret;
+				return;
+			}
+#endif
+
 			fmt::throw_exception("Unknown/Illegal opcode: 0x%08x at 0x%x", op.opcode, ppu.cia);
 		};
 	}

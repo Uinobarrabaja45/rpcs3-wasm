@@ -56,9 +56,12 @@ function Compare({ game }: { game: string }) {
   // lookups. `sel` is what we forward to the live iframe via ?game=.
   const sel = GAMES[game] ? game : 'terraria';
   const info = GAMES[sel] ?? getRunnableGame(null);
-  // ram=1024: the stable fixed-heap build. ram=dyna creeps up over a long
-  // soak session and eventually wedges the page — the compare view is
-  // exactly the soaking scenario, so use the fixed-size build.
+  // ram=2048: post-#45 default. The wasm32 vm layer pre-reserves a
+  // 1.5 GiB g_base_addr at static-init, so the 1024 build would OOM
+  // before BootGame even runs. 2048 keeps a comfortable margin and
+  // MAXIMUM_MEMORY=4 GiB is the actual hard cap. ram=dyna creeps up over
+  // a long soak session and eventually wedges the page — the compare view
+  // is exactly that soaking scenario, so stay on a fixed-size build.
   const urlParams = new URLSearchParams(window.location.search);
   const waitMsParam = urlParams.get('waitMs');
   // loadFixedRom=true makes App.tsx fetch the game's ROM from
@@ -68,7 +71,7 @@ function Compare({ game }: { game: string }) {
   // compare view so the left pane shows live emulation without a manual
   // file pick.
   const liveUrl =
-    `${process.env.PUBLIC_URL}/?ram=1024&webgpu=true&ignore_log=false` +
+    `${process.env.PUBLIC_URL}/?ram=2048&webgpu=true&ignore_log=false` +
     `&autoInit=true&mute=true&loadFixedRom=true&game=${sel}` +
     (waitMsParam ? `&waitMs=${waitMsParam}` : '');
   const referenceImage = `${process.env.PUBLIC_URL}/${info.ref}`;

@@ -7,6 +7,10 @@
 #include <thread>
 #include <string>
 
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+#include <pthread.h>
+#endif
+
 // Hardware core layout
 enum class native_core_arrangement : u32
 {
@@ -127,6 +131,17 @@ public:
 #endif
 
 	const native_entry entry_point;
+
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+	// wasm32: native_entry above points at a shared C trampoline (we
+	// can't JIT per-thread asm). The real per-Context entry is stored
+	// here and the C trampoline reads it. Public so the trampoline
+	// (free function) can access without friending the world.
+	u64 (*emcc_entry)(thread_base*) = nullptr;
+	// Public accessor so the free-function trampoline can read the
+	// thread name for diagnostic logging without friending it.
+	shared_ptr<std::string> get_name_ptr() const { return m_tname.load(); }
+#endif
 
 	// Set name for debugger
 	static void set_name(std::string name);
@@ -483,6 +498,19 @@ class named_thread final : public Context, result_storage<Context>, thread_base
 
 	u64 entry_point2()
 	{
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+		{
+			auto sp = static_cast<thread_base*>(this)->get_name_ptr();
+			const char* nm = (sp && !sp->empty()) ? sp->c_str() : "<unnamed>";
+			// pthread_self() lets us correlate this thread with the
+			// "Pthread 0x... sent an error!" lines Emscripten prints when
+			// a worker traps — without it, we can't tell which named
+			// thread the crashing pthread ID belonged to.
+			printf("[named_thread::entry_point2] start name='%s' this=%p pthread=%p\n",
+				nm, static_cast<void*>(this),
+				reinterpret_cast<void*>(static_cast<uintptr_t>(pthread_self())));
+		}
+#endif
 		while (u32 value = stx::g_launch_retainer)
 		{
 			stx::g_launch_retainer.wait(value);
@@ -497,6 +525,15 @@ class named_thread final : public Context, result_storage<Context>, thread_base
 			}
 		});
 
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+		{
+			auto sp = static_cast<thread_base*>(this)->get_name_ptr();
+			const char* nm = (sp && !sp->empty()) ? sp->c_str() : "<unnamed>";
+			printf("[named_thread::entry_point2] about-to-op name='%s' pthread=%p\n",
+				nm,
+				reinterpret_cast<void*>(static_cast<uintptr_t>(pthread_self())));
+		}
+#endif
 		if constexpr (result::empty)
 		{
 			// No result
@@ -518,6 +555,13 @@ class named_thread final : public Context, result_storage<Context>, thread_base
 			// Construct the result using placement new (copy elision should happen)
 			new (result::_get()) decltype(auto)(Context::operator()());
 		}
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+		{
+			auto sp = static_cast<thread_base*>(this)->get_name_ptr();
+			const char* nm = (sp && !sp->empty()) ? sp->c_str() : "<unnamed>";
+			printf("[named_thread::entry_point2] post-op name='%s'\n", nm);
+		}
+#endif
 
 		return thread::finalize(thread_state::finished);
 	}

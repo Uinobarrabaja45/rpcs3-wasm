@@ -216,17 +216,17 @@ function connectToDebugger(wsUrl) {
     setTimeout(() => {
         if (!captured) {
             captured = true;
-            console.log('No trigger seen in 60s — capturing whatever is on screen.');
+            console.log('No trigger seen in 540s (9 min) — capturing whatever is on screen.');
             captureNow(ws);
         }
-    }, 60000);
+    }, 540000);
 
-    // Hard timeout: 3 minutes max, then bail.
+    // Hard timeout: 10 minutes max, then bail.
     setTimeout(() => {
-        console.error('Timeout of 180 seconds exceeded! Crashing...');
+        console.error('Timeout of 600 seconds exceeded! Crashing...');
         chromeProcess.kill('SIGKILL');
         process.exit(1);
-    }, 180000);
+    }, 600000);
 }
 
 setTimeout(() => getWsUrl(), 1000);

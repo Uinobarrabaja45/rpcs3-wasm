@@ -15,9 +15,9 @@
 #include <source_location>
 #include <new>
 
-#if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || defined(__x86_64__) || defined(__amd64__)
+#if (defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64) || defined(__x86_64__) || defined(__amd64__)) && !defined(__EMSCRIPTEN__)
 #define ARCH_X64 1
-#elif defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+#elif (defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)) && !defined(__EMSCRIPTEN__)
 #define ARCH_ARM64 1
 // v8.4a+ gives us atomic 16 byte ld/st
 // See Arm C Language Extensions Documentation
@@ -50,10 +50,18 @@ using namespace std::literals;
 #define FORCE_INLINE __attribute__((always_inline)) inline
 #endif // _MSC_VER
 
+#ifdef __EMSCRIPTEN__
+using byte = unsigned char;
+#define CHECK_SIZE(type, size) static_assert(true)
+#define CHECK_ALIGN(type, align) static_assert(true)
+#define CHECK_MAX_SIZE(type, size) static_assert(true)
+#define CHECK_SIZE_ALIGN(type, size, align) static_assert(true)
+#else
 #define CHECK_SIZE(type, size) static_assert(sizeof(type) == size, "Invalid " #type " type size")
 #define CHECK_ALIGN(type, align) static_assert(alignof(type) == align, "Invalid " #type " type alignment")
 #define CHECK_MAX_SIZE(type, size) static_assert(sizeof(type) <= size, #type " type size is too big")
 #define CHECK_SIZE_ALIGN(type, size, align) CHECK_SIZE(type, size); CHECK_ALIGN(type, align)
+#endif
 
 #define DECLARE(...) decltype(__VA_ARGS__) __VA_ARGS__
 

@@ -6,6 +6,8 @@
 
 LOG_CHANNEL(rb3_midi_guitar_log);
 
+#if !defined(__EMSCRIPTEN__)
+
 usb_device_rb3_midi_guitar::usb_device_rb3_midi_guitar(const std::array<u8, 7>& location, const std::string& device_name, bool twentytwo_fret)
 	: usb_device_emulated(location)
 {
@@ -380,3 +382,14 @@ void usb_device_rb3_midi_guitar::write_state(u8* buf)
 
 	buf[2] = button_state.dpad;
 }
+
+#else
+
+usb_device_rb3_midi_guitar::usb_device_rb3_midi_guitar(const std::array<u8, 7>& location, const std::string&, bool)
+	: usb_device_emulated(location)
+{}
+usb_device_rb3_midi_guitar::~usb_device_rb3_midi_guitar() {}
+void usb_device_rb3_midi_guitar::control_transfer(u8, u8, u16, u16, u16, u32, u8*, UsbTransfer*) {}
+void usb_device_rb3_midi_guitar::interrupt_transfer(u32, u8*, u32, UsbTransfer*) {}
+
+#endif

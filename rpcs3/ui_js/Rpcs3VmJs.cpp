@@ -28,7 +28,47 @@
 
 #ifdef HAS_EMUCORE
 #include "Emu/System.h"
+#include "Emu/system_config.h"
 #include "Emu/system_config_types.h"
+#include "Utilities/File.h"
+#include "JsDiscFile.h"
+#include "Emu/RSX/GSFrameBase.h"
+#include "Emu/RSX/Null/NullGSRender.h"
+#include "Emu/RSX/RSXThread.h"
+#include "Emu/Audio/Null/NullAudioBackend.h"
+#include "WebGPUGSRender.h"
+#include "util/fixed_typemap.hpp"
+#include "Emu/Cell/Modules/cellSaveData.h"
+#include "Emu/Cell/Modules/sceNpTrophy.h"
+#include "util/video_source.h"
+
+namespace fs {
+	extern std::unique_ptr<file_base> (*g_emscripten_open_disc_file)();
+}
+extern std::string g_booted_disc_path;
+
+#include "util/logs.hpp"
+
+struct JseConsoleLogListener final : logs::listener
+{
+	void log(u64 /*stamp*/, const logs::message& msg, std::string_view prefix, std::string_view text) override
+	{
+		std::string ch_name = msg->name ? msg->name : "";
+		printf("[%s] %.*s: %.*s\n", ch_name.c_str(), (int)prefix.size(), prefix.data(), (int)text.size(), text.data());
+	}
+};
+static JseConsoleLogListener g_consoleLogListener;
+
+struct InitDiscFileCallback {
+	InitDiscFileCallback() {
+		setvbuf(stdout, nullptr, _IONBF, 0);
+		setvbuf(stderr, nullptr, _IONBF, 0);
+		fs::g_emscripten_open_disc_file = []() -> std::unique_ptr<fs::file_base> {
+			return std::make_unique<JsDiscFile>();
+		};
+		logs::listener::add(&g_consoleLogListener);
+	}
+} g_initDiscFileCallback;
 #endif
 
 CRpcs3VmJs* g_virtualMachine = nullptr;
@@ -46,11 +86,121 @@ CRpcs3VmJs::~CRpcs3VmJs()
 void CRpcs3VmJs::CreateVM()
 {
 	printf("[Rpcs3VmJs] CreateVM — registering JIT runtime helpers\n");
+
+#ifdef HAS_EMUCORE
+	g_cfg.core.ppu_decoder.set(ppu_decoder_type::_static);
+	g_cfg.core.spu_decoder.set(spu_decoder_type::_static);
+#endif
 	// In the full build this is where Emu.SetCallbacks(...) lives,
 	// mirroring headless_application::InitializeCallbacks() but with
 	// WebGPU-friendly substitutions for init_gs_render / get_gs_frame.
 	// See plan-poc-ps3-webgpu.md §2.4 for the threading map (PPU + 6 SPU
 	// + RSX + IOP across pthread workers) that has to be set up here.
+
+#ifdef HAS_EMUCORE
+	EmuCallbacks callbacks = {};
+
+	callbacks.call_from_main_thread = [](std::function<void()> func, atomic_t<u32>* wake_up)
+	{
+		func();
+		if (wake_up)
+		{
+			*wake_up = true;
+			wake_up->notify_one();
+		}
+	};
+	callbacks.on_run    = [](bool) {};
+	callbacks.on_pause  = []() {};
+	callbacks.on_resume = []() {};
+	callbacks.on_stop   = []() {};
+	callbacks.on_ready  = []() {};
+	callbacks.on_missing_fw = []() {};
+	callbacks.on_emulation_stop_no_response = [](std::shared_ptr<atomic_t<bool>>, int) {};
+	callbacks.on_save_state_progress = [](std::shared_ptr<atomic_t<bool>>, stx::shared_ptr<utils::serial>, stx::atomic_ptr<std::string>*, std::shared_ptr<void>) {};
+	callbacks.enable_disc_eject  = [](bool) {};
+	callbacks.enable_disc_insert = [](bool) {};
+	callbacks.try_to_quit = [](bool, std::function<void()>) { return false; };
+	callbacks.handle_taskbar_progress = [](s32, s32) {};
+	callbacks.init_kb_handler = []() {};
+	callbacks.init_mouse_handler = []() {};
+	callbacks.init_pad_handler = [](std::string_view)
+	{
+		// No-op. Constructing a real named_thread<pad_thread> on wasm32 is
+		// blocked: Input/pad_thread.cpp + the handler implementations pull
+		// in SDL/hidapi/evdev which we don't cross-compile. cellPadInit()
+		// will hit `ensure(g_pad_thread.load())` → raw_verify_error →
+		// emergency_exit; with the dump_regs wasm32 stub (PPUThread.cpp)
+		// emergency_exit logs cleanly instead of trapping `unreachable`.
+		// Real fix lives in #52 follow-up: stub pad_thread minimally in
+		// ui_js/ so cellPadInit returns CELL_OK.
+	};
+	callbacks.update_emu_settings = []() {};
+	callbacks.save_emu_settings = []() {};
+	callbacks.close_gs_frame = []() {};
+	callbacks.get_gs_frame = []() { return std::unique_ptr<GSFrameBase>(); };
+	callbacks.get_camera_handler = []() { return std::shared_ptr<camera_handler_base>(); };
+	callbacks.get_music_handler = []() { return std::shared_ptr<music_handler_base>(); };
+	callbacks.init_gs_render = [](utils::serial* ar)
+	{
+		// wasm32 POC: spawn WebGPUGSRender as the rsx::thread fxo singleton.
+		// WebGPUGSRender's end() is still a no-op draw (same as NullGSRender)
+		// but its flip() bumps g_webgpu_flip_count so the browser-side
+		// GSH_WebGPUJs::Render and Main.cpp's mainLoopTick can observe
+		// real RSX presents. The BASE rsx::thread runs the full FIFO pump:
+		// it pulls cellGcm commands out of guest memory, decodes them,
+		// advances the FIFO pointer, and notifies flip-status back to the
+		// PPU. That's the bridge Terraria needs to make progress past
+		// cellGcmInit.
+		//
+		// Phase 7+ will replace end()/flip() with WGSL-translated draws +
+		// real framebuffer present, but the rsx::thread plumbing is the
+		// same — only the backend changes.
+		printf("[Rpcs3VmJs] init_gs_render: spawning WebGPUGSRender (wasm32 POC)\n");
+		g_fxo->init<rsx::thread, named_thread<WebGPUGSRender>>(ar);
+		printf("[Rpcs3VmJs] init_gs_render: rsx::thread initialized\n");
+	};
+	callbacks.get_audio = []()
+	{
+		// MUST be non-null — cell_audio_config::reset() does
+		// backend->GetName() without a null check, so returning an empty
+		// shared_ptr crashes the cellAudio worker with "RuntimeError: null
+		// function" on wasm32. NullAudioBackend is a no-op stub (Close/Play
+		// /Pause are bools and GetName returns "Null") — perfect for the
+		// browser POC where audio is non-essential.
+		return std::shared_ptr<AudioBackend>(std::make_shared<NullAudioBackend>());
+	};
+	callbacks.get_audio_enumerator = [](u64) { return std::shared_ptr<audio_device_enumerator>(); };
+	callbacks.get_msg_dialog = []() { return std::shared_ptr<MsgDialogBase>(); };
+	callbacks.get_osk_dialog = []() { return std::shared_ptr<OskDialogBase>(); };
+	callbacks.get_save_dialog = []() { return std::unique_ptr<SaveDialogBase>(); };
+	callbacks.get_sendmessage_dialog = []() { return std::shared_ptr<SendMessageDialogBase>(); };
+	callbacks.get_recvmessage_dialog = []() { return std::shared_ptr<RecvMessageDialogBase>(); };
+	callbacks.get_trophy_notification_dialog = []() { return std::unique_ptr<TrophyNotificationBase>(); };
+	callbacks.get_localized_string = [](localized_string_id, const char*) { return std::string(); };
+	callbacks.get_localized_u32string = [](localized_string_id, const char*) { return std::u32string(); };
+	callbacks.get_localized_setting = [](const cfg::_base*, u32) { return std::string(); };
+	callbacks.get_photo_path = [](std::string_view) { return std::string(); };
+	callbacks.play_sound = [](const std::string&, std::optional<f32>) {};
+	callbacks.get_image_info = [](const std::string&, std::string&, s32&, s32&, s32&) { return false; };
+	callbacks.get_scaled_image = [](const std::string&, s32, s32, s32&, s32&, u8*, bool) { return false; };
+	callbacks.get_font_dirs = []() { return std::vector<std::string>(); };
+	callbacks.on_install_pkgs = [](const std::vector<std::string>&) { return false; };
+	callbacks.add_breakpoint = [](u32) {};
+	callbacks.display_sleep_control_supported = []() { return false; };
+	callbacks.enable_display_sleep = [](bool) {};
+	callbacks.check_microphone_permissions = []() {};
+	callbacks.make_video_source = []() { return std::unique_ptr<video_source>(); };
+	callbacks.enable_gamemode = [](bool) {};
+	callbacks.get_database_config = [](const std::string&) { return std::string(); };
+
+	Emu.SetCallbacks(std::move(callbacks));
+
+	// Initialize VFS + per-user dirs the same way headless_application
+	// does on native. Without this, BootGame later hits null vfs state
+	// when it tries to resolve the boot path.
+	Emu.Init();
+	printf("[Rpcs3VmJs] Emu.Init() returned\n");
+#endif
 }
 
 void CRpcs3VmJs::Boot(const std::string& path, const std::string& title_id, bool direct)
@@ -64,18 +214,40 @@ void CRpcs3VmJs::Boot(const std::string& path, const std::string& title_id, bool
 	m_status = Status::Booting;
 
 #ifdef HAS_EMUCORE
-	Emu.GracefulShutdown(false);
-	printf("[Rpcs3VmJs] Emu.GracefulShutdown(false) returned\n");
+	std::thread([this, path, title_id, direct]() {
+		printf("[Rpcs3VmJs] BootGame thread entered\n");
+		Emu.GracefulShutdown(false);
+		printf("[Rpcs3VmJs] Emu.GracefulShutdown(false) returned\n");
 
-	const auto error = Emu.BootGame(path, title_id, direct);
-	if (error != game_boot_result::no_errors)
-	{
-		printf("[Rpcs3VmJs] Emu.BootGame failed: %s\n", fmt::format("%s", error).c_str());
-		m_status = Status::Stopped;
-		return;
-	}
-	printf("[Rpcs3VmJs] Emu.BootGame succeeded — path=%s\n", Emu.GetBoot().c_str());
-	m_bootPath = Emu.GetBoot();
+		printf("[Rpcs3VmJs] calling Emu.BootGame(path='%s', tid='%s', direct=%d)...\n",
+			path.c_str(), title_id.c_str(), direct ? 1 : 0);
+		const auto error = Emu.BootGame(path, title_id, direct);
+		printf("[Rpcs3VmJs] Emu.BootGame returned: %d\n", static_cast<int>(error));
+		if (error != game_boot_result::no_errors)
+		{
+			printf("[Rpcs3VmJs] Emu.BootGame failed: %d\n", static_cast<int>(error));
+			m_status = Status::Stopped;
+			return;
+		}
+		printf("[Rpcs3VmJs] Emu.BootGame succeeded — path=%s\n", Emu.GetBoot().c_str());
+		printf("[Rpcs3VmJs] post-boot state: IsReady=%d IsStarting=%d IsRunning=%d IsStopped=%d\n",
+			Emu.IsReady() ? 1 : 0, Emu.IsStarting() ? 1 : 0,
+			Emu.IsRunning() ? 1 : 0, Emu.IsStopped() ? 1 : 0);
+		if (Emu.IsReady())
+		{
+			printf("[Rpcs3VmJs] calling Emu.Run(true) to start PPU execution...\n");
+			Emu.Run(true);
+		}
+		// BootGame's autostart path leaves us in 'starting' state. On
+		// native rpcs3 the RSX thread spawns and calls RunPPU() via
+		// CallFromMainThread; since we now wire NullGSRender as the
+		// rsx::thread, that callback fires automatically. Don't call
+		// RunPPU() here (would race with rsx::thread::on_task and can
+		// double-clear stop flags before RSX is ready).
+		printf("[Rpcs3VmJs] post-boot: deferring Run to rsx::thread::on_task\n");
+		m_bootPath = Emu.GetBoot();
+		m_status = Status::Running;
+	}).detach();
 #else
 	// POC scaffold path — emucore not linked. Log the same milestones so
 	// downstream code (Stats FPS pill, screenshot triggers, the WebGPU
@@ -84,9 +256,8 @@ void CRpcs3VmJs::Boot(const std::string& path, const std::string& title_id, bool
 	printf("[Rpcs3VmJs] [POC] Emu.BootGame('%s', '%s', %d) [stub]\n",
 	       path.c_str(), title_id.c_str(), direct ? 1 : 0);
 	m_bootPath = path;
-#endif
-
 	m_status = Status::Running;
+#endif
 }
 
 void CRpcs3VmJs::BootElf(std::string path)
@@ -98,6 +269,10 @@ void CRpcs3VmJs::BootElf(std::string path)
 void CRpcs3VmJs::BootDiscImage(std::string path)
 {
 	printf("[Rpcs3VmJs] BootDiscImage('%s')\n", path.c_str());
+
+#ifdef HAS_EMUCORE
+	g_booted_disc_path = path;
+#endif
 
 	// Phase 2 smoke test (plan-poc-ps3-webgpu.md) — exercise the JS disc
 	// bridge before the emucore is hooked up, so we can confirm

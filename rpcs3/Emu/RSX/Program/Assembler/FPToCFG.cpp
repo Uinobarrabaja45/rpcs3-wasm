@@ -9,6 +9,10 @@
 #include <util/v128.hpp>
 #include <span>
 
+#if defined(__EMSCRIPTEN__)
+#include <immintrin.h>
+#endif
+
 #if defined(ARCH_ARM64)
 #if !defined(_MSC_VER)
 #pragma GCC diagnostic push

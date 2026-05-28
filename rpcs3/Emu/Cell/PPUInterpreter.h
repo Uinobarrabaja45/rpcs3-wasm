@@ -9,6 +9,16 @@ using ppu_intrp_func_t = void(*)(ppu_thread& ppu_, ppu_opcode_t op, be_t<u32>* t
 struct ppu_intrp_func
 {
 	ppu_intrp_func_t fn;
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+	// wasm32 function pointers are 4 bytes (table indices), so sizeof
+	// would naturally be 4. But the interpreter cache uses `cia * 2`
+	// as the stride (one slot per 4-byte PPU instruction, 8 bytes per
+	// slot to match x86-64). exec_task chains via `fn + 1`, which on
+	// 32-bit advances by sizeof(ppu_intrp_func) = 4 — landing in the
+	// middle of the current slot instead of at the next instruction.
+	// Pad to 8 bytes so the layout matches the cache stride.
+	u32 _wasm_pad;
+#endif
 };
 
 template <typename IT>

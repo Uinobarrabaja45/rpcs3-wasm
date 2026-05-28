@@ -20,6 +20,13 @@ std::string g_android_config_dir;
 std::string g_android_cache_dir;
 #endif
 
+#ifdef __EMSCRIPTEN__
+namespace fs {
+	std::unique_ptr<file_base> (*g_emscripten_open_disc_file)() = nullptr;
+}
+std::string g_booted_disc_path;
+#endif
+
 #ifdef _WIN32
 
 #include "Utilities/StrUtil.h"
@@ -945,6 +952,17 @@ bool fs::get_stat(const std::string& path, stat_t& info)
 	// Ensure consistent information on failure
 	info = {};
 
+#ifdef __EMSCRIPTEN__
+	if (g_emscripten_open_disc_file && !::g_booted_disc_path.empty() && path == ::g_booted_disc_path)
+	{
+		if (auto f = g_emscripten_open_disc_file())
+		{
+			info = f->get_stat();
+			return true;
+		}
+	}
+#endif
+
 	if (auto device = get_virtual_device(path))
 	{
 		return device->stat(path, info);
@@ -1675,6 +1693,14 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
 		return;
 	}
 
+#ifdef __EMSCRIPTEN__
+	if (g_emscripten_open_disc_file && !::g_booted_disc_path.empty() && path == ::g_booted_disc_path)
+	{
+		m_file = g_emscripten_open_disc_file();
+		if (m_file) return;
+	}
+#endif
+
 	if (auto device = get_virtual_device(path))
 	{
 		if (auto&& _file = device->open(path, mode))
@@ -2165,6 +2191,8 @@ std::string fs::get_executable_path()
 
 		// App bundle directory is three levels up from the binary.
 		return get_parent_dir(bin_path, 3);
+#elif defined(__EMSCRIPTEN__)
+		return "/rpcs3";
 #else
 		if (const char* appimage_path = ::getenv("APPIMAGE"))
 		{

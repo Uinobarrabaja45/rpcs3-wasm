@@ -14,6 +14,10 @@
 #include "alext.h"
 #endif
 
+#ifndef AL_FORMAT_QUAD16
+#define AL_FORMAT_QUAD16 0x1205
+#endif
+
 LOG_CHANNEL(cellMic);
 
 template <>

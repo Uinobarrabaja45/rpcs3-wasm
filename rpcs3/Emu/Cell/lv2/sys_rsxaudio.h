@@ -1,5 +1,8 @@
 #pragma once
 
+#include <mutex>
+#include <condition_variable>
+
 #include "sys_sync.h"
 #include "sys_event.h"
 #include "Utilities/simple_ringbuf.h"
@@ -267,6 +270,12 @@ private:
 
 	int kq{};
 	struct kevent handle[2]{};
+#elif defined(__EMSCRIPTEN__)
+	// Emscripten/WASM fallback using condition variables
+	std::mutex cv_m{};
+	std::condition_variable cv{};
+	bool cv_cancelled = false;
+	u64 timer_interval = 0;
 #else
 #error "Implement"
 #endif

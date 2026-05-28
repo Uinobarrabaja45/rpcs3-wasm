@@ -95,6 +95,24 @@ set_source_files_properties("../../Utilities/JITLLVM.cpp" "../../Utilities/JITAS
     SKIP_PRECOMPILE_HEADERS ON
 )
 
+if(EMSCRIPTEN)
+    # asmjit emits x86/arm64 machine code; LLVM JIT generates the same.
+    # Neither makes sense on wasm — JIT into a WebAssembly.Module is a
+    # different code-gen path (plan-poc-ps3-webgpu.md §2.1, Phase 6).
+    # Mark the JIT-impl translation units as header-only so they're not
+    # compiled into rpcs3_emu. Interpreters always compile; runtime
+    # picks them via system_config when WITH_LLVM is off.
+    set_source_files_properties(
+        ../../Utilities/JITASM.cpp
+        ../../Utilities/JITLLVM.cpp
+        Cell/SPUASMJITRecompiler.cpp
+        Cell/SPULLVMRecompiler.cpp
+        Cell/SPUCommonRecompiler.cpp
+        Cell/PPUTranslator.cpp
+        PROPERTIES HEADER_FILE_ONLY ON
+    )
+endif()
+
 set_source_files_properties("../util/yaml.cpp" PROPERTIES
     COMPILE_FLAGS "$<IF:$<CXX_COMPILER_ID:MSVC>,/EHsc,-fexceptions>"
     SKIP_PRECOMPILE_HEADERS ON

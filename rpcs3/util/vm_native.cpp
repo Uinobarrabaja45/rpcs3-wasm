@@ -853,6 +853,28 @@ namespace utils
 
 		return nullptr;
 #else
+#ifdef __EMSCRIPTEN__
+		const u64 ptr64 = reinterpret_cast<u64>(ptr) & -0x10000;
+		if (ptr64)
+		{
+			printf("[shm::map] wasm32 fixed-ptr path ptr=%p m_size=0x%llx\n",
+				ptr, static_cast<unsigned long long>(m_size));
+			return reinterpret_cast<u8*>(ptr64);
+		}
+		else
+		{
+			void* mem = nullptr;
+			const int rc = posix_memalign(&mem, 0x10000, m_size);
+			printf("[shm::map] wasm32 posix_memalign(align=0x10000, size=0x%llx) rc=%d -> %p (end=%p)\n",
+				static_cast<unsigned long long>(m_size), rc, mem,
+				static_cast<void*>(static_cast<u8*>(mem) + m_size));
+			if (rc != 0)
+			{
+				return nullptr;
+			}
+			return static_cast<u8*>(mem);
+		}
+#else
 		const u64 ptr64 = reinterpret_cast<u64>(ptr) & -0x10000;
 
 		if (ptr64)
@@ -882,6 +904,7 @@ namespace utils
 			return reinterpret_cast<u8*>(result);
 		}
 #endif
+#endif
 	}
 
 	u8* shm::try_map(void* ptr, protection prot, bool cow) const
@@ -906,6 +929,10 @@ namespace utils
 	std::pair<u8*, std::string> shm::map_critical(void* ptr, protection prot, bool cow)
 	{
 		const auto target = reinterpret_cast<u8*>(reinterpret_cast<u64>(ptr) & -0x10000);
+
+#ifdef __EMSCRIPTEN__
+		return {target, {}};
+#endif
 
 #ifdef _WIN32
 		::MEMORY_BASIC_INFORMATION mem{};

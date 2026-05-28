@@ -36,7 +36,20 @@ namespace vm
 	extern u8* const g_free_addr;
 	extern u8 g_reservations[65536 / 128 * 64];
 
+#if defined(__EMSCRIPTEN__)
+	// wasm32: the native 0x200000000 (8 GiB) offset wraps to 0 on a
+	// 32-bit address space, aliasing ppu_seg_ptr onto the ppu_ptr range
+	// and corrupting whatever lives just past g_exec_addr. Pick a
+	// 32-bit-safe value that's > the largest ppu_ptr index (max_guest_addr
+	// * 2). Our shrunken guest layout caps usable code at 32 MiB, so
+	// ppu_ptr maxes at 64 MiB — use 64 MiB exactly as the seg base.
+	// memory_reserve_4GiB allocates the matching 128 MiB g_exec_addr
+	// region so [exec, exec+64M) is ppu_ptr and [exec+64M, exec+96M) is
+	// ppu_seg_ptr.
+	static constexpr u64 g_exec_addr_seg_offset = 0x0400'0000ULL;
+#else
 	static constexpr u64 g_exec_addr_seg_offset = 0x2'0000'0000ULL;
+#endif
 
 	struct writer_lock;
 
@@ -240,7 +253,17 @@ namespace vm
 	// Unsafe convert host ptr to PS3 VM address (clamp with 4GiB alignment assumption)
 	inline vm::addr_t get_addr(const void* ptr)
 	{
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+		// wasm32 g_base_addr is allocated via aligned_alloc(0x10000, ...)
+		// at some host address like 0x3af0000 — NOT 4 GiB-aligned, so the
+		// low 32 bits of (ptr) are NOT the guest address. Do the proper
+		// subtraction: guest_addr = host_ptr - g_base_addr.
+		// (Native rpcs3 keeps the fast cast because mmap pins g_base_addr
+		// at a 4 GiB boundary so the low bits are equivalent.)
+		return vm::addr_t{static_cast<u32>(static_cast<const u8*>(ptr) - g_base_addr)};
+#else
 		return vm::addr_t{static_cast<u32>(uptr(ptr))};
+#endif
 	}
 
 	template<typename T> requires (std::is_integral_v<decltype(+T{})> && (sizeof(+T{}) > 4 || std::is_signed_v<decltype(+T{})>))

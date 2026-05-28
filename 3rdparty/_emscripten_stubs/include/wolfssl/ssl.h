@@ -28,6 +28,7 @@ typedef struct WOLFSSL_CTX WOLFSSL_CTX;
 typedef struct WOLFSSL_METHOD WOLFSSL_METHOD;
 
 #define WOLFSSL_SUCCESS    1
+#define SSL_SUCCESS        1
 #define WOLFSSL_FAILURE    0
 #define SSL_VERIFY_NONE    0
 #define WOLFSSL_MAX_ERROR_SZ 80
@@ -49,7 +50,7 @@ int      wolfSSL_set_using_nonblock(WOLFSSL* ssl, int on);
 int  wolfSSL_connect(WOLFSSL* ssl);
 int  wolfSSL_read(WOLFSSL* ssl, void* data, int sz);
 int  wolfSSL_write(WOLFSSL* ssl, const void* data, int sz);
-int  wolfSSL_write_dup(WOLFSSL* ssl, const void* data, int sz);
+WOLFSSL* wolfSSL_write_dup(WOLFSSL* ssl);
 
 int  wolfSSL_get_error(WOLFSSL* ssl, int ret);
 int  wolfSSL_want_read(WOLFSSL* ssl);

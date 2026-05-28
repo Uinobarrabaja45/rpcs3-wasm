@@ -188,7 +188,7 @@ namespace
 #elif defined(ANDROID)
 			tid = pthread_self();
 #else
-			tid = reinterpret_cast<u64>(pthread_self());
+			tid = static_cast<u64>(reinterpret_cast<uintptr_t>(pthread_self()));
 #endif
 
 #ifdef USE_STD

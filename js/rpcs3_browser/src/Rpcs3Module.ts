@@ -16,7 +16,6 @@ import Rpcs31024 from "./Rpcs31024";
 import Rpcs32048 from "./Rpcs32048";
 import Rpcs3Dyna from "./Rpcs3Dyna";
 import DiscImageDevice from "./DiscImageDevice";
-import { GAMES } from "./Games";
 
 export let Rpcs3Module: any = null;
 
@@ -26,12 +25,26 @@ export let Rpcs3Module: any = null;
 // WASM aborts still surface. index.tsx silences the JS-side console too.
 const ignoreLog = new URLSearchParams(window.location.search).get('ignore_log') !== 'false';
 
+// Emscripten's libc prints "warning: unsupported syscall: __syscall_X" via
+// `err()` (which defaults to console.warn) every time rpcs3 calls mlock /
+// mprotect / madvise / getrusage / etc. The stubs return success so these
+// are pure noise — but they fire hundreds of times per boot and bury real
+// errors. Filter them at the printErr boundary; keep everything else.
+const SYSCALL_NOISE_RE = /^warning: unsupported syscall: __syscall_/;
+const printErrFiltered = (text: any) => {
+    if (typeof text === 'string' && SYSCALL_NOISE_RE.test(text)) return;
+    // Fall back to console.warn for genuine wasm aborts / unhandled errors.
+    // eslint-disable-next-line no-console
+    console.warn(text);
+};
+
 let module_overrides: { [k: string]: any } = {
     locateFile: function (path: string) {
         const baseURL = window.location.origin + window.location.pathname.substring(0, window.location.pathname.lastIndexOf("/"));
         return baseURL + '/' + path;
     },
     mainScriptUrlOrBlob: "",
+    printErr: printErrFiltered,
 };
 if (ignoreLog) {
     module_overrides.print = () => {};
@@ -47,13 +60,20 @@ async function loadRpcs3Module(ramParam: string | null): Promise<{ moduleFunctio
 
     console.log('Loading Rpcs3 module with RAM setting:', ramParam);
 
-    // Default = 1024 MB (Rpcs31024). PS3 commercial titles typically need
-    // 256 MB main RAM + 256 MB RSX VRAM, plus PPU/SPU JIT translation cache
-    // and Emscripten/V8 overhead — ~1 GB is the comfortable floor.
+    // Default = 2048 MB (Rpcs32048). The wasm32 vm layer pre-reserves a
+    // 1.5 GiB host-side g_base_addr region at static-init (aligned_alloc
+    // inside __wasm_call_ctors before main() runs) to back the PS3 guest
+    // address space. The 1024 MB build's INITIAL_MEMORY=1 GiB cannot grow
+    // far enough to satisfy that allocation → aborts immediately with
+    // "Cannot enlarge memory arrays to size 1672445952 bytes (OOM)".
+    // Users can opt into smaller builds explicitly via ?ram=1024/512/dyna
+    // once we shrink g_base_addr (Phase 5+ work), but 2048 is the safe
+    // default that actually boots.
     if (ramParam === '512') {
         jsFileName = 'Rpcs3512.js';
         moduleFunction = Rpcs3512;
     } else if (ramParam === '1024') {
+        console.warn('[Rpcs3Module] ?ram=1024 will OOM at static-init on current wasm32 build (g_base_addr=1.5GiB). Use ?ram=2048 unless you know what you are doing.');
         jsFileName = 'Rpcs31024.js';
         moduleFunction = Rpcs31024;
     } else if (ramParam === '2048') {
@@ -63,8 +83,9 @@ async function loadRpcs3Module(ramParam: string | null): Promise<{ moduleFunctio
         jsFileName = 'Rpcs3Dyna.js';
         moduleFunction = Rpcs3Dyna;
     } else {
-        jsFileName = 'Rpcs31024.js';
-        moduleFunction = Rpcs31024;
+        // No ?ram=: pick 2048 (safe default — see comment above).
+        jsFileName = 'Rpcs32048.js';
+        moduleFunction = Rpcs32048;
     }
     return { moduleFunction, jsFileName };
 }
@@ -312,65 +333,6 @@ export let initRpcs3Module = async function () {
             }
         } else {
             throw new Error('Neither initVmWebGPU nor initVm exported — WASM build is incomplete');
-        }
-
-        // Reference-image upload — POC visual stand-in that uploads a
-        // PNG via setReferenceTexture and draws it via the fullscreen
-        // textured-quad pipeline. This is the "Phase 1 cheat" called out
-        // in plan-poc-ps3-webgpu.md: it makes the compare view show
-        // visual parity *before* real emulation exists.
-        //
-        // Now OPT-IN — gated behind ?cheatTexture=true so the default
-        // compare view shows the honest pre-emulation state (animated
-        // clear color from CGSH_WebGPUJs::Render's else-branch) and only
-        // dev workflows that explicitly want the placeholder enable it.
-        // ?refImage=<path> still works for one-off diagnostic uploads.
-        const cheatTexture = new URLSearchParams(window.location.search).get('cheatTexture') === 'true';
-        if (useWebGPU && typeof Rpcs3Module.setReferenceTexture === 'function' && cheatTexture) {
-            const gameKey = new URLSearchParams(window.location.search).get('game');
-            const refPath = new URLSearchParams(window.location.search).get('refImage');
-            let imageUrl: string | null = null;
-            if (refPath) {
-                imageUrl = refPath.startsWith('http') || refPath.startsWith('/')
-                    ? refPath
-                    : `${process.env.PUBLIC_URL}/${refPath}`;
-            } else if (gameKey && GAMES[gameKey]) {
-                imageUrl = `${process.env.PUBLIC_URL}/${GAMES[gameKey].ref}`;
-            }
-            if (imageUrl) {
-                (async () => {
-                    try {
-                        console.log(`[Rpcs3Module] fetching reference image ${imageUrl}`);
-                        const response = await fetch(imageUrl!);
-                        if (!response.ok) {
-                            console.warn(`[Rpcs3Module] reference image fetch failed: HTTP ${response.status}`);
-                            return;
-                        }
-                        const blob = await response.blob();
-                        // ImageBitmap path is fastest; falls back to <img> +
-                        // canvas on browsers that gate ImageBitmap behind
-                        // a feature flag. Both produce the same RGBA bytes.
-                        const bitmap = await createImageBitmap(blob);
-                        const off = document.createElement('canvas');
-                        off.width = bitmap.width;
-                        off.height = bitmap.height;
-                        const ctx = off.getContext('2d');
-                        if (!ctx) {
-                            console.warn('[Rpcs3Module] 2D context unavailable — cannot decode reference image');
-                            return;
-                        }
-                        ctx.drawImage(bitmap, 0, 0);
-                        const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-                        // imageData.data is already tightly-packed RGBA8; the
-                        // C++ side pads rows to wgpu's 256-byte alignment
-                        // before WriteTexture, so JS doesn't have to.
-                        Rpcs3Module.setReferenceTexture(imageData.data, bitmap.width, bitmap.height);
-                        console.log(`[Rpcs3Module] reference image uploaded (${bitmap.width}x${bitmap.height})`);
-                    } catch (e) {
-                        console.warn('[Rpcs3Module] reference image upload failed:', e);
-                    }
-                })();
-            }
         }
 
         // Mark VM ready so the UI auto-load can proceed.

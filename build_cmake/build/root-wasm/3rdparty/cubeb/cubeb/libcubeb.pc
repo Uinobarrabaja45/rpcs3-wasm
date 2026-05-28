@@ -1,0 +1,12 @@
+prefix=/usr/local/Cellar/emscripten/5.0.7/libexec/cache/sysroot
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libcubeb
+Description: Cross platform audio library
+Version: 0.0.0
+Requires.private: 
+Libs: -L${libdir} -lcubeb
+Libs.private: -lstdc++ -lspeex
+Cflags: -I${includedir}

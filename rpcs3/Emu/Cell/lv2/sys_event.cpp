@@ -466,6 +466,21 @@ error_code sys_event_queue_receive(ppu_thread& ppu, u32 equeue_id, vm::ptr<sys_e
 {
 	ppu.state += cpu_flag::wait;
 
+#if defined(__EMSCRIPTEN__)
+	{
+		static atomic_t<u64> s_total{0};
+		const u64 cnt = ++s_total;
+		// Print every 100th call so we can see if game is spinning on it.
+		if (cnt < 4 || (cnt % 100) == 0)
+		{
+			printf("[sys_event_queue_receive] #%llu equeue_id=0x%x timeout=0x%llx\n",
+				static_cast<unsigned long long>(cnt), equeue_id,
+				static_cast<unsigned long long>(timeout));
+		}
+		// wasm32 POC: cap indefinite waits at 10 ms.
+		if (timeout == 0) timeout = 10000;
+	}
+#endif
 	sys_event.trace("sys_event_queue_receive(equeue_id=0x%x, *0x%x, timeout=0x%llx)", equeue_id, dummy_event, timeout);
 
 	ppu.gpr[3] = CELL_OK;

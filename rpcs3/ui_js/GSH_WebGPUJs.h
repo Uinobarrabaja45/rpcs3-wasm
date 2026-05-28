@@ -54,31 +54,12 @@ public:
 	// "splash" color shown during initialization).
 	void SetBooted(bool booted) { m_booted = booted; }
 
-	// Upload a reference image to GPU, used as the "rendered output" until
-	// the real RSX → WebGPU translator lands. Pixel data is tightly packed
-	// RGBA8 (width*4 bytes per row); the caller may pad to a 256-byte
-	// boundary if it wants to skip the staging copy. Stored as a
-	// wgpu::Texture and drawn as a fullscreen triangle on every Render().
-	void UploadReferenceTexture(const uint8_t* rgba, int width, int height);
-
 private:
 #ifdef HAS_WEBGPU
-	void EnsureQuadPipeline();
-	void DrawReferenceQuad(wgpu::RenderPassEncoder& pass);
-
 	wgpu::Device m_device;
 	wgpu::Queue m_queue;
 	wgpu::Instance m_instance;
 	wgpu::Surface m_surface;
-
-	wgpu::RenderPipeline m_quadPipeline;
-	wgpu::BindGroupLayout m_quadBindGroupLayout;
-	wgpu::Sampler m_quadSampler;
-	wgpu::Texture m_refTexture;
-	wgpu::TextureView m_refTextureView;
-	wgpu::BindGroup m_refBindGroup;
-	int m_refTextureWidth = 0;
-	int m_refTextureHeight = 0;
 #endif
 	std::string m_backend;
 	int m_windowWidth = 1280;

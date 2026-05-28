@@ -2614,6 +2614,12 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 			return game_boot_result::invalid_file_or_folder;
 		}
 
+#if defined(__EMSCRIPTEN__)
+		// wasm32 POC: we don't ship a PS3 firmware in the browser. The
+		// HLE path covers everything we need for Terraria's main thread
+		// to spawn. Skip the firmware-missing fail-out so BootGame
+		// returns no_errors and the autostart Run() actually fires.
+#else
 		if (ppu_exec == elf_error::ok && !fs::is_file(g_cfg_vfs.get_dev_flash() + "sys/external/liblv2.sprx"))
 		{
 			const auto& libs = g_cfg.core.libraries_control.get_set();
@@ -2637,6 +2643,7 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
 				return game_boot_result::firmware_missing;
 			}
 		}
+#endif
 
 		const bool autostart = m_ar || (std::exchange(m_force_boot, false) || g_cfg.misc.autostart);
 

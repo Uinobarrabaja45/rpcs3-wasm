@@ -51,6 +51,38 @@ using native_args = std::array<asmjit::x86::Gp, 4>;
 #elif defined(ARCH_ARM64)
 using native_asm = asmjit::a64::Assembler;
 using native_args = std::array<asmjit::a64::Gp, 4>;
+#elif defined(__EMSCRIPTEN__) || defined(__wasm__)
+// wasm: asmjit can't emit wasm bytecode; the JIT path is non-functional
+// on wasm and the call sites either #ifdef out (ARCH_X64/ARM64 guards)
+// or fall back to interpreter. Provide a minimal dummy that accepts any
+// constructor arg (asmjit's real Assembler takes CodeHolder*), so files
+// like simd.hpp's vec_builder(CodeHolder*) compile. None of these
+// instances are reachable at runtime in interpreter mode.
+struct native_asm_stub
+{
+	struct Label { template <typename... Args> Label(Args&&...) {} };
+	enum class EncodingOptions { kOptimizedAlign, kOptimizeForSize };
+
+	template <typename... Args>
+	native_asm_stub(Args&&...) {}
+
+	template <typename... Args>
+	void emit(Args&&...) {}
+	template <typename... Args>
+	void embed(Args&&...) {}
+	template <typename... Args>
+	void align(Args&&...) {}
+	template <typename... Args>
+	void mov(Args&&...) {}
+	template <typename... Args>
+	void bind(Args&&...) {}
+	template <typename... Args>
+	void addEncodingOptions(Args&&...) {}
+	template <typename... Args>
+	Label newLabel(Args&&...) { return {}; }
+};
+using native_asm = native_asm_stub;
+using native_args = std::array<int, 4>;
 #endif
 
 void jit_announce(uptr func, usz size, std::string_view name);
@@ -467,6 +499,11 @@ inline FT build_function_asm(std::string_view name, F&& builder, ::jit_runtime* 
 	args[1] = a64::x1;
 	args[2] = a64::x2;
 	args[3] = a64::x3;
+#elif defined(__EMSCRIPTEN__) || defined(__wasm__)
+	// wasm: JIT is non-functional; native_args is the int-array stub.
+	// `args` must still be declared so the templated builder() call
+	// downstream compiles.
+	native_args args{};
 #endif
 
 	Asm compiler(&code);

@@ -2,6 +2,7 @@
 #include "upnp_handler.h"
 #include "util/logs.hpp"
 
+#if !defined(__EMSCRIPTEN__)
 #include <miniwget.h>
 #include <upnpcommands.h>
 
@@ -187,3 +188,14 @@ bool upnp_handler::is_active() const
 {
 	return m_active;
 }
+
+#else
+
+upnp_handler::~upnp_handler() {}
+void upnp_handler::upnp_enable() {}
+void upnp_handler::add_port_redir(const std::string&, u16, std::string_view) {}
+void upnp_handler::remove_port_redir(u16, std::string_view) {}
+void upnp_handler::remove_port_redir_external(u16, std::string_view, bool) {}
+bool upnp_handler::is_active() const { return false; }
+
+#endif

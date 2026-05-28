@@ -21,6 +21,8 @@ namespace utils
 #elif defined(ARCH_ARM64)
 		// TODO
 		__asm__ volatile("isb");
+#elif defined(__EMSCRIPTEN__) || defined(__wasm__)
+		__asm__ volatile("" ::: "memory");
 #else
 #error "Missing lfence() implementation"
 #endif

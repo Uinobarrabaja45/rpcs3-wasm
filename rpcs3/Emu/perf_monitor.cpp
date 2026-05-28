@@ -11,6 +11,12 @@ LOG_CHANNEL(perf_log, "PERF");
 
 void perf_monitor::operator()()
 {
+#if defined(__EMSCRIPTEN__)
+	// wasm32 Phase 4 — perf_monitor aborts on std::vector::append's
+	// length_error. Not needed in browser POC; stub it out.
+	printf("[perf_monitor] wasm32 stub — exiting\n");
+	return;
+#endif
 	constexpr u64 update_interval_us = 500000; // Update every half second
 	constexpr u64 log_interval_us_max = 10000000; // Log at minimum every 10 seconds
 	constexpr u64 log_interval_us_min = 500000;  // Log at maximum every half a second (catching possible memory leak)

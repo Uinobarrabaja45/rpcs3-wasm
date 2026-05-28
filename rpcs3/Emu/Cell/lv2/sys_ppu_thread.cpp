@@ -8,6 +8,7 @@
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/PPUCallback.h"
 #include "Emu/Cell/PPUOpcodes.h"
+#include "Emu/Cell/PPUFunction.h"
 #include "Emu/Memory/vm_locking.h"
 #include "sys_event.h"
 #include "sys_process.h"
@@ -19,6 +20,10 @@
 #include <thread>
 
 LOG_CHANNEL(sys_ppu_thread);
+
+#if defined(__EMSCRIPTEN__)
+extern std::vector<std::string> g_ppu_function_names;
+#endif
 
 // Simple structure to cleanup previous thread, because can't remove its own thread
 struct ppu_thread_cleaner
@@ -496,6 +501,30 @@ error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::p
 
 	const ppu_func_opd_t entry = param->entry.opd();
 	const u32 tls = param->tls;
+
+#if defined(__EMSCRIPTEN__)
+	// wasm32: redirect any HLE-area entry to HLE_RETURN. The function
+	// at the originally-requested index has an unimplemented/empty HLE
+	// body that traps "unreachable" inside the new thread's interpreter
+	// dispatch (cellSysutil internal handlers we don't have real impls
+	// for). Without this redirect, the parent thread spins forever
+	// polling a shared flag that the dead child was supposed to set.
+	{
+		const u32 hle_base = g_fxo->get<ppu_function_manager>().addr;
+		const u32 ea = static_cast<u32>(+entry.addr); // be_t<u32> → host u32
+		if (hle_base && ea >= hle_base)
+		{
+			const u32 ret_addr = g_fxo->get<ppu_function_manager>().func_addr(1, true); // HLE_RETURN
+			printf("[_sys_ppu_thread_create] wasm32: redirect HLE entry 0x%x → HLE_RETURN 0x%x (thread='%s')\n",
+				ea, ret_addr, threadname ? threadname.get_ptr() : "<null>");
+			// Build a new OPD struct with the redirected address. Avoid
+			// writing into `entry` via const_cast — be_t assignment is
+			// fine but the wrapper is `const`, easier to construct fresh.
+			ppu_func_opd_t redirected{ret_addr, static_cast<u32>(+entry.rtoc)};
+			std::memcpy(const_cast<ppu_func_opd_t*>(&entry), &redirected, sizeof(redirected));
+		}
+	}
+#endif
 
 	// Compute actual stack size and allocate
 	// 0 and UINT64_MAX both convert to 4096

@@ -583,15 +583,25 @@ namespace utils
 
 namespace std
 {
-	static_assert(sizeof(usz) >= 2 * sizeof(u32), "usz must be at least twice the size of u32");
-
 	template <>
 	struct hash<utils::address_range32>
 	{
 		usz operator()(const utils::address_range32& k) const
 		{
-			// we can guarantee a unique hash since our type is 64 bits and usz as well
-			return (usz{ k.start } << 32) | usz{ k.end };
+			// On 64-bit hosts (native), pack both u32 fields into one usz
+			// — gives collision-free hashing for this type's full range.
+			// On wasm32 (32-bit `usz`), pack would truncate; fall back to
+			// XOR which is correct (just allows collisions). The
+			// emscripten port's hash table walks the bucket on collision
+			// so correctness is preserved, performance is the only cost.
+			if constexpr (sizeof(usz) >= 2 * sizeof(u32))
+			{
+				return (usz{ k.start } << 32) | usz{ k.end };
+			}
+			else
+			{
+				return usz{ k.start } ^ (usz{ k.end } * 0x9E3779B1u);
+			}
 		}
 	};
 }

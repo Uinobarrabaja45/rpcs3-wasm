@@ -44,6 +44,8 @@
 #include "Emu/Io/LogitechG27.h"
 #endif
 
+#if !defined(__EMSCRIPTEN__)
+
 #ifdef _WIN32
 #if LIBUSB_WINDOWS_HOTPLUG && LIBUSB_API_VERSION >= 0x0100010C
 #define SYS_USBD_HOTPLUG_SUPPORTED 1
@@ -1692,3 +1694,46 @@ error_code sys_usbd_get_device_speed(ppu_thread& ppu)
 	sys_usbd.todo("sys_usbd_get_device_speed()");
 	return CELL_OK;
 }
+
+#else
+// Emscripten/WASM stub implementation
+
+cfg_buzz g_cfg_buzz;
+cfg_ghltars g_cfg_ghltar;
+cfg_turntables g_cfg_turntable;
+cfg_usios g_cfg_usio;
+cfg_guncon3 g_cfg_guncon3;
+cfg_topshotelite g_cfg_topshotelite;
+cfg_topshotfearmaster g_cfg_topshotfearmaster;
+
+error_code sys_usbd_initialize(ppu_thread&, vm::ptr<u32>) { return CELL_OK; }
+error_code sys_usbd_finalize(ppu_thread&, u32) { return CELL_OK; }
+error_code sys_usbd_get_device_list(ppu_thread&, u32, vm::ptr<UsbInternalDevice>, u32) { return CELL_OK; }
+error_code sys_usbd_get_descriptor_size(ppu_thread&, u32, u32) { return CELL_OK; }
+error_code sys_usbd_get_descriptor(ppu_thread&, u32, u32, vm::ptr<void>, u32) { return CELL_OK; }
+error_code sys_usbd_register_ldd(ppu_thread&, u32, vm::cptr<char>, u16) { return CELL_OK; }
+error_code sys_usbd_unregister_ldd(ppu_thread&, u32, vm::cptr<char>, u16) { return CELL_OK; }
+error_code sys_usbd_open_pipe(ppu_thread&, u32, u32, u32, u64, u64, u32, u64) { return CELL_OK; }
+error_code sys_usbd_open_default_pipe(ppu_thread&, u32, u32) { return CELL_OK; }
+error_code sys_usbd_close_pipe(ppu_thread&, u32, u32) { return CELL_OK; }
+error_code sys_usbd_receive_event(ppu_thread&, u32, vm::ptr<u64>, vm::ptr<u64>, vm::ptr<u64>) { return CELL_OK; }
+error_code sys_usbd_detect_event(ppu_thread&) { return CELL_OK; }
+error_code sys_usbd_attach(ppu_thread&, u32, u32, u32, u32) { return CELL_OK; }
+error_code sys_usbd_transfer_data(ppu_thread&, u32, u32, vm::ptr<u8>, u32, vm::ptr<UsbDeviceRequest>, u32) { return CELL_OK; }
+error_code sys_usbd_isochronous_transfer_data(ppu_thread&, u32, u32, vm::ptr<UsbDeviceIsoRequest>) { return CELL_OK; }
+error_code sys_usbd_get_transfer_status(ppu_thread&, u32, u32, u32, vm::ptr<u32>, vm::ptr<u32>) { return CELL_OK; }
+error_code sys_usbd_get_isochronous_transfer_status(ppu_thread&, u32, u32, u32, vm::ptr<UsbDeviceIsoRequest>, vm::ptr<u32>) { return CELL_OK; }
+error_code sys_usbd_get_device_location(ppu_thread&, u32, u32, vm::ptr<u8>) { return CELL_OK; }
+error_code sys_usbd_send_event(ppu_thread&) { return CELL_OK; }
+error_code sys_usbd_event_port_send(ppu_thread&, u32, u64, u64, u64) { return CELL_OK; }
+error_code sys_usbd_allocate_memory(ppu_thread&) { return CELL_OK; }
+error_code sys_usbd_free_memory(ppu_thread&) { return CELL_OK; }
+error_code sys_usbd_get_device_speed(ppu_thread&) { return CELL_OK; }
+error_code sys_usbd_register_extra_ldd(ppu_thread&, u32, vm::cptr<char>, u16, u16, u16, u16) { return CELL_OK; }
+error_code sys_usbd_unregister_extra_ldd(ppu_thread&, u32, vm::cptr<char>, u16) { return CELL_OK; }
+
+void connect_usb_controller(u8, input::product_type) {}
+void reconnect_usb(u32) {}
+void handle_hotplug_event(bool, bool) {}
+
+#endif

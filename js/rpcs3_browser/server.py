@@ -10,11 +10,19 @@ class CORSRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
         self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
         self.send_header('Cross-Origin-Resource-Policy', 'cross-origin')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', '*')
         super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200, "ok")
+        self.end_headers()
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
     with socketserver.TCPServer(("", port), CORSRequestHandler) as httpd:
         print(f"Serving HTTP on :: port {port} (http://[::]:{port}/)")
-        print("COOP/COEP headers enabled for SharedArrayBuffer")
+        print("COOP/COEP and CORS headers enabled")
         httpd.serve_forever()
+

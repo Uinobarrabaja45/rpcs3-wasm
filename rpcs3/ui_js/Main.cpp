@@ -60,14 +60,21 @@ static long g_lastSleepMicroseconds = 0;
 // commands captured since last vsync"; the loop shape stays identical.
 static void mainLoopTick()
 {
-	if (g_gsHandler)
+	// PPU/SPU pthread workers abort under wasm32 (unaligned access in
+	// guest-code emulation, plan-poc-ps3-webgpu.md Phase 4). Their abort
+	// can taint our main-thread wgpu state — keep this loop alive
+	// regardless so the React canvas stays visible and the boot trigger
+	// pipeline keeps logging.
+	if (!g_gsHandler) return;
+	bool booted = false;
+	if (g_virtualMachine)
 	{
-		const bool booted = g_virtualMachine && g_virtualMachine->IsRunning();
-		g_gsHandler->SetBooted(booted);
-		if (g_gsHandler->Render())
-		{
-			g_frameCount++;
-		}
+		booted = g_virtualMachine->IsRunning();
+	}
+	g_gsHandler->SetBooted(booted);
+	if (g_gsHandler->Render())
+	{
+		g_frameCount++;
 	}
 }
 #endif
@@ -287,40 +294,6 @@ namespace
 	void setMinDrawIntervalMs(int n) { g_minDrawIntervalMs = n; }
 	void setMaxTextureUploadsPerFrame(int n) { g_maxTextureUploadsPerFrame = n; }
 	long getLastSleepMicroseconds() { return g_lastSleepMicroseconds; }
-
-#ifdef HAS_WEBGPU
-	// Reference-image upload bridge — JS hands us a Uint8Array of
-	// tightly-packed RGBA8 pixels plus the dimensions; we copy the bytes
-	// out of the JS heap and forward to the GS handler. Used by the
-	// compare view (and other POC visual tests) to render a known image
-	// on the WebGPU side before the real RSX→WGSL translator exists.
-	// See plan-poc-ps3-webgpu.md §3 Phase 4.
-	void setReferenceTexture(emscripten::val pixels, int width, int height)
-	{
-		if (!g_gsHandler)
-		{
-			printf("[Main] setReferenceTexture: GS handler not initialized\n");
-			return;
-		}
-		if (width <= 0 || height <= 0)
-		{
-			printf("[Main] setReferenceTexture: bad dimensions %dx%d\n", width, height);
-			return;
-		}
-		const size_t expected = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
-		const size_t length = pixels["length"].as<size_t>();
-		if (length < expected)
-		{
-			printf("[Main] setReferenceTexture: pixel buffer too small (got %zu, need %zu for %dx%d)\n",
-			       length, expected, width, height);
-			return;
-		}
-		std::vector<uint8_t> buf(expected);
-		emscripten::val memView = emscripten::val(emscripten::typed_memory_view(expected, buf.data()));
-		memView.call<void>("set", pixels.call<emscripten::val>("subarray", 0, static_cast<int>(expected)));
-		g_gsHandler->UploadReferenceTexture(buf.data(), width, height);
-	}
-#endif
 }
 
 EMSCRIPTEN_BINDINGS(rpcs3_js_module)
@@ -341,7 +314,6 @@ EMSCRIPTEN_BINDINGS(rpcs3_js_module)
 #ifdef HAS_WEBGPU
 	emscripten::function("initVmWebGPU",            &initVmWebGPU);
 	emscripten::function("recreateWebGPUDevice",    &recreateWebGPUDevice);
-	emscripten::function("setReferenceTexture",     &setReferenceTexture);
 #endif
 	emscripten::function("initVm",                  &initVm);
 }

@@ -1996,6 +1996,8 @@ void rsxaudio_periodic_tmr::sched_timer()
 		handle[TIMER_ID].flags = (handle[TIMER_ID].flags & ~EV_ENABLE) | EV_DISABLE;
 	}
 	ensure(kevent(kq, &handle[TIMER_ID], 1, nullptr, 0, nullptr) >= 0);
+#elif defined(__EMSCRIPTEN__)
+	timer_interval = interval;
 #else
 #error "Implement"
 #endif
@@ -2031,6 +2033,9 @@ void rsxaudio_periodic_tmr::cancel_timer_unlocked()
 	{
 		ensure(kevent(kq, &handle[TIMER_ID], 1, nullptr, 0, nullptr) >= 0);
 	}
+#elif defined(__EMSCRIPTEN__)
+	cv_cancelled = true;
+	cv.notify_all();
 #else
 #error "Implement"
 #endif
@@ -2045,6 +2050,8 @@ void rsxaudio_periodic_tmr::reset_cancel_flag()
 	[[maybe_unused]] const auto nread = read(cancel_event, &tmp_buf, sizeof(tmp_buf));
 #elif defined(BSD) || defined(__APPLE__)
 	// Cancel event is reset automatically
+#elif defined(__EMSCRIPTEN__)
+	cv_cancelled = false;
 #else
 #error "Implement"
 #endif
@@ -2077,6 +2084,9 @@ rsxaudio_periodic_tmr::rsxaudio_periodic_tmr()
 	EV_SET(&handle[CANCEL_ID], CANCEL_ID, EVFILT_USER, EV_ADD | EV_ENABLE | EV_CLEAR, NOTE_FFNOP, 0, nullptr);
 	ensure(kevent(kq, &handle[CANCEL_ID], 1, nullptr, 0, nullptr) >= 0);
 	handle[CANCEL_ID].fflags |= NOTE_TRIGGER;
+#elif defined(__EMSCRIPTEN__)
+	cv_cancelled = false;
+	timer_interval = 0;
 #else
 #error "Implement"
 #endif
@@ -2093,6 +2103,8 @@ rsxaudio_periodic_tmr::~rsxaudio_periodic_tmr()
 	close(cancel_event);
 #elif defined(BSD) || defined(__APPLE__)
 	close(kq);
+#elif defined(__EMSCRIPTEN__)
+	// Nothing to clean up
 #else
 #error "Implement"
 #endif
@@ -2188,6 +2200,27 @@ rsxaudio_periodic_tmr::wait_result rsxaudio_periodic_tmr::wait(const std::functi
 					wait_canceled = true;
 					break;
 				}
+			}
+		}
+#elif defined(__EMSCRIPTEN__)
+		std::unique_lock<std::mutex> cv_lock(cv_m);
+		if (timer_interval == 0)
+		{
+			cv.wait(cv_lock, [this]() { return cv_cancelled; });
+			if (cv_cancelled)
+			{
+				wait_canceled = true;
+			}
+		}
+		else
+		{
+			if (!cv.wait_for(cv_lock, std::chrono::microseconds(timer_interval), [this]() { return cv_cancelled; }))
+			{
+				timeout = true;
+			}
+			else if (cv_cancelled)
+			{
+				wait_canceled = true;
 			}
 		}
 #else

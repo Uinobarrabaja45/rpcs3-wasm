@@ -78,7 +78,7 @@ void lv2_int_serv::exec() const
 		{ ppu_cmd::entry_call, 0 },
 		{ ppu_cmd::sleep, 0 },
 		{ ppu_cmd::ptr_call, 0 },
-		std::bit_cast<u64>(&ppu_interrupt_thread_entry)
+		static_cast<u64>(std::bit_cast<uptr>(&ppu_interrupt_thread_entry))
 	});
 }
 
@@ -89,7 +89,7 @@ void lv2_int_serv::join() const
 	thread->cmd_list
 	({
 		{ ppu_cmd::ptr_call, 0 },
-		std::bit_cast<u64>(&ppu_thread_exit)
+		static_cast<u64>(std::bit_cast<uptr>(&ppu_thread_exit))
 	});
 
 	thread->cmd_notify.store(1);
@@ -179,7 +179,7 @@ error_code _sys_interrupt_thread_establish(ppu_thread& ppu, vm::ptr<u32> ih, u32
 		it->cmd_list
 		({
 			{ ppu_cmd::ptr_call, 0 },
-			std::bit_cast<u64>(&ppu_interrupt_thread_entry)
+			static_cast<u64>(std::bit_cast<uptr>(&ppu_interrupt_thread_entry))
 		});
 
 		it->state -= cpu_flag::stop;

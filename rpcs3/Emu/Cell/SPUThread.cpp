@@ -1441,6 +1441,11 @@ extern thread_local std::string(*g_tls_log_prefix)();
 
 void spu_thread::cpu_task()
 {
+#if defined(__EMSCRIPTEN__)
+	// wasm32 Phase 4 diagnostic — see PPUThread.cpp for context.
+	printf("[spu_thread] cpu_task: wasm32 stub — exiting thread without executing\n");
+	return;
+#endif
 #ifdef __APPLE__
 	pthread_jit_write_protect_np(true);
 #endif
@@ -1726,7 +1731,15 @@ void spu_thread::init_spu_decoder()
 	ensure(!jit);
 
 #if !defined(ARCH_X64) && !defined(ARCH_ARM64)
-#error "Unimplemented"
+	const spu_decoder_type spu_decoder = g_cfg.core.spu_decoder;
+	if (spu_decoder == spu_decoder_type::_static || spu_decoder == spu_decoder_type::dynamic)
+	{
+		// Interpreter
+	}
+	else
+	{
+		fmt::throw_exception("Unsupported spu decoder '%s' on this architecture", g_cfg.core.spu_decoder);
+	}
 #else
 	const spu_decoder_type spu_decoder = g_cfg.core.spu_decoder;
 

@@ -120,21 +120,19 @@ if dynamic_mode:
         1
     )
 else:
-    # Fixed: uncomment the matching INITIAL_MEMORY, ALLOW_MEMORY_GROWTH=0
+    # Fixed: uncomment the matching INITIAL_MEMORY. KEEP growth=1 so the
+    # wasm32 vm layer's 1.5 GiB g_base_addr aligned_alloc at static-init
+    # can succeed even on the smaller (1024, 512) builds — INITIAL_MEMORY
+    # is now just the *starting* size, and MAXIMUM_MEMORY=4 GiB (set in
+    # CMakeLists.txt) is the hard cap. Previously growth was disabled,
+    # which made the 1024 build abort during __wasm_call_ctors trying to
+    # grow to 1.6 GiB. Fixed builds still have a predictable starting
+    # heap; only the cap on resize is what changes.
     target_line = f'# target_link_options(Rpcs3 PRIVATE "-sINITIAL_MEMORY={memory}")'
     active_line = f'target_link_options(Rpcs3 PRIVATE "-sINITIAL_MEMORY={memory}")'
     content = content.replace(target_line, active_line, 1)
-    content = re.sub(
-        r'^target_link_options\(Rpcs3 PRIVATE "-sALLOW_MEMORY_GROWTH=1"\)',
-        r'# target_link_options(Rpcs3 PRIVATE "-sALLOW_MEMORY_GROWTH=1")',
-        content,
-        flags=re.MULTILINE
-    )
-    content = content.replace(
-        '# target_link_options(Rpcs3 PRIVATE "-sALLOW_MEMORY_GROWTH=0")',
-        'target_link_options(Rpcs3 PRIVATE "-sALLOW_MEMORY_GROWTH=0")',
-        1
-    )
+    # Leave ALLOW_MEMORY_GROWTH=1 alone (it's already enabled in
+    # CMakeLists.txt). Do NOT disable growth.
 
 with open(path, 'w') as f:
     f.write(content)
@@ -181,6 +179,7 @@ configure_and_build() {
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_WEBGPU="${webgpu}" \
             -DOPTIMIZE_SIZE="${optsize}" \
+            -DHAS_EMUCORE=ON \
             ${CMAKE_EXTRA_FLAGS} \
             "$PROJECT_DIR/rpcs3/ui_js" )
         "$CMAKE" --build "$BIN_DIR" --target Rpcs3

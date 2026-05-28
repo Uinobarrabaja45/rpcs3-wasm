@@ -178,6 +178,13 @@ namespace utils
 		__asm__ volatile("isb" ::: "memory");
 #elif defined(ARCH_X64)
 		_mm_pause();
+#elif defined(__EMSCRIPTEN__) || defined(__wasm__)
+		// wasm has no spin-loop hint instruction. The whole purpose of
+		// `pause()` is to back off in a busy-wait so the hyperthread sibling
+		// gets time — meaningless on wasm where each pthread is a Web
+		// Worker that the browser already cooperatively schedules. A
+		// compiler memory barrier is the conservative no-op equivalent.
+		__asm__ volatile("" ::: "memory");
 #else
 #error "Missing utils::pause() implementation"
 #endif
@@ -288,7 +295,7 @@ namespace utils
 #endif
 	}
 
-	inline void trap()
+	[[noreturn]] inline void trap()
 	{
 #ifdef _M_X64
 		__debugbreak();
@@ -296,9 +303,15 @@ namespace utils
 		__asm__ volatile("int3");
 #elif defined(ARCH_ARM64)
 		__asm__ volatile("brk 0x42");
+#elif defined(__EMSCRIPTEN__) || defined(__wasm__)
+		// wasm's UNREACHABLE instruction terminates the calling thread
+		// with a trap — same semantics as int3/brk for our purposes
+		// (assertion failures, "this is supposed to be unreachable").
+		__builtin_trap();
 #else
 #error "Missing utils::trap() implementation"
 #endif
+		__builtin_unreachable();
 	}
 } // namespace utils
 

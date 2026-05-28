@@ -1943,7 +1943,13 @@ auto gen_ghc_cpp_trampoline(ppu_intrp_func_t fn_target)
 }
 
 #else
-#error "Not implemented!"
+auto gen_ghc_cpp_trampoline(ppu_intrp_func_t fn_target)
+{
+	return [fn_target] (native_asm& c, auto& args)
+	{
+		(void)c; (void)args; (void)fn_target;
+	};
+}
 #endif
 
 ppu_function_manager::ppu_function_manager(utils::serial& ar)

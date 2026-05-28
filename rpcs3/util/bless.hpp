@@ -18,6 +18,13 @@ namespace utils
 		T* result;
 		__asm__("mov %0, %1" : "=r" (result) : "r" (ptr) : "memory");
 		return result;
+#elif defined(__EMSCRIPTEN__) || defined(__wasm__)
+		// wasm has no inline asm "register move" trick to defeat aliasing
+		// analysis; the original purpose of bless() (workaround for the
+		// strict-aliasing UB the type-pun would otherwise hit) is moot
+		// on wasm where memory is a single linear array and the compiler
+		// is much more conservative about reordering loads/stores anyway.
+		return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(ptr));
 #else
 #error "Missing utils::bless() implementation"
 #endif

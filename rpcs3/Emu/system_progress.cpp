@@ -39,6 +39,12 @@ namespace rsx::overlays
 
 void progress_dialog_server::operator()()
 {
+#if defined(__EMSCRIPTEN__)
+	// wasm32 Phase 4 diagnostic — this thread hits unaligned atomic in
+	// thread_base::exec(). Skip entirely on wasm; no progress UI in browser.
+	printf("[progress_dialog_server] wasm32 stub — exiting\n");
+	return;
+#endif
 	std::shared_ptr<rsx::overlays::progress_dialog> native_dlg;
 	g_system_progress_stopping = system_progress_stop_state::stop_state_disabled;
 	g_system_progress_canceled = false;

@@ -1,0 +1,12 @@
+prefix=/usr/local/Cellar/emscripten/5.0.7/libexec/cache/sysroot
+exec_prefix=/usr/local/Cellar/emscripten/5.0.7/libexec/cache/sysroot
+libdir=/usr/local/Cellar/emscripten/5.0.7/libexec/cache/sysroot/lib
+includedir=/usr/local/Cellar/emscripten/5.0.7/libexec/cache/sysroot/include/libpng16
+
+Name: libpng
+Description: Loads and saves PNG files
+Version: 1.6.58
+Requires.private: zlib
+Libs: -L${libdir} -lpng16
+Libs.private: -lz -lm
+Cflags: -I${includedir}

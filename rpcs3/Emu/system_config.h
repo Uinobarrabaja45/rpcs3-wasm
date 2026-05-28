@@ -14,7 +14,11 @@ struct cfg_root : cfg::node
 	{
 		node_core(cfg::node* _this) : cfg::node(_this, "Core") {}
 
+#ifdef __EMSCRIPTEN__
+		cfg::_enum<ppu_decoder_type> ppu_decoder{ this, "PPU Decoder", ppu_decoder_type::_static };
+#else
 		cfg::_enum<ppu_decoder_type> ppu_decoder{ this, "PPU Decoder", ppu_decoder_type::llvm };
+#endif
 		cfg::_int<1, 8> ppu_threads{ this, "PPU Threads", 2 }; // Amount of PPU threads running simultaneously (must be 2)
 		cfg::_bool ppu_debug{ this, "PPU Debug" };
 		cfg::_bool ppu_call_history{ this, "PPU Calling History" }; // Enable PPU calling history recording
@@ -25,7 +29,11 @@ struct cfg_root : cfg::node
 		cfg::_bool llvm_precompilation{ this, "LLVM Precompilation", true };
 		cfg::_enum<thread_scheduler_mode> thread_scheduler{this, "Thread Scheduler Mode", thread_scheduler_mode::os};
 		cfg::_bool set_daz_and_ftz{ this, "Set DAZ and FTZ", false };
+#ifdef __EMSCRIPTEN__
+		cfg::_enum<spu_decoder_type> spu_decoder{ this, "SPU Decoder", spu_decoder_type::_static };
+#else
 		cfg::_enum<spu_decoder_type> spu_decoder{ this, "SPU Decoder", spu_decoder_type::llvm };
+#endif
 		cfg::uint<0, 100> spu_reservation_busy_waiting_percentage{ this, "SPU Reservation Busy Waiting Percentage 1", 100, true };
 		cfg::_bool spu_reservation_busy_waiting_enabled{ this, "SPU Reservation Busy Waiting Enabled", false, true };
 		cfg::uint<0, 100> spu_getllar_busy_waiting_percentage{ this, "SPU GETLLAR Busy Waiting Percentage", 100, true };
@@ -120,6 +128,23 @@ struct cfg_root : cfg::node
 		cfg::_enum<video_renderer> renderer{ this, "Renderer", video_renderer::opengl };
 #endif
 
+#ifdef __EMSCRIPTEN__
+		// wasm32 POC: potato-level defaults. The interpreter-only shader
+		// path skips JIT compilation (a major heap and instantiation cost),
+		// 480p + 25 % scale keeps texture/RT memory minuscule, MSAA off
+		// avoids multisample resolve overhead, low shader precision picks
+		// the cheapest WGSL math, frame limit 30 caps the work pipeline
+		// can do per second. Everything here can be flipped back to native
+		// defaults later once perf headroom appears.
+		cfg::_enum<video_resolution> resolution{ this, "Resolution", video_resolution::_480p };
+		cfg::_enum<video_aspect> aspect_ratio{ this, "Aspect ratio", video_aspect::_16_9 };
+		cfg::_enum<frame_limit_type> frame_limit{ this, "Frame limit", frame_limit_type::_30, true };
+		cfg::_float<0, 1000> second_frame_limit{ this, "Second Frame Limit", 0, true };
+		cfg::_enum<msaa_level> antialiasing_level{ this, "MSAA", msaa_level::none };
+		cfg::_enum<shader_mode> shadermode{ this, "Shader Mode", shader_mode::interpreter_only };
+		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision", gpu_preset_level::low };
+		cfg::_enum<vsync_mode> vsync{ this, "VSync Mode", vsync_mode::off, true };
+#else
 		cfg::_enum<video_resolution> resolution{ this, "Resolution", video_resolution::_720p };
 		cfg::_enum<video_aspect> aspect_ratio{ this, "Aspect ratio", video_aspect::_16_9 };
 		cfg::_enum<frame_limit_type> frame_limit{ this, "Frame limit", frame_limit_type::_auto, true };
@@ -128,7 +153,39 @@ struct cfg_root : cfg::node
 		cfg::_enum<shader_mode> shadermode{ this, "Shader Mode", shader_mode::async_recompiler };
 		cfg::_enum<gpu_preset_level> shader_precision{ this, "Shader Precision", gpu_preset_level::high };
 		cfg::_enum<vsync_mode> vsync{ this, "VSync Mode", vsync_mode::off, true };
+#endif
 
+#ifdef __EMSCRIPTEN__
+		// wasm32 POC: turn off every optional render pipeline. Color/depth
+		// readback round-trips are expensive on WebGPU and we have no game
+		// that needs them; ZCull occlusion queries cost host syncs; on-disk
+		// shader cache writes to OPFS we don't have; frame skip cuts the
+		// effective render rate in half; force CPU blit is the simplest
+		// blit path. disable_async_host_memory_manager keeps memory ops on
+		// the calling thread (one fewer worker).
+		cfg::_bool write_color_buffers{ this, "Write Color Buffers", false };
+		cfg::_bool write_depth_buffer{ this, "Write Depth Buffer", false };
+		cfg::_bool read_color_buffers{ this, "Read Color Buffers", false };
+		cfg::_bool read_depth_buffer{ this, "Read Depth Buffer", false };
+		cfg::_bool handle_tiled_memory{ this, "Handle RSX Memory Tiling", false, true };
+		cfg::_bool log_programs{ this, "Log shader programs", false };
+		cfg::_bool debug_output{ this, "Debug output", false };
+		cfg::_bool debug_overlay{ this, "Debug overlay", false, true };
+		cfg::_bool renderdoc_compatiblity{ this, "Renderdoc Compatibility Mode", false };
+		cfg::_bool use_gpu_texture_scaling{ this, "Use GPU texture scaling", false };
+		cfg::_bool stretch_to_display_area{ this, "Stretch To Display Area", false, true };
+		cfg::_bool force_high_precision_z_buffer{ this, "Force High Precision Z buffer", false };
+		cfg::_bool strict_rendering_mode{ this, "Strict Rendering Mode", false };
+		cfg::_enum<framebuffer_aliasing_bias> fb_aliasing_bias{ this, "Framebuffer Aliasing Heuristic Bias", framebuffer_aliasing_bias::_auto, true };
+		cfg::_bool disable_zcull_queries{ this, "Disable ZCull Occlusion Queries", true, true };
+		cfg::_bool disable_video_output{ this, "Disable Video Output", false, true };
+		cfg::_bool disable_vertex_cache{ this, "Disable Vertex Cache", true };
+		cfg::_bool disable_FIFO_reordering{ this, "Disable FIFO Reordering", true };
+		cfg::_bool emulate_depth_compare{ this, "Emulate Special Depth Comparison", false };
+		cfg::_bool frame_skip_enabled{ this, "Enable Frame Skip", true, true };
+		cfg::_bool force_cpu_blit_processing{ this, "Force CPU Blit", true, true };
+		cfg::_bool disable_on_disk_shader_cache{ this, "Disable On-Disk Shader Cache", true };
+#else
 		cfg::_bool write_color_buffers{ this, "Write Color Buffers" };
 		cfg::_bool write_depth_buffer{ this, "Write Depth Buffer" };
 		cfg::_bool read_color_buffers{ this, "Read Color Buffers" };
@@ -151,6 +208,7 @@ struct cfg_root : cfg::node
 		cfg::_bool frame_skip_enabled{ this, "Enable Frame Skip", false, true };
 		cfg::_bool force_cpu_blit_processing{ this, "Force CPU Blit", false, true }; // Debugging option
 		cfg::_bool disable_on_disk_shader_cache{ this, "Disable On-Disk Shader Cache", false };
+#endif
 		cfg::_bool disable_vulkan_mem_allocator{ this, "Disable Vulkan Memory Allocator", false };
 		cfg::_bool full_rgb_range_output{ this, "Use full RGB output range", true, true }; // Video out dynamic range
 		cfg::_bool strict_texture_flushing{ this, "Strict Texture Flushing", false };
@@ -162,6 +220,33 @@ struct cfg_root : cfg::node
 		cfg::_int<10, 99> screen_size{ this, "Screen size in inches", 24, false };
 		cfg::_bool debug_program_analyser{ this, "Debug Program Analyser", false };
 		cfg::_bool precise_zpass_count{ this, "Accurate ZCULL stats", true };
+#ifdef __EMSCRIPTEN__
+		// wasm32 POC: draw 1 frame, skip 3 — quarter the GPU work. Resolution
+		// scale 25 % drops the framebuffer to 1/16 area vs 100 %. Min scalable
+		// dimension 1 lets every texture get scaled down. 0 shader compiler
+		// threads keeps the interpreter-only path sequential. Vblank 30 halves
+		// the synthetic frame ticks RSX expects. Output scaling = nearest
+		// avoids the bilinear filter pass at present.
+		cfg::_int<1, 8> consecutive_frames_to_draw{ this, "Consecutive Frames To Draw", 1, true};
+		cfg::_int<1, 8> consecutive_frames_to_skip{ this, "Consecutive Frames To Skip", 3, true};
+		cfg::uint<25, 800> resolution_scale_percent{ this, "Resolution Scale", 25, true };
+		cfg::uint<0, 16> anisotropic_level_override{ this, "Anisotropic Filter Override", 1, true };
+		cfg::_float<-32, 32> texture_lod_bias{ this, "Texture LOD Bias Addend", 0, true };
+		cfg::uint<1, 1024> min_scalable_dimension{ this, "Minimum Scalable Dimension", 1, true };
+		cfg::_int<0, 16> shader_compiler_threads_count{ this, "Shader Compiler Threads", 1 };
+		cfg::_int<0, 30000000> driver_recovery_timeout{ this, "Driver Recovery Timeout", 1000000, true };
+		cfg::uint<0, 16667> driver_wakeup_delay{ this, "Driver Wake-Up Delay", 0, true };
+		cfg::_int<1, 6000> vblank_rate{ this, "Vblank Rate", 30, true };
+		cfg::_bool vblank_ntsc{ this, "Vblank NTSC Fixup", false, true };
+		cfg::_bool decr_memory_layout{ this, "DECR memory layout", false};
+		cfg::_bool host_label_synchronization{ this, "Allow Host GPU Labels", false };
+		cfg::_bool disable_msl_fast_math{ this, "Disable MSL Fast Math", false };
+		cfg::_bool disable_async_host_memory_manager{ this, "Disable Asynchronous Memory Manager", true, true };
+		cfg::_enum<output_scaling_mode> output_scaling{ this, "Output Scaling Mode", output_scaling_mode::nearest, true };
+		cfg::_bool record_with_overlays{ this, "Record With Overlays", false, true };
+		cfg::_bool disable_hardware_texel_remapping{ this, "Disable Hardware ColorSpace Remapping", false, true };
+		cfg::uint<0, 100> rcas_sharpening_intensity{ this, "FidelityFX CAS Sharpening Intensity", 0, true };
+#else
 		cfg::_int<1, 8> consecutive_frames_to_draw{ this, "Consecutive Frames To Draw", 1, true};
 		cfg::_int<1, 8> consecutive_frames_to_skip{ this, "Consecutive Frames To Skip", 1, true};
 		cfg::uint<25, 800> resolution_scale_percent{ this, "Resolution Scale", 100, true };
@@ -181,6 +266,7 @@ struct cfg_root : cfg::node
 		cfg::_bool record_with_overlays{ this, "Record With Overlays", true, true };
 		cfg::_bool disable_hardware_texel_remapping{ this, "Disable Hardware ColorSpace Remapping", false, true };
 		cfg::uint<0, 100> rcas_sharpening_intensity{ this, "FidelityFX CAS Sharpening Intensity", 50, true };
+#endif
 
 		struct node_vk : cfg::node
 		{
@@ -250,7 +336,16 @@ struct cfg_root : cfg::node
 	{
 		node_audio(cfg::node* _this) : cfg::node(_this, "Audio") {}
 
+#ifdef __EMSCRIPTEN__
+		// wasm32 POC: no audio backend. cubeb on emscripten would route
+		// through Web Audio + a worker thread we don't need yet. Null
+		// renderer means the emulator generates no audio output — saves
+		// the cellAudio thread, the RsxAudio backend thread, and a few
+		// MB of mixing buffers.
+		cfg::_enum<audio_renderer> renderer{ this, "Renderer", audio_renderer::null, true };
+#else
 		cfg::_enum<audio_renderer> renderer{ this, "Renderer", audio_renderer::cubeb, true };
+#endif
 		cfg::_enum<audio_provider> provider{ this, "Audio Provider", audio_provider::cell_audio, false };
 		cfg::_enum<audio_avport> rsxaudio_port{ this, "RSXAudio Avport", audio_avport::hdmi_0, true };
 		cfg::_bool dump_to_file{ this, "Dump to file", false, true };

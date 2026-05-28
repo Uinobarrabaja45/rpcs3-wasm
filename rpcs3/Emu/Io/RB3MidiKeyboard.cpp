@@ -6,6 +6,8 @@
 
 LOG_CHANNEL(rb3_midi_keyboard_log);
 
+#if !defined(__EMSCRIPTEN__)
+
 usb_device_rb3_midi_keyboard::usb_device_rb3_midi_keyboard(const std::array<u8, 7>& location, const std::string& device_name)
 	: usb_device_emulated(location)
 {
@@ -355,3 +357,14 @@ void usb_device_rb3_midi_keyboard::write_state(u8* buf)
 		buf[15] = std::min<u8>(std::max<u8>(0x5, wheel_pos), 0x75);
 	}
 }
+
+#else
+
+usb_device_rb3_midi_keyboard::usb_device_rb3_midi_keyboard(const std::array<u8, 7>& location, const std::string&)
+	: usb_device_emulated(location)
+{}
+usb_device_rb3_midi_keyboard::~usb_device_rb3_midi_keyboard() {}
+void usb_device_rb3_midi_keyboard::control_transfer(u8, u8, u16, u16, u16, u32, u8*, UsbTransfer*) {}
+void usb_device_rb3_midi_keyboard::interrupt_transfer(u32, u8*, u32, UsbTransfer*) {}
+
+#endif

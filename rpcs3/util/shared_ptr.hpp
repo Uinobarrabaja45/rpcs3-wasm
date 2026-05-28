@@ -587,6 +587,13 @@ namespace stx
 			uptr ptr{};
 			u32 is_non_null{};
 			u32 ref_ctr{};
+#if defined(__EMSCRIPTEN__) || (defined(__wasm__) && !defined(__wasm64__))
+			// wasm32: uptr is 4 bytes → sizeof would be 12, but
+			// atomic_t<> requires sizeof to be a power of 2 (for the
+			// double-word CAS lowering). Pad to 16 so the CAS hits the
+			// same aligned slot it does on x86_64/arm64 where uptr is 8.
+			u32 _pad_for_wasm32{};
+#endif
 		};
 
 		mutable atomic_t<fat_ptr> m_val{fat_ptr{}};

@@ -282,7 +282,7 @@ const auto ppu_gateway = build_function_asm<void(*)(ppu_thread*)>("ppu_gateway",
 #endif
 
 	c.ret();
-#else
+#elif defined(ARCH_ARM64)
 	// See https://github.com/ghc/ghc/blob/master/rts/include/stg/MachRegs.h
 	// for GHC calling convention definitions on Aarch64
 	// and https://developer.arm.com/documentation/den0024/a/The-ABI-for-ARM-64-bit-Architecture/Register-use-in-the-AArch64-Procedure-Call-Standard/Parameters-in-general-purpose-registers
@@ -404,6 +404,9 @@ const auto ppu_gateway = build_function_asm<void(*)(ppu_thread*)>("ppu_gateway",
 	// Return
 	c.mov(a64::sp, a64::x15);
 	c.ret(a64::x30);
+#else
+	// wasm32: no JIT — this assembly is unreachable.
+	(void)c; (void)args;
 #endif
 });
 
@@ -418,7 +421,7 @@ const extern auto ppu_escape = build_function_asm<void(*)(ppu_thread*)>("ppu_esc
 	// Return to the return location
 	c.sub(x86::rsp, 8);
 	c.ret();
-#else
+#elif defined(ARCH_ARM64)
 	// We really shouldn't be using this, but an implementation shoudln't hurt
 	// Far jump return. Only clobbers x30.
 	const arm::GpX ppu_t_base = a64::x20;
@@ -427,6 +430,9 @@ const extern auto ppu_escape = build_function_asm<void(*)(ppu_thread*)>("ppu_esc
 	c.mov(a64::x30, Imm(hv_register_array_offset));
 	c.ldr(a64::x30, arm::Mem(ppu_t_base, a64::x30));
 	c.ret(a64::x30);
+#else
+	// wasm32: no JIT — this assembly is unreachable. Suppress unused.
+	(void)c; (void)args;
 #endif
 });
 
@@ -464,6 +470,8 @@ const auto ppu_recompiler_fallback_ghc = build_function_asm<void(*)(ppu_thread& 
 	c.bind(escape_fn);
 	c.embedUInt64(reinterpret_cast<u64>(ppu_escape));
 });
+#else
+const void* const ppu_recompiler_fallback_ghc = nullptr;
 #endif
 
 // Get pointer to executable cache
@@ -773,6 +781,18 @@ extern void ppu_register_range(u32 addr, u32 size)
 	size = utils::align(size + addr % 0x10000, 0x10000);
 	addr &= -0x10000;
 
+#if defined(__EMSCRIPTEN__)
+	// wasm32: validate the range fits in our smaller g_exec_addr region.
+	// g_exec_addr_seg_offset = 64 MiB, total g_exec_addr = 128 MiB. Any
+	// guest addr beyond ~32 MiB would have ppu_ptr (addr*2 = 64 MiB)
+	// stomp on the seg ptr range. Skip out-of-range registrations.
+	if (u64{addr} + u64{size} > 0x2000000ull) // 32 MiB cap
+	{
+		ensure(vm::page_protect(addr, size, 0, vm::page_executable));
+		return;
+	}
+#endif
+
 	// Register executable range at
 	utils::memory_commit(ppu_ptr(addr), u64{size} * 2, utils::protection::rw);
 	ensure(vm::page_protect(addr, size, 0, vm::page_executable));
@@ -1047,7 +1067,7 @@ struct ppu_far_jumps_t
 				c.mov(args[0], x86::rbp);
 				c.mov(args[2], vm::g_base_addr + pc);
 				c.jmp(ppu_far_jump);
-#else
+#elif defined(ARCH_ARM64)
 				Label jmp_address = c.newLabel();
 				Label this_op_address = c.newLabel();
 
@@ -1060,6 +1080,9 @@ struct ppu_far_jumps_t
 				c.embedUInt64(reinterpret_cast<u64>(ppu_far_jump));
 				c.bind(this_op_address);
 				c.embedUInt64(reinterpret_cast<u64>(vm::g_base_addr) + pc);
+#else
+				// wasm32: no JIT — suppress unused
+				(void)c; (void)args; (void)pc;
 #endif
 			}, &rt);
 		}
@@ -1353,6 +1376,18 @@ std::array<u32, 2> op_branch_targets(u32 pc, ppu_opcode_t op)
 
 void ppu_thread::dump_regs(std::string& ret, std::any& custom_data) const
 {
+#if defined(__EMSCRIPTEN__)
+	// wasm32: the native dump_regs body uses PPUDisAsm + std::any +
+	// vm::check_addr<...> chains that trap `unreachable` here (the trap
+	// site at the top of every emergency_exit-induced stack trace in the
+	// browser console). Print only the bare essentials so emergency_exit
+	// from any ensure()/throw_exception failure can complete its log
+	// instead of killing the worker pthread with no diagnostic.
+	(void)custom_data;
+	fmt::append(ret, "cia=0x%08x lr=0x%08x r1=0x%llx (wasm32 stub)\n",
+		static_cast<u32>(cia), static_cast<u32>(lr), static_cast<u64>(gpr[1]));
+	return;
+#else
 	const system_state emu_state = Emu.GetStatus(false);
 	const bool is_stopped_or_frozen = state & cpu_flag::exit || emu_state == system_state::frozen || emu_state <= system_state::stopping;
 	const ppu_debugger_mode mode = debugger_mode.load();
@@ -1622,6 +1657,7 @@ void ppu_thread::dump_regs(std::string& ret, std::any& custom_data) const
 			*(&ret.back() - (4 - (addr % 16 / 4)) * 9 - (8 - (addr % 128 / 16)) * std::size("[0x00]"sv)) = '*';
 		}
 	}
+#endif // __EMSCRIPTEN__
 }
 
 std::string ppu_thread::dump_callstack() const
@@ -2139,6 +2175,8 @@ void ppu_thread::cpu_task()
 	{
 		const u32 arg = cmd.arg2<u32>(); // 32-bit arg extracted
 
+// dispatch logging removed for perf — see exec_task heartbeat instead
+
 		switch (auto type = cmd.arg1<ppu_cmd>())
 		{
 		case ppu_cmd::opcode:
@@ -2403,6 +2441,19 @@ void ppu_thread::exec_task()
 
 	const auto cache = vm::g_exec_addr;
 	const auto mem_ = vm::g_base_addr;
+#if defined(__EMSCRIPTEN__)
+	// Cheap heartbeat: emit "alive" every 5M instructions. Lets us see
+	// when a PPU thread is stuck in a tight loop vs actually progressing
+	// through code, without taxing the hot path (one printf per ~10s of
+	// interpreter work on wasm32 ≈ 0 % overhead).
+	u32 s_hb = 0;
+	// First-instruction guard: log the first dispatch + sanity-check that
+	// the interpreter cache slot is non-null. Without this guard, an
+	// unmapped cia (e.g. HLE_RETURN where the cache wasn't populated)
+	// dispatches a null function pointer → wasm `unreachable` trap that
+	// kills the worker with no diagnostic. Logs once per thread.
+	bool s_first = true;
+#endif
 
 	while (true)
 	{
@@ -2413,9 +2464,36 @@ void ppu_thread::exec_task()
 
 		gv_zeroupper();
 
+#if defined(__EMSCRIPTEN__)
+		if ((++s_hb & 0x4FFFFF) == 0)
+		{
+			printf("[exec_task hb] cia=0x%x raw=0x%x hb=%u\n", cia,
+				reinterpret_cast<be_t<u32>*>(mem_ + u64{cia})->value(), s_hb);
+		}
+#endif
+
 		// Execute instruction (may be step; execute only one instruction if state)
 		const auto op = reinterpret_cast<be_t<u32>*>(mem_ + u64{cia});
 		const auto fn = reinterpret_cast<ppu_intrp_func*>(cache + u64{cia} * 2);
+#if defined(__EMSCRIPTEN__)
+		if (s_first || !fn->fn) [[unlikely]]
+		{
+			const auto sp_name = ppu_tname.load();
+			const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+			printf("[exec_task dispatch] thread='%s' cia=0x%x raw=0x%x fn=%p%s\n",
+				nm, cia, reinterpret_cast<be_t<u32>*>(mem_ + u64{cia})->value(),
+				reinterpret_cast<void*>(fn->fn), fn->fn ? " (first)" : " — NULL would trap unreachable");
+			s_first = false;
+			if (!fn->fn)
+			{
+				// Stop the thread cleanly instead of letting wasm trap.
+				// Surface the dead cia to PPU stop flag; caller sees it as
+				// a normal exit rather than a vanished worker.
+				state += cpu_flag::stop;
+				return;
+			}
+		}
+#endif
 		fn->fn(*this, {*op}, op, state ? &ppu_ret : fn + 1);
 	}
 }
@@ -2571,7 +2649,7 @@ ppu_thread::ppu_thread(utils::serial& ar)
 			cmd_list
 			({
 				{ ppu_cmd::ptr_call, 0 },
-				std::bit_cast<u64>(&ppu_interrupt_thread_entry)
+				static_cast<u64>(std::bit_cast<uptr>(&ppu_interrupt_thread_entry))
 			});
 		}
 	};
@@ -2917,11 +2995,23 @@ void ppu_thread::fast_call(u32 addr, u64 rtoc, bool is_thread_entry)
 		}
 		else if (state & cpu_flag::ret && cia == g_fxo->get<ppu_function_manager>().func_addr(1, true) + 4 && is_thread_entry)
 		{
+#if defined(__EMSCRIPTEN__)
+			// wasm32: for HLE-redirected thread entries (see
+			// sys_ppu_thread.cpp's HLE-region redirect to HLE_RETURN),
+			// reaching here is the EXPECTED clean exit, not an error. The
+			// native dump_all() path calls into PPUDisAsm + std::any +
+			// fmt::append-of-vm::check_addr — at least one of those traps
+			// `unreachable` on wasm32 (seen in browser console: stack ends
+			// at ppu_thread::dump_regs → cpu_thread::dump_all). Skip the
+			// dump and just log a short notice so the worker exits cleanly.
+			ppu_log.notice("Thread entry returned via HLE_RETURN (func=0x%x) — wasm32 redirect", entry_func.addr);
+#else
 			std::string ret;
 			dump_all(ret);
 
 			ppu_log.error("Returning from the thread entry function! (func=0x%x)", entry_func.addr);
 			ppu_log.notice("Thread context: %s", ret);
+#endif
 
 			lv2_obj::sleep(*this);
 

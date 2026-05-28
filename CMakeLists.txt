@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
 find_program(CCACHE_PATH ccache HINTS ENV PATH)
 if(CCACHE_PATH)
   message(STATUS "Using ccache: ${CCACHE_PATH}")

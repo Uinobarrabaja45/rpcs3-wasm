@@ -131,3 +131,13 @@ CMakeUserPresets.json
 
 
 js/rpcs3_browser/node_modules
+
+# WASM/JS build artifacts — emscripten output of build_wasm.sh. The .js
+# glue + .wasm binary together can hit ~30 MB per variant × 4 variants =
+# ~120 MB per commit. Source lives in C++ / TS; binaries should never be
+# tracked.
+build_cmake/build/wasm-ninja/
+js/rpcs3_browser/public/Rpcs3*.js
+js/rpcs3_browser/public/Rpcs3*.wasm
+js/rpcs3_browser/src/Rpcs3*.js
+js/rpcs3_browser/src/Rpcs3*.wasm

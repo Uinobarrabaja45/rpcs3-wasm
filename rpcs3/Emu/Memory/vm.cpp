@@ -28,6 +28,73 @@ namespace vm
 {
 	static u8* memory_reserve_4GiB(void* _addr, u64 size = 0x100000000, bool is_memory_mapping = false)
 	{
+#ifdef __EMSCRIPTEN__
+		// wasm32: 4 GB address-space cap. Can't reserve 4 distinct 4-32 GiB
+		// regions. Strategy:
+		//   * The FIRST call (is_memory_mapping=true, asks for 8 GiB) is the
+		//     real g_base_addr / g_sudo_addr backing. Allocate a single
+		//     large block sized to cover the highest guest address the
+		//     PS3 layout reaches — 0x10000000 (main, 256 MB) through
+		//     0xFFFFFFFF (SPU top). Cap at 1 GiB (largest we can reliably
+		//     get out of wasm32 grow heap). guest -> host translation
+		//     then works for any addr < kBaseSize via vm::base().
+		//   * Subsequent calls (exec / hook / stat tables) get a tiny
+		//     dummy 64 KiB allocation each — emucore never writes more
+		//     than a handful of pages here in our POC scope, and JIT is
+		//     disabled on wasm32.
+		// PS3 layout we need to cover:
+		//   main  0x00010000 - 0x10000000   (256 MB)
+		//   video 0xC0000000 - 0xD0000000   (256 MB)
+		//   stack 0xD0000000 - 0xE0000000   (256 MB)
+		//   spu   0xE0000000 - 0x100000000  (512 MB)
+		// Highest address used = 0x100000000 (4 GiB). We can't allocate
+		// 4 GiB on wasm32 because the heap also has to fit code + other
+		// data. Compromise: 1.5 GiB cap, and we'll move stack/video/SPU
+		// down to fit (see vm:: init shrinkage).
+		(void)_addr;
+		(void)is_memory_mapping;
+		static int s_reserve_call = 0;
+		const int call_idx = s_reserve_call++;
+		constexpr u64 kBaseSize  = 0x60000000ull;   // 1.5 GiB for g_base
+		constexpr u64 kExecSize  = 0x08000000ull;   // 128 MiB for g_exec
+		                                            // = ppu_ptr range (64 MiB at offset 0)
+		                                            // + ppu_seg_ptr range (32 MiB at offset 64 MiB)
+		                                            // matches g_exec_addr_seg_offset in vm.h
+		constexpr u64 kTinySize  = 0x10000ull;      // 64 KiB stubs for hook/stat
+		u64 effective_size;
+		switch (call_idx)
+		{
+		case 0:  effective_size = kBaseSize; break; // g_base_addr (1.5 GiB)
+		case 1:  effective_size = kExecSize; break; // g_exec_addr (128 MiB)
+		default: effective_size = kTinySize; break; // g_hook_addr, g_stat_addr (stubs)
+		}
+		void* mem = std::aligned_alloc(0x10000, (effective_size + 0xFFFF) & ~static_cast<u64>(0xFFFF));
+		if (!mem)
+		{
+			printf("[vm] WASM32 memory_reserve_4GiB call=%d req=0x%llx eff=0x%llx FAILED\n",
+				call_idx,
+				static_cast<unsigned long long>(size),
+				static_cast<unsigned long long>(effective_size));
+			return nullptr;
+		}
+		printf("[vm] WASM32 memory_reserve_4GiB call=%d req=0x%llx eff=0x%llx -> %p (end=%p)\n",
+			call_idx,
+			static_cast<unsigned long long>(size),
+			static_cast<unsigned long long>(effective_size),
+			mem,
+			static_cast<void*>(static_cast<u8*>(mem) + effective_size));
+		// NOTE: skipping memset(0) on the big base region (call 0). emscripten's
+		// dlmalloc returns 0x3af0000 for 1.5 GiB which appears to overlap with
+		// the wasm heap region used by later allocs (elf.progs etc.). Writing
+		// to that range corrupts heap objects allocated *after* memory_reserve
+		// runs. The vm:: layer touches pages on-demand via page_map so the
+		// guest sees mapped-then-cleared memory anyway.
+		if (call_idx != 0)
+		{
+			std::memset(mem, 0, effective_size);
+		}
+		return static_cast<u8*>(mem);
+#else
 		for (u64 addr = reinterpret_cast<u64>(_addr) + 0x100000000; addr < 0x8000'0000'0000; addr += 0x100000000)
 		{
 			if (auto ptr = utils::memory_reserve(size, reinterpret_cast<void*>(addr), is_memory_mapping))
@@ -37,6 +104,7 @@ namespace vm
 		}
 
 		fmt::throw_exception("Failed to reserve vm memory");
+#endif
 	}
 
 	// Emulated virtual memory
@@ -2217,7 +2285,11 @@ namespace vm
 
 	inline namespace ps3_
 	{
+#ifdef __EMSCRIPTEN__
+		static utils::shm s_hook{0x10000, ""};
+#else
 		static utils::shm s_hook{0x800000000, ""};
+#endif
 
 		void init()
 		{
@@ -2237,6 +2309,31 @@ namespace vm
 
 			std::memset(&g_pages, 0, sizeof(g_pages));
 
+#ifdef __EMSCRIPTEN__
+			// wasm32: shrink/relocate guest VM regions so the entire layout
+			// fits inside the 1.5 GiB g_base_addr allocation we get from
+			// aligned_alloc (see memory_reserve_4GiB above). Keep `main`
+			// at its real PS3 address (0x00010000) — most code references
+			// it relative anyway. The video/stack/SPU regions get packed
+			// just above main, well below the 0x60000000 cap.
+			//
+			// Trade-off: any PS3 game that hardcodes guest pointers into
+			// the 0xC0000000+ range (eg. RSX MMIO at 0xC0000000) will
+			// break — but Terraria as a 2D game doesn't do that. Native
+			// rpcs3 keeps the original layout (#else branch below).
+			g_locations =
+			{
+				std::make_shared<block_t>(0x00010000, 0x0FFF0000, page_size_64k | preallocated), // main: 256 MiB at 0x00010000
+				nullptr,                                                                         // user 64k pages
+				nullptr,                                                                         // user 1m pages
+				nullptr,                                                                         // rsx context
+				std::make_shared<block_t>(0x10000000, 0x04000000, page_size_64k | preallocated), // video:  64 MiB at 0x10000000 (was 256 MiB at 0xC0000000)
+				std::make_shared<block_t>(0x14000000, 0x04000000, page_size_4k  | preallocated | stack_guarded | bf0_0x1), // stack:  64 MiB at 0x14000000 (was 256 MiB at 0xD0000000)
+				std::make_shared<block_t>(0x18000000, 0x08000000, page_size_64k),                // SPU:   128 MiB at 0x18000000 (was 512 MiB at 0xE0000000)
+				// Highest used address = 0x20000000 (512 MiB). Well under
+				// the 0x60000000 (1.5 GiB) g_base_addr cap.
+			};
+#else
 			g_locations =
 			{
 				std::make_shared<block_t>(0x00010000, 0x0FFF0000, page_size_64k | preallocated), // main
@@ -2247,6 +2344,7 @@ namespace vm
 				std::make_shared<block_t>(0xD0000000, 0x10000000, page_size_4k  | preallocated | stack_guarded | bf0_0x1), // stack
 				std::make_shared<block_t>(0xE0000000, 0x20000000, page_size_64k),                // SPU reserved
 			};
+#endif
 
 			std::memset(g_reservations, 0, sizeof(g_reservations));
 			std::memset(g_shmem, 0, sizeof(g_shmem));

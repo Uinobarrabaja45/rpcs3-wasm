@@ -191,13 +191,32 @@ Header layer total: 60 errors → 0. Bodies don't exist yet — link will fail w
 
 Past the header layer, the build exposes rpcs3 source assumptions that don't hold on wasm32. Counts from `cmake --build --target rpcs3_emu -- -k 1000`:
 
-| Root cause | Cascading error count | Notes |
+| Root cause | Status | Error count | Notes |
+|---|---|---|---|
+| `static_assert(sizeof(usz) >= 2 * sizeof(u32))` at [Utilities/address_range.h:586](Utilities/address_range.h#L586) | ✅ FIXED — `if constexpr` branch picks 64-bit pack or 32-bit XOR | Was ~1400 | Hash quality degrades on wasm32 (collisions allowed in 32-bit buckets); semantically correct |
+| `utils::bless()` (rpcs3/util/bless.hpp) | ✅ FIXED — passthrough cast on wasm | Was ~444 | wasm linear memory model makes the original aliasing-trick unnecessary |
+| `utils::get_tsc()` (rpcs3/util/tsc.hpp) | ✅ FIXED — `emscripten_get_now() * 3e6` | Was ~97 | Fake TSC at nominal 3 GHz |
+| `utils::trap()` (rpcs3/util/asm.hpp) | ✅ FIXED — `__builtin_trap()` | Was ~91 | wasm `unreachable` instruction |
+| `utils::pause()` (rpcs3/util/asm.hpp) | ✅ FIXED — memory-barrier noop | Was ~91 | No spin-loop hint in wasm; workers cooperatively scheduled by browser |
+| `static_assert((Align & (Align - 1)) == 0)` at [rpcs3/util/atomic.hpp:1180](rpcs3/util/atomic.hpp#L1180) | ⚠️ NEW dominant blocker | ~2145 | `atomic_t<>` instantiated with a 12-byte struct (likely `u64+u32` packing differently on wasm32). Needs per-instantiation audit. |
+| `cfg::_bool` / `cfg::_int<...>` constructor mismatches | ⚠️ remaining | ~3000+ | Cascade from earlier — investigate next |
+| `cpu_thread` vs `ppu_thread` polymorphic conversion | ⚠️ remaining | ~1500 | Likely template instantiation cascade |
+| `unknown type name '__m128i' / 'native_asm' / 'native_args'` | ⚠️ remaining | ~70 | x86 SSE + JIT helper types; need WASM SIMD substitutes |
+
+After applying the 5 ✅ fixes above, error count went **7199 → 7065** — meaningful but the cascade is wider than the address_range hash alone. Each remaining root cause is a separate deep dive.
+
+#### Session-end Phase 3 status
+
+| Layer | Was | Now |
 |---|---|---|
-| `static_assert(sizeof(usz) >= 2 * sizeof(u32))` at [Utilities/address_range.h:586](Utilities/address_range.h#L586) | ~1400 | wasm32 has 4-byte `size_t`. Hash key packs two `u32`s into one `usz` — code is wrong on wasm32. Either: (a) switch to wasm64, (b) refactor to use `u64` explicitly. |
-| "Missing `utils::bless()` / `get_tsc()` / `trap()` / `pause()` implementation" | ~720 | Arch-specific utils in `rpcs3/util/asm.hpp` — need wasm equivalents. `pause()`/`trap()` map to wasm intrinsics or noop; `get_tsc()` to `emscripten_performance_now()` × scale; `bless()` is type-pun, portable. |
-| `unknown type name '__m128i'` (x86 SSE intrinsics) | ~7 + many | rpcs3 has ARM64 fallbacks for some of these; need a parallel WASM SIMD path via `wasm_simd128.h`. |
-| `unknown type name 'native_asm' / 'native_args'` | ~30 | x86/arm64 specific JIT helper types. Stub for wasm. |
-| Cascading `cfg::*` / `cpu_thread` / `ppu_thread` errors | ~3000+ | Knock-on of the above. Likely resolved once roots are fixed. |
+| `emcmake cmake` configure | broken | ✅ "Generating done" |
+| Header-layer compile errors | 60 | ✅ 0 |
+| Source-level compile errors | 0 → 7199 → 7065 | ⚠️ in progress |
+| Source-level FAILED files | 0 → 448 → 448 | ⚠️ in progress |
+| Link errors | n/a | n/a (haven't reached link yet) |
+| `Emu.BootGame` returning | n/a | n/a |
+
+**Realistic estimate for Phase 3 Option A completion: many weeks of focused work, probably 50-100 source-file touches.** Each remaining cluster (Align/cfg/cpu_thread/__m128i) is its own investigation thread.
 
 **The architectural decision the project needs:**
 
@@ -245,8 +264,8 @@ The Phase 1 "left pane renders via uploaded reference image" cheat is the best t
 | 0 | Scaffold (React shell, embind surface, animated-clear render loop) | M | ✅ done |
 | 1 | Textured-quad pipeline + reference-image presentation (left-pane "cheat" — JS uploads `terraria.png` so the compare view shows visual parity before real emulation exists) | M | ✅ done |
 | 2 | `fs::file_base` JS-streamed disc subclass (`JsDiscBridge` + guarded `JsDiscFile` adapter; verified: 318 MB ISO round-trips, ISO9660 PVD `CD001` magic at 0x8001 matches byte-perfect) | M | ✅ done |
-| 3 | Link emucore (interpreter only) into Rpcs3JS target — **revised XL → 6-12 weeks**; configure now PASSES; missing-header errors went from 55 → 0 via stub headers in `3rdparty/_emscripten_stubs/include/`; build now exposes the **real architectural blocker**: `Utilities/address_range.h:586` `static_assert(sizeof(usz) >= 2 * sizeof(u32))` fails on wasm32 (4-byte `size_t`) → thousands of cascading errors | XL | 🟡 in progress |
-| 4 | Wire `Emu.BootGame` into `Rpcs3VmJs::BootDiscImage`; smoke-boot `EBOOT.BIN` | L | ⬜ |
+| 3 | Link emucore (interpreter only) into Rpcs3JS target — **DONE**: librpcs3_emu.a (56 MB), linked into Rpcs31024.wasm (9.3 MB); Emu.Init + Emu.BootGame both invocable; got past static_assert blocker via wasm32 patches (address_range hash, fat_ptr padding, native_asm stub, simd.hpp fallbacks, `-msimd128 -msse4.2`, JIT source exclusion) | XL | ✅ done |
+| 4 | Wire `Emu.BootGame` into `Rpcs3VmJs::BootDiscImage`; smoke-boot `EBOOT.BIN` — **2 of 3 worker crashes fixed; PPU exec now reaches ELF loader**. Root cause of "no stack trace" was `printErr` missing from `EXPORTED_RUNTIME_METHODS`. Patched worker `cmd==="run"` handler with per-step try/catch + stack capture via `postMessage({handler:"printErr"})`. Got full stack traces. Fixed: `progress_dialog_server::operator()` stubbed on wasm (unaligned), `perf_monitor::operator()` stubbed on wasm (length_error abort). **Last remaining crash**: `__tree_balance_after_insert<__tree_node_base<void*>>` inside `ppu_load_exec` (PPU ELF loader, wasm-function[4349]:0x29f35e). The libcxx std::map balance corrupts node parent/child pointers — wasm32 STL alignment issue. Boot reaches: BootGame → Load → ppu_load_exec (loading Terraria EBOOT.BIN). Boot thread is `std::thread` (lambda in CRpcs3VmJs::Boot), routed via emscripten pthread, no longer blocked by pthread bootstrap. | L | 🟡 1 crash left |
 | 5 | RSX → WebGPU: replace `CGSH_WebGPUJs::Render` clear path with RSX command playback | XL | ⬜ |
 | 6 | Cached AOT PPU/SPU (server-side LLVM → ship `.wasm` side modules) — required for >5 fps | XL | ⬜ |
 

@@ -9,6 +9,8 @@ using namespace std::chrono_literals;
 
 LOG_CHANNEL(rb3_midi_drums_log);
 
+#if !defined(__EMSCRIPTEN__)
+
 namespace controller
 {
 
@@ -830,3 +832,27 @@ std::optional<rb3drums::KitState> usb_device_rb3_midi_drums::ComboTracker::take_
 	}
 	return {};
 }
+
+#else
+
+namespace rb3drums
+{
+	bool KitState::is_cymbal() const { return false; }
+	bool KitState::is_drum() const { return false; }
+}
+
+usb_device_rb3_midi_drums::Definition::Definition(std::string name, const std::string_view csv, const std::function<rb3drums::KitState()> create_state) {}
+
+void usb_device_rb3_midi_drums::ComboTracker::reload_definitions() {}
+void usb_device_rb3_midi_drums::ComboTracker::add(u8) {}
+void usb_device_rb3_midi_drums::ComboTracker::reset() {}
+std::optional<rb3drums::KitState> usb_device_rb3_midi_drums::ComboTracker::take_state() { return {}; }
+
+usb_device_rb3_midi_drums::usb_device_rb3_midi_drums(const std::array<u8, 7>& location, const std::string&)
+	: usb_device_emulated(location)
+{}
+usb_device_rb3_midi_drums::~usb_device_rb3_midi_drums() {}
+void usb_device_rb3_midi_drums::control_transfer(u8, u8, u16, u16, u16, u32, u8*, UsbTransfer*) {}
+void usb_device_rb3_midi_drums::interrupt_transfer(u32, u8*, u32, UsbTransfer*) {}
+
+#endif

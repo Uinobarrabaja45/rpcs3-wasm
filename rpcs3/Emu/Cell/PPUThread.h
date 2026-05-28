@@ -78,8 +78,26 @@ struct ppu_thread_params
 	u64 arg1;
 };
 
+#include <cstring>
+
 struct cmd64
 {
+	template <typename To, typename From>
+	static constexpr To bit_cast_safe(const From& val) noexcept
+	{
+		if constexpr (sizeof(To) == sizeof(From))
+		{
+			return std::bit_cast<To>(val);
+		}
+		else
+		{
+			To temp{};
+			constexpr size_t copy_size = sizeof(To) < sizeof(From) ? sizeof(To) : sizeof(From);
+			std::memcpy(&temp, &val, copy_size);
+			return temp;
+		}
+	}
+
 	u64 m_data = 0;
 
 	constexpr cmd64() noexcept = default;
@@ -92,13 +110,13 @@ struct cmd64
 
 	template <typename T, typename T2 = std::common_type_t<T>>
 	cmd64(const T& value)
-		: m_data(std::bit_cast<u64, T2>(value))
+		: m_data(bit_cast_safe<u64, T2>(value))
 	{
 	}
 
 	template <typename T1, typename T2>
 	cmd64(const T1& arg1, const T2& arg2)
-		: cmd64(pair_t{std::bit_cast<u32>(arg1), std::bit_cast<u32>(arg2)})
+		: cmd64(pair_t{bit_cast_safe<u32>(arg1), bit_cast_safe<u32>(arg2)})
 	{
 	}
 
@@ -110,19 +128,19 @@ struct cmd64
 	template <typename T>
 	T as() const
 	{
-		return std::bit_cast<T>(m_data);
+		return bit_cast_safe<T>(m_data);
 	}
 
 	template <typename T>
 	T arg1() const
 	{
-		return std::bit_cast<T>(std::bit_cast<pair_t>(m_data).arg1);
+		return bit_cast_safe<T>(bit_cast_safe<pair_t>(m_data).arg1);
 	}
 
 	template <typename T>
 	T arg2() const
 	{
-		return std::bit_cast<T>(std::bit_cast<pair_t>(m_data).arg2);
+		return bit_cast_safe<T>(bit_cast_safe<pair_t>(m_data).arg2);
 	}
 };
 

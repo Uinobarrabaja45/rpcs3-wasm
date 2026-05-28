@@ -436,6 +436,11 @@ error_code _sys_lwcond_queue_wait(ppu_thread& ppu, u32 lwcond_id, u32 lwmutex_id
 {
 	ppu.state += cpu_flag::wait;
 
+#if defined(__EMSCRIPTEN__)
+	// wasm32 POC: cap indefinite waits to prevent deadlocks on missing
+	// signaller threads (cellSysutil _cfg_evt_hndlr crashes in HLE init).
+	if (timeout == 0) timeout = 10000; // 10 ms
+#endif
 	sys_lwcond.trace("_sys_lwcond_queue_wait(lwcond_id=0x%x, lwmutex_id=0x%x, timeout=0x%llx)", lwcond_id, lwmutex_id, timeout);
 
 	ppu.gpr[3] = CELL_OK;

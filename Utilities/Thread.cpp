@@ -136,7 +136,13 @@ std::string dump_useful_thread_info()
 #ifndef _WIN32
 bool IsDebuggerPresent()
 {
-#if defined(__APPLE__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#if defined(__EMSCRIPTEN__)
+	// /proc/self/status doesn't exist under Emscripten — the call from
+	// emergency_exit / signal-context paths floods the console with
+	// "Failed to open /proc/self/status" (~hundreds of lines per crash).
+	// There's no debugger to detect in a browser worker anyway.
+	return false;
+#elif defined(__APPLE__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 	int mib[] = {
 		CTL_KERN,
 		KERN_PROC,
@@ -2098,6 +2104,9 @@ const bool s_exception_handler_set = []() -> bool
 
 #else
 
+#ifdef __EMSCRIPTEN__
+const bool s_exception_handler_set = true;
+#else
 static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
 {
 	ucontext_t* context = static_cast<ucontext_t*>(uct);
@@ -2267,6 +2276,7 @@ const bool s_exception_handler_set = []() -> bool
 	std::printf("Debugger: %d\n", +IsDebuggerPresent());
 	return true;
 }();
+#endif
 
 #endif
 
@@ -2292,6 +2302,10 @@ thread_local DECLARE(thread_ctrl::g_tls_error_callback) = nullptr;
 
 DECLARE(thread_ctrl::g_native_core_layout) { native_core_arrangement::undefined };
 
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+extern "C" void emcc_register_thread_entry(thread_base* base);
+#endif
+
 void thread_base::start()
 {
 	m_sync.atomic_op([&](u32& v)
@@ -2299,6 +2313,19 @@ void thread_base::start()
 		v &= ~static_cast<u32>(thread_state::mask);
 		v |= static_cast<u32>(thread_state::created);
 	});
+
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+	// wasm32: register the entry function for our C trampoline so it
+	// can dispatch to the right callable when pthread_create returns.
+	emcc_register_thread_entry(this);
+	{
+		// Resolve the name from the m_tname shared_ptr for diagnostics.
+		const auto sp_name = m_tname.load();
+		const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+		printf("[thread_base::start] wasm32 spawn name='%s' this=%p entry=%p\n",
+			nm, static_cast<void*>(this), reinterpret_cast<void*>(entry_point));
+	}
+#endif
 
 #ifdef _WIN32
 	m_thread = ::_beginthreadex(nullptr, 0, entry_point, this, CREATE_SUSPENDED, nullptr);
@@ -2324,8 +2351,8 @@ void thread_base::start()
 void thread_base::initialize(void (*error_cb)())
 {
 #ifndef _WIN32
-#ifdef ANDROID
-	m_thread.release(pthread_self());
+#if defined(ANDROID) || defined(__EMSCRIPTEN__)
+	m_thread.release(static_cast<u64>(reinterpret_cast<uintptr_t>(pthread_self())));
 #else
 	m_thread.release(reinterpret_cast<u64>(pthread_self()));
 #endif
@@ -2402,7 +2429,7 @@ void thread_base::set_name(std::string name)
 	pthread_set_name_np(pthread_self(), name.c_str());
 #elif defined(__NetBSD__)
 	pthread_setname_np(pthread_self(), "%s", name.data());
-#elif !defined(_WIN32)
+#elif !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 	name.resize(std::min<usz>(15, name.size()));
 	pthread_setname_np(pthread_self(), name.c_str());
 #endif
@@ -2428,6 +2455,19 @@ u64 thread_base::finalize(thread_state result_state) noexcept
 	const u64 fhard = 0;
 	const u64 ctxvol = 0;
 	const u64 ctxinv = 0;
+#elif defined(__EMSCRIPTEN__)
+	// Emscripten has RUSAGE_THREAD declared but the syscall is a no-op
+	// stub that prints "warning: unsupported syscall: __syscall_getrusage"
+	// to the console every time it's called. finalize() runs once per
+	// thread exit so this fires ~30 times per boot. Skip and report zeros.
+	static thread_local u64 tls_time{}, tls_fsoft{}, tls_fhard{}, tls_ctxvol{}, tls_ctxinv{};
+	const u64 cycles = 0;
+	const u64 time = 0;
+	const u64 fsoft = 0;
+	const u64 fhard = 0;
+	const u64 ctxvol = 0;
+	const u64 ctxinv = 0;
+	(void)tls_time; (void)tls_fsoft; (void)tls_fhard; (void)tls_ctxvol; (void)tls_ctxinv;
 #elif defined(RUSAGE_THREAD)
 	static thread_local u64 tls_time{}, tls_fsoft{}, tls_fhard{}, tls_ctxvol{}, tls_ctxinv{};
 	const u64 cycles = 0; // Not supported
@@ -2514,8 +2554,89 @@ thread_base::native_entry thread_base::finalize(u64 _self) noexcept
 	return nullptr;
 }
 
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+// wasm32: build_function_asm can't JIT — the x86_64/arm64 trampoline
+// returned by `make_trampoline` would normally be machine code that
+// calls entry(thread_base), then finalize(result), then tail-jumps to
+// the next entry if finalize returned one. On wasm we can't emit asm,
+// so use a portable C trampoline.
+//
+// The challenge: `entry` differs per template instantiation but
+// pthread_entry signature is fixed (`void*(*)(void*)`). We store the
+// map from thread_base* → entry in a global mutex-protected map. The
+// pthread arg is the thread_base*; the trampoline looks up the entry
+// pointer, calls it, calls finalize, and loops if finalize returned a
+// new entry. Tail-call replaced by a loop — fine because wasm has no
+// stack-frame ABI mismatch concern here.
+
+namespace {
+	std::mutex g_emcc_entry_mutex;
+	std::unordered_map<thread_base*, u64(*)(thread_base*)>& emcc_entry_map() {
+		static std::unordered_map<thread_base*, u64(*)(thread_base*)> m;
+		return m;
+	}
+	std::mutex g_emcc_pending_mutex;
+	u64 (*g_emcc_pending_entry)(thread_base*) = nullptr;
+}
+
+// Pointer to thread_base::finalize, captured inside make_trampoline()
+// where private access is allowed. The trampoline body below uses it
+// without naming the private static directly.
+namespace {
+	thread_base::native_entry (*g_emcc_finalize)(u64) = nullptr;
+}
+
+extern "C" void* emcc_trampoline_pthread_entry(void* arg)
+{
+	auto* base = static_cast<thread_base*>(arg);
+	if (!base) { puts("[emcc_trampoline] null base"); return nullptr; }
+	const auto sp_name = base->get_name_ptr();
+	const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+	printf("[emcc_trampoline] thread started name='%s' this=%p\n", nm, arg);
+	auto entry = base->emcc_entry;
+	if (!entry) { printf("[emcc_trampoline] no entry registered name='%s'\n", nm); return nullptr; }
+	printf("[emcc_trampoline] calling entry() name='%s' entry=%p\n", nm, reinterpret_cast<void*>(entry));
+	u64 result = 0;
+	result = entry(base);
+	printf("[emcc_trampoline] entry() returned result=%llu name='%s'\n", static_cast<unsigned long long>(result), nm);
+	auto next_entry = g_emcc_finalize ? g_emcc_finalize(result) : nullptr;
+	while (next_entry)
+	{
+		thread_base* current = thread_ctrl::get_current();
+		if (!current) break;
+		result = reinterpret_cast<u64(*)(thread_base*)>(next_entry)(current);
+		next_entry = g_emcc_finalize ? g_emcc_finalize(result) : nullptr;
+	}
+	printf("[emcc_trampoline] exit name='%s'\n", nm);
+	return nullptr;
+}
+
+// Called from thread_base::start() right before pthread_create on wasm.
+// Picks up the entry pointer most-recently stashed by make_trampoline()
+// and writes it onto the thread_base instance so the trampoline can find
+// it without a global lookup.
+extern "C" void emcc_register_thread_entry(thread_base* base)
+{
+	std::lock_guard<std::mutex> lk2(g_emcc_pending_mutex);
+	base->emcc_entry = g_emcc_pending_entry;
+}
+#endif
+
 thread_base::native_entry thread_base::make_trampoline(u64(*entry)(thread_base* _base))
 {
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+	// Save the entry function pointer in a global; the next thread to
+	// register (via emcc_register_thread_entry called from start()) will
+	// pick it up. There's a window of unsafety if multiple threads start
+	// concurrently — the mutex below serialises trampoline creation.
+	std::lock_guard<std::mutex> lk(g_emcc_pending_mutex);
+	g_emcc_pending_entry = entry;
+	// Capture finalize address from inside this member function, where
+	// private access is allowed.
+	g_emcc_finalize = &thread_base::finalize;
+	return reinterpret_cast<native_entry>(&emcc_trampoline_pthread_entry);
+#endif
+
 	return build_function_asm<native_entry>("", [&](native_asm& c, auto& args)
 	{
 		using namespace asmjit;
@@ -2775,6 +2896,8 @@ thread_base::~thread_base() noexcept
 		CloseHandle(handle0);
 #elif defined(ANDROID)
 		pthread_join(m_thread.load(), nullptr);
+#elif defined(__EMSCRIPTEN__)
+		pthread_join(reinterpret_cast<pthread_t>(static_cast<uintptr_t>(m_thread.load())), nullptr);
 #else
 		pthread_join(reinterpret_cast<pthread_t>(m_thread.load()), nullptr);
 #endif
@@ -2851,6 +2974,8 @@ u64 thread_base::get_cycles()
 	struct timespec thread_time;
 #ifdef ANDROID
 	pthread_t thread_id = handle;
+#elif defined(__EMSCRIPTEN__)
+	pthread_t thread_id = reinterpret_cast<pthread_t>(static_cast<uintptr_t>(handle));
 #else
 	pthread_t thread_id = reinterpret_cast<pthread_t>(handle);
 #endif
@@ -3515,6 +3640,9 @@ std::pair<void*, usz> thread_ctrl::get_thread_stack()
 #elif defined(__APPLE__)
 	saddr = pthread_get_stackaddr_np(pthread_self());
 	ssize = pthread_get_stacksize_np(pthread_self());
+#elif defined(__EMSCRIPTEN__)
+	saddr = nullptr;
+	ssize = 0;
 #else
 	pthread_attr_t attr;
 	pthread_attr_get_np(pthread_self(), &attr);
@@ -3531,6 +3659,8 @@ u64 thread_ctrl::get_tid()
 	return GetCurrentThreadId();
 #elif defined(ANDROID)
 	return static_cast<u64>(pthread_self());
+#elif defined(__EMSCRIPTEN__)
+	return static_cast<u64>(reinterpret_cast<uintptr_t>(pthread_self()));
 #elif defined(__linux__)
 	return syscall(SYS_gettid);
 #else

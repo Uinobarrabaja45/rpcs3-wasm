@@ -2096,6 +2096,9 @@ void ppu_unload_prx(const lv2_prx& prx)
 
 bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::string& elf_path, utils::serial* ar)
 {
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] WASM32-BISECT entry; progs=%zu\n", elf.progs.size());
+#endif
 	if (elf != elf_error::ok)
 	{
 		return false;
@@ -2117,13 +2120,28 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 		}
 	}
 
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] WASM32-BISECT pre init_ppu_functions\n");
+#endif
 	init_ppu_functions(ar, false);
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] WASM32-BISECT post init_ppu_functions\n");
+#endif
 
 	// Set for delayed initialization in ppu_initialize()
 	auto& _main = g_fxo->get<main_ppu_module<lv2_obj>>();
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] WASM32-BISECT post fxo::get main_ppu_module\n");
+#endif
 
 	// Access linkage information object
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] WASM32-BISECT pre g_fxo->get<ppu_linkage_info>\n");
+#endif
 	auto& link = g_fxo->get<ppu_linkage_info>();
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] WASM32-BISECT post g_fxo->get<ppu_linkage_info> ptr=%p\n", reinterpret_cast<void*>(&link));
+#endif
 
 	// TLS information
 	u32 tls_vaddr = 0;
@@ -2176,14 +2194,57 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	u32 segs_size = 0;
 
 	// Allocate memory at fixed positions
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] WASM32-BISECT pre alloc-segs loop\n");
+	int _bs_idx = 0;
+#endif
+#if defined(__EMSCRIPTEN__)
+	// wasm32: elf.progs gets clobbered between iterations of the seg
+	// loop (root cause TBD — likely heap/stack overlap with g_base_addr).
+	// Snapshot the vector now so the loop sees stable data even if the
+	// original storage is corrupted later. The snapshot lives on the
+	// loop's own stack frame so it's independent of caller state.
+	const auto progs_snapshot = elf.progs;
+	printf("[ppu_load_exec] WASM32-BISECT progs.data=%p progs.size=%zu sizeof(prog)=%zu snapshot.data=%p snapshot.size=%zu\n",
+		static_cast<const void*>(elf.progs.data()), elf.progs.size(),
+		sizeof(decltype(elf.progs)::value_type),
+		static_cast<const void*>(progs_snapshot.data()), progs_snapshot.size());
+	for (size_t _i = 0; _i < progs_snapshot.size(); ++_i)
+	{
+		const auto& _p = progs_snapshot[_i];
+		printf("[ppu_load_exec] WASM32-BISECT pre-loop prog[%zu] type=0x%x vaddr=0x%llx memsz=0x%llx\n",
+			_i, _p.p_type, static_cast<unsigned long long>(_p.p_vaddr), static_cast<unsigned long long>(_p.p_memsz));
+	}
+	for (const auto& prog : progs_snapshot)
+	{
+#else
 	for (const auto& prog : elf.progs)
 	{
+#endif
+#if defined(__EMSCRIPTEN__)
+		printf("[ppu_load_exec] WASM32-BISECT loop-top idx=%d &prog=%p\n", _bs_idx, static_cast<const void*>(&prog));
+		printf("[ppu_load_exec] WASM32-BISECT alloc-seg #%d ENTER &prog=%p type=0x%x vaddr=0x%llx memsz=0x%llx p_filesz=0x%llx p_flags=0x%x\n", _bs_idx++, static_cast<const void*>(&prog), prog.p_type, static_cast<unsigned long long>(prog.p_vaddr), static_cast<unsigned long long>(prog.p_memsz), static_cast<unsigned long long>(prog.p_filesz), prog.p_flags);
+		printf("[ppu_load_exec] WASM32-BISECT pre-notice (skipping ppu_loader.notice on wasm32)\n");
+		// ppu_loader.notice via fmt machinery has been crashing with
+		// "function signature mismatch" on wasm32, even though seg #0
+		// went through fine. Suspect: indirect function-table corruption
+		// somewhere between the two calls. Skip the notice for now —
+		// the ENTER printf above already gives us the same info, so we
+		// lose nothing diagnostically.
+#else
 		ppu_loader.notice("** Segment: p_type=0x%x, p_vaddr=0x%llx, p_filesz=0x%llx, p_memsz=0x%llx, flags=0x%x", prog.p_type, prog.p_vaddr, prog.p_filesz, prog.p_memsz, prog.p_flags);
+#endif
+#if defined(__EMSCRIPTEN__)
+		printf("[ppu_load_exec] WASM32-BISECT alloc-seg post-notice\n");
+#endif
 
 		ppu_segment _seg;
 		const u32 addr = _seg.addr = vm::cast(prog.p_vaddr);
 		const u32 size = _seg.size = ::narrow<u32>(prog.p_memsz);
 		const u32 type = _seg.type = prog.p_type;
+#if defined(__EMSCRIPTEN__)
+		printf("[ppu_load_exec] WASM32-BISECT alloc-seg post-narrow type=0x%x\n", type);
+#endif
 
 		_seg.flags  = prog.p_flags;
 		_seg.filesz = ::narrow<u32>(prog.p_filesz);
@@ -2191,9 +2252,20 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 		// Hash big-endian values
 		sha1_update(&sha, reinterpret_cast<const uchar*>(&prog.p_type), sizeof(prog.p_type));
 		sha1_update(&sha, reinterpret_cast<const uchar*>(&prog.p_flags), sizeof(prog.p_flags));
+#if defined(__EMSCRIPTEN__)
+		printf("[ppu_load_exec] WASM32-BISECT alloc-seg post-sha1 type=0x%x\n", type);
+		{
+			const u64 _pm = prog.p_memsz;
+			printf("[ppu_load_exec] WASM32-BISECT pre LOAD-check type==0x1?=%d p_memsz=0x%llx\n",
+				type == 0x1, static_cast<unsigned long long>(_pm));
+		}
+#endif
 
 		if (type == 0x1 /* LOAD */ && prog.p_memsz)
 		{
+#if defined(__EMSCRIPTEN__)
+			printf("[ppu_load_exec] WASM32-BISECT in LOAD branch, addr=0x%x size=0x%x\n", addr, size);
+#endif
 			if (prog.bin.size() > size || prog.bin.size() != prog.p_filesz)
 			{
 				ppu_loader.error("ppu_load_exec(): Invalid binary size (0x%llx, memsz=0x%x)", prog.bin.size(), size);
@@ -2201,6 +2273,9 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 			}
 
 			const bool already_loaded = ar && vm::check_addr(addr, vm::page_readable, size);
+#if defined(__EMSCRIPTEN__)
+			printf("[ppu_load_exec] WASM32-BISECT already_loaded=%d virtual=%d\n", already_loaded?1:0, virtual_load?1:0);
+#endif
 
 			_seg.ptr = vm::base(addr);
 
@@ -2222,8 +2297,14 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 				// 1M pages if it is RSX shared
 				const u32 area_flags = (_seg.flags >> 28) ? vm::page_size_1m : vm::page_size_64k;
 				const u32 alloc_at = std::max<u32>(addr & -0x10000000, 0x10000);
+#if defined(__EMSCRIPTEN__)
+				printf("[ppu_load_exec] WASM32-BISECT lambda: area_flags=0x%x alloc_at=0x%x addr=0x%x size=0x%x\n", area_flags, alloc_at, addr, size);
+#endif
 
 				const auto area = vm::reserve_map(vm::any, std::max<u32>(addr & -0x10000000, 0x10000), 0x10000000, area_flags);
+#if defined(__EMSCRIPTEN__)
+				printf("[ppu_load_exec] WASM32-BISECT lambda: reserve_map -> area=%p\n", static_cast<void*>(area.get()));
+#endif
 
 				if (!area)
 				{
@@ -2236,7 +2317,14 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 					return false;
 				}
 
-				return area->falloc(addr, size);
+#if defined(__EMSCRIPTEN__)
+				printf("[ppu_load_exec] WASM32-BISECT lambda: pre falloc addr=0x%x size=0x%x\n", addr, size);
+#endif
+				const bool fa = area->falloc(addr, size);
+#if defined(__EMSCRIPTEN__)
+				printf("[ppu_load_exec] WASM32-BISECT lambda: post falloc result=%d\n", fa);
+#endif
+				return fa;
 			}())
 			{
 				ppu_loader.error("ppu_load_exec(): vm::falloc() failed (addr=0x%x, memsz=0x%x)", addr, size);
@@ -2244,10 +2332,27 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 			}
 
 			// Store only LOAD segments (TODO)
+#if defined(__EMSCRIPTEN__)
+			printf("[ppu_load_exec] WASM32-BISECT pre segs.emplace_back, current size=%zu\n", _main.segs.size());
+#endif
 			_main.segs.emplace_back(_seg);
+#if defined(__EMSCRIPTEN__)
+			printf("[ppu_load_exec] WASM32-BISECT pre addr_to_seg_index.emplace, current size=%zu\n", _main.addr_to_seg_index.size());
+#endif
 			_main.addr_to_seg_index.emplace(addr, ::size32(_main.segs) - 1);
+#if defined(__EMSCRIPTEN__)
+			printf("[ppu_load_exec] WASM32-BISECT post addr_to_seg_index.emplace\n");
+#endif
 
 			// Copy segment data, hash it
+#if defined(__EMSCRIPTEN__)
+			{
+				void* dst = _main.get_ptr<void>(addr);
+				const void* src = prog.bin.data();
+				printf("[ppu_load_exec] WASM32-BISECT pre memcpy dst=%p src=%p bin_size=%zu vm_base=%p seg_ptr=%p\n",
+					dst, src, prog.bin.size(), reinterpret_cast<void*>(vm::base(0)), _seg.ptr);
+			}
+#endif
 			if (!already_loaded)
 			{
 				std::memcpy(_main.get_ptr<void>(addr), prog.bin.data(), prog.bin.size());
@@ -2259,6 +2364,9 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 				const u32 addr0 = addr & -0x10000;
 				vm::page_protect(addr0, size0, 0, vm::page_writable | vm::page_readable, vm::page_executable);
 			}
+#if defined(__EMSCRIPTEN__)
+			printf("[ppu_load_exec] WASM32-BISECT post memcpy\n");
+#endif
 
 			sha1_update(&sha, reinterpret_cast<const uchar*>(&prog.p_vaddr), sizeof(prog.p_vaddr));
 			sha1_update(&sha, reinterpret_cast<const uchar*>(&prog.p_memsz), sizeof(prog.p_memsz));
@@ -2728,12 +2836,30 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	}
 
 	// Initialize main thread
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] preparing main_thread: primary_stacksize=0x%x entry=0x%x prio=%d\n",
+		primary_stacksize, entry, primary_prio);
+#endif
 	ppu_thread_params p{};
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] calling vm::alloc for primary stack...\n");
+#endif
 	p.stack_addr = vm::cast(vm::alloc(primary_stacksize, vm::stack, 4096));
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] vm::alloc stack_addr=0x%x stack_size=0x%x\n", p.stack_addr, primary_stacksize);
+#endif
 	p.stack_size = primary_stacksize;
 	p.entry = vm::_ref<ppu_func_opd_t>(entry);
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] entry func opd: addr=0x%x rtoc=0x%x\n",
+		static_cast<u32>(p.entry.addr), static_cast<u32>(p.entry.rtoc));
+	printf("[ppu_load_exec] creating named_thread<ppu_thread> main_thread...\n");
+#endif
 
 	auto ppu = idm::make_ptr<named_thread<ppu_thread>>(p, "main_thread", primary_prio, 1);
+#if defined(__EMSCRIPTEN__)
+	printf("[ppu_load_exec] main_thread created ppu=%p\n", static_cast<void*>(ppu.get()));
+#endif
 
 	// Write initial data (exitspawn)
 	if (!Emu.data.empty())

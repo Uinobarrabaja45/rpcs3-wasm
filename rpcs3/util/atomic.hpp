@@ -205,7 +205,12 @@ namespace atomic_wait
 		constexpr void set(lf_queue<T2>& var, std::nullptr_t = nullptr)
 		{
 			static_assert(Index < Max);
-			static_assert(sizeof(var) == sizeof(uptr) * 2);
+			// 16 bytes = double-word CAS slot. Original code wrote
+			// `sizeof(uptr) * 2` which holds on 64-bit (8*2=16) but
+			// fails on wasm32 where uptr is 4 bytes. The lf_queue and
+			// atomic_ptr internal fat_ptr structs are explicitly sized
+			// to 16 bytes (padded on wasm32 — see shared_ptr.hpp).
+			static_assert(sizeof(var) == 16);
 
 			m_info[Index].data = std::bit_cast<char*>(&var.get_wait_atomic().raw());
 			m_info[Index].old = 0;
@@ -215,7 +220,12 @@ namespace atomic_wait
 		constexpr void set(stx::atomic_ptr<T2>& var, std::nullptr_t = nullptr)
 		{
 			static_assert(Index < Max);
-			static_assert(sizeof(var) == sizeof(uptr) * 2);
+			// 16 bytes = double-word CAS slot. Original code wrote
+			// `sizeof(uptr) * 2` which holds on 64-bit (8*2=16) but
+			// fails on wasm32 where uptr is 4 bytes. The lf_queue and
+			// atomic_ptr internal fat_ptr structs are explicitly sized
+			// to 16 bytes (padded on wasm32 — see shared_ptr.hpp).
+			static_assert(sizeof(var) == 16);
 
 			m_info[Index].data = std::bit_cast<char*>(&var.get_wait_atomic().raw());
 			m_info[Index].old = 0;

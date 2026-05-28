@@ -110,6 +110,10 @@ namespace logs
 		// Channel prefix (added to every log message)
 		const char* const name;
 
+#if defined(__EMSCRIPTEN__) || (defined(__wasm__) && !defined(__wasm64__))
+		u32 _pad_after_name;
+#endif
+
 		// The lowest logging level enabled for this channel (used for early filtering)
 		atomic_t<level> enabled;
 
@@ -117,6 +121,9 @@ namespace logs
 		consteval channel(const char* name) noexcept
 			: message{}
 			, name(name)
+#if defined(__EMSCRIPTEN__) || (defined(__wasm__) && !defined(__wasm64__))
+			, _pad_after_name(0)
+#endif
 			, enabled(level::notice)
 		{
 		}
