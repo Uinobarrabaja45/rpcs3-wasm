@@ -60,6 +60,14 @@ private:
 	wgpu::Queue m_queue;
 	wgpu::Instance m_instance;
 	wgpu::Surface m_surface;
+	// Lazily-created texture holding the most recent PS3 front buffer,
+	// uploaded from guest VRAM and copied to the swapchain each frame.
+	wgpu::Texture m_fbTexture;
+	uint32_t m_fbTexW = 0;
+	uint32_t m_fbTexH = 0;
+	uint64_t m_lastFlip = 0;          // last g_webgpu_flip_count we uploaded
+	uint64_t m_lastDrawnFlip = ~0ull; // last flip count we actually presented (idle throttle)
+	std::vector<uint32_t> m_fbStaging; // CPU scratch for the ARGB→BGRA swizzle
 #endif
 	std::string m_backend;
 	int m_windowWidth = 1280;

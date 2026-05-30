@@ -48,6 +48,11 @@ const customTrigger = process.argv[5] || null;
 // loadFixedRom URL is the single-pane direct view used for automated
 // boot tests.
 const urlMode = process.argv[6] || null;
+// Optional 7th arg = post-trigger capture delay in ms (default 1500). Lets us
+// snapshot the game's LATER steady state — e.g. to see whether the PPU threads
+// progress to cellGcmInit some seconds after the first null-fn crash, rather
+// than the moment of the crash itself.
+const captureDelayMs = process.argv[7] ? parseInt(process.argv[7], 10) : 1500;
 // The autoboot path: ?loadFixedRom=true picks the game's rom file from
 // Games.ts (default key: 'demons' → TERRARIA → terraria.iso) and fetches
 // it from http://localhost:8008. Run a static server in your ROM dir
@@ -71,7 +76,9 @@ const chromeCmd = [
     '--remote-debugging-port=9223',                // 9222 is the Play! port; offset to avoid clashes
     '--remote-debugging-address=127.0.0.1',
     '--enable-unsafe-webgpu',
-    '--enable-features=Vulkan',                    // emdawnwebgpu prefers a Vulkan adapter on Linux/CI
+    // NOTE: '--enable-features=Vulkan' REMOVED — Vulkan is not native on macOS
+    // (Chrome/Dawn WebGPU uses Metal there). Forcing it is a prime suspect for
+    // the flaky ~8min headless WebGPU renderer death; let Chrome pick Metal.
     `--user-data-dir=${profileDir}`,
     `"${targetUrl}"`,
 ].join(' ');
@@ -174,8 +181,8 @@ function connectToDebugger(wsUrl) {
                       ];
                 if (!captured && triggers.some(t => args.includes(t))) {
                     captured = true;
-                    console.log('Detected boot trigger. Capturing screenshot in 1500ms...');
-                    setTimeout(() => captureNow(ws), 1500);
+                    console.log(`Detected boot trigger. Capturing screenshot in ${captureDelayMs}ms...`);
+                    setTimeout(() => captureNow(ws), captureDelayMs);
                 }
             }
 
@@ -216,17 +223,20 @@ function connectToDebugger(wsUrl) {
     setTimeout(() => {
         if (!captured) {
             captured = true;
-            console.log('No trigger seen in 540s (9 min) — capturing whatever is on screen.');
+            console.log('No trigger seen in 1440s (24 min) — capturing whatever is on screen.');
             captureNow(ws);
         }
-    }, 540000);
+    }, 1440000);
 
-    // Hard timeout: 10 minutes max, then bail.
+    // Hard timeout: 25 minutes max, then bail. Extended for the slow JIT-less
+    // PPU interpreter: Terraria streams large zlib assets on EE ResourceLoop at
+    // ~1.8 KB/s, so reaching the first GCM flip (the 505 splash) takes many
+    // minutes. The flip-trigger still fires + captures the moment it happens.
     setTimeout(() => {
-        console.error('Timeout of 600 seconds exceeded! Crashing...');
+        console.error('Timeout of 1500 seconds exceeded! Crashing...');
         chromeProcess.kill('SIGKILL');
         process.exit(1);
-    }, 600000);
+    }, 1500000);
 }
 
 setTimeout(() => getWsUrl(), 1000);

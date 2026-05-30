@@ -21,6 +21,7 @@
 #include "Emu/Cell/SPUAnalyser.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/SPURecompiler.h"
+#include "Emu/Cell/SPUInterpreter.h"
 #include "Emu/Cell/timers.hpp"
 
 #include "Emu/RSX/Core/RSXReservationLock.hpp"
@@ -1441,11 +1442,6 @@ extern thread_local std::string(*g_tls_log_prefix)();
 
 void spu_thread::cpu_task()
 {
-#if defined(__EMSCRIPTEN__)
-	// wasm32 Phase 4 diagnostic — see PPUThread.cpp for context.
-	printf("[spu_thread] cpu_task: wasm32 stub — exiting thread without executing\n");
-	return;
-#endif
 #ifdef __APPLE__
 	pthread_jit_write_protect_np(true);
 #endif
@@ -1551,9 +1547,55 @@ void spu_thread::cpu_task()
 	}
 	else
 	{
-		ensure(spu_runtime::g_interpreter);
-
 		allow_interrupts_in_cpu_work = true;
+
+#if defined(__EMSCRIPTEN__)
+		// wasm32: the ASMJIT g_gateway / tr_interpreter trampolines that
+		// g_interpreter dispatches through are non-functional here (no runtime
+		// codegen — build_function_asm emits empty stubs on wasm), AND the
+		// pure-C++ spu_recompiler_base::old_interpreter lives in
+		// SPUCommonRecompiler.cpp which is HEADER_FILE_ONLY (excluded) on wasm.
+		// So inline the exact same static-interpreter dispatch loop here, using
+		// the spu_interpreter_rt table (SPUInterpreter.cpp, always compiled).
+		ensure(g_cfg.core.spu_decoder == spu_decoder_type::_static);
+		{
+			const auto& table = g_fxo->get<spu_interpreter_rt>();
+			const auto ls_base = _ptr<u8>(0);
+
+#if defined(__EMSCRIPTEN__)
+			// [SPUPROG] minimal progress probe: is the SPURS kernel advancing or
+			// stuck? Log pc every ~1M instrs for SPURS threads (to diagnose the
+			// PPU-side handler.c:144 wait_ready timeout).
+			const bool prog_spurs = thread_ctrl::get_name().find("SpursKernel") != std::string::npos;
+			u64 prog_n = 0;
+			if (prog_spurs)
+			{
+				printf("[SPUENTRY] SpursKernel reached interpreter loop, initial pc=0x%05x state=0x%x\n", +pc, +state.load());
+			}
+#endif
+
+			while (true)
+			{
+				if (state) [[unlikely]]
+				{
+					if (check_state())
+						break;
+				}
+
+				const u32 op = *reinterpret_cast<const be_t<u32>*>(ls_base + pc);
+#if defined(__EMSCRIPTEN__)
+				if (prog_spurs && prog_n < (40u * 4096u) && (prog_n % 4096u) == 0)
+				{
+					printf("[SPUPROG] SpursKernel n=%llu pc=0x%05x op=0x%08x\n", static_cast<unsigned long long>(prog_n), +pc, op);
+				}
+				prog_n++;
+#endif
+				if (table.decode(op)(*this, {op}))
+					pc += 4;
+			}
+		}
+#else
+		ensure(spu_runtime::g_interpreter);
 
 		while (true)
 		{
@@ -1565,6 +1607,7 @@ void spu_thread::cpu_task()
 
 			spu_runtime::g_interpreter(*this, _ptr<u8>(0), nullptr);
 		}
+#endif
 
 		allow_interrupts_in_cpu_work = false;
 	}
@@ -4942,7 +4985,23 @@ bool spu_thread::reservation_check(u32 addr, const decltype(rdata)& data, u32 cu
 
 	if ((vm::reservation_acquire(addr) & -128) != rtime)
 	{
+#if defined(__EMSCRIPTEN__)
+		// wasm32: vm::reservation_acquire indexes by (addr & 0xff80)/2, i.e. ONLY
+		// address bits 7..15 — so unrelated addresses that share those bits alias
+		// onto the same reservation counter. A same-value write to any aliasing
+		// address bumps the timestamp and "loses" the reservation even though the
+		// reserved data is byte-identical. The native LLVM SPU recompiler wins the
+		// GETLLAR->PUTLLC race fast enough to tolerate this, but the wasm SPU
+		// *interpreter* is far slower and loses the race every retry, thrashing
+		// the audio SPURS lock-free loop until libspurs asserts (event_helper.c:151
+		// -> STOP 0x101 -> group exception -> boot abort). Treat the reservation as
+		// still valid when the reserved DATA is unchanged: the value the SPU will
+		// CAS on is identical, so PUTLLC is still safe in practice. (Slightly
+		// weakens ABA strictness — acceptable for wasm bring-up.)
+		return !cmp_rdata(data, *vm::get_super_ptr<decltype(rdata)>(addr));
+#else
 		return true;
+#endif
 	}
 
 	if ((addr >> 28) < 2 || (addr >> 28) == 0xd)
@@ -6443,6 +6502,15 @@ extern void resume_spu_thread_group_from_waiting(spu_thread& spu, std::array<sha
 
 bool spu_thread::stop_and_signal(u32 code)
 {
+#if defined(__EMSCRIPTEN__)
+	// [SPUSTOP] minimal (only on the SPURS assert STOP 0x101): locate the SPU pc
+	// where libspurs reports its assertion, to track the remaining wasm SPURS fault.
+	if (code == 0x101 && thread_ctrl::get_name().find("SpursKernel") != std::string::npos)
+	{
+		printf("[SPUSTOP] SpursKernel assert STOP 0x101 at pc=0x%05x srr0=0x%x\n", +pc, +srr0);
+	}
+#endif
+
 	auto set_status_npc = [&]()
 	{
 		status_npc.atomic_op([&](status_npc_sync_var& state)

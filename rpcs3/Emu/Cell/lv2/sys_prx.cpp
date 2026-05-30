@@ -215,6 +215,18 @@ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<s
 			// Force HLE
 			ignore = true;
 		}
+#if defined(__EMSCRIPTEN__)
+		else if (name == "libsre.sprx")
+		{
+			// wasm32: force the SPURS PRX (libsre.sprx) to HLE. The guest LLE SPURS
+			// kernel runs on the slow SPU interpreter and its PPU-side init asserts
+			// (libspurs event_helper.c:151 / handler.c) because the SPU misses
+			// SPURS deadlines / handshakes. RPCS3's HLE cellSpurs implements the
+			// handler + event-helper in PPU C++ (cellSpurs.cpp), bypassing the
+			// guest assert. Trade-off: relies on RPCS3's (partial) SPURS HLE.
+			ignore = true;
+		}
+#endif
 		else
 		{
 			// Use list

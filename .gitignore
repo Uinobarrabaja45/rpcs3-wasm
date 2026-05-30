@@ -141,3 +141,9 @@ js/rpcs3_browser/public/Rpcs3*.js
 js/rpcs3_browser/public/Rpcs3*.wasm
 js/rpcs3_browser/src/Rpcs3*.js
 js/rpcs3_browser/src/Rpcs3*.wasm
+
+# Symlinks to local PS3 firmware (copyrighted, never committed). Each
+# developer symlinks their own dev_flash + PUP file locally — see
+# scripts/extract_pup.py / public/dev_flash docs.
+js/rpcs3_browser/public/dev_flash
+js/rpcs3_browser/public/PS3UPDAT.PUP

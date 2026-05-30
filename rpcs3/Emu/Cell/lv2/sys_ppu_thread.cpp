@@ -512,7 +512,12 @@ error_code _sys_ppu_thread_create(ppu_thread& ppu, vm::ptr<u64> thread_id, vm::p
 	{
 		const u32 hle_base = g_fxo->get<ppu_function_manager>().addr;
 		const u32 ea = static_cast<u32>(+entry.addr); // be_t<u32> → host u32
-		if (hle_base && ea >= hle_base)
+		// Only redirect ACTUAL HLE stubs, which have NO TOC (rtoc == 0). Real loaded
+		// PRX/eboot thread entries also live above hle_base (e.g. cellGcmSys's
+		// _gcm_intr_thread at 0xc382d8) but carry a valid rtoc — those are real code and
+		// MUST run (redirecting _gcm_intr_thread broke GCM interrupt delivery and stalled
+		// the EE RenderLoop right after the first sys_rsx_context_attribute).
+		if (hle_base && ea >= hle_base && +entry.rtoc == 0)
 		{
 			const u32 ret_addr = g_fxo->get<ppu_function_manager>().func_addr(1, true); // HLE_RETURN
 			printf("[_sys_ppu_thread_create] wasm32: redirect HLE entry 0x%x → HLE_RETURN 0x%x (thread='%s')\n",

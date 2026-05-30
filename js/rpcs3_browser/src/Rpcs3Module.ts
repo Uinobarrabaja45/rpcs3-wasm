@@ -54,6 +54,84 @@ function getRAMFromURL(): string | null {
     return new URLSearchParams(window.location.search).get('ram');
 }
 
+// PS3 firmware .sprx files we preload into Emscripten MEMFS before boot.
+// These are the modules whose absence forces the rpcs3 loader to fall
+// back to HLE — which works for early init but leaves dispatch tables
+// (cellSysutil callback chain, sceNp export thunks, sysPrxForUser
+// callback registration) only partially populated. Games like Terraria
+// dereference those tables and segfault when entries are NULL.
+//
+// Minimal set chosen to fix the cellSysutilRegisterCallback null-fn
+// dispatch path observed in main_thread:
+//   - liblv2.sprx        — kernel runtime, callback dispatch
+//   - libsysmodule.sprx  — runtime module loader (cellSysmoduleLoadModule)
+//   - libsysutil.sprx    — sysutil callback infrastructure
+// More can be added as the boot progresses past each new null-fn site.
+const FIRMWARE_PRELOAD_PATHS = [
+    // Boot/kernel/runtime
+    '/dev_flash/sys/external/liblv2.sprx',
+    '/dev_flash/sys/external/libsysmodule.sprx',
+    '/dev_flash/sys/external/libsysutil.sprx',
+    // Modules Terraria asks for at boot (observed via
+    // "firmware SPRX not found" log lines). Adding them lets the
+    // loader resolve real exports instead of HLE-stubbing them.
+    '/dev_flash/sys/external/libfs.sprx',
+    '/dev_flash/sys/external/libgcm_sys.sprx',
+    '/dev_flash/sys/external/libnet.sprx',
+    '/dev_flash/sys/external/librudp.sprx',
+    '/dev_flash/sys/external/libsre.sprx',
+];
+
+// rpcs3 mounts /dev_flash → `$(EmulatorDir)dev_flash/` which on
+// Emscripten resolves to /home/web_user/.config/rpcs3/dev_flash/. We
+// write firmware .sprx to that host path, NOT to the guest /dev_flash/
+// path, because the loader resolves through the mount before touching
+// the FS. (Tried overriding g_cfg_vfs.dev_flash in CreateVM — gets
+// clobbered by Emu.Init()'s from_default + load chain.)
+const MEMFS_DEV_FLASH_HOST = '/home/web_user/.config/rpcs3/dev_flash/';
+
+async function preloadFirmwareFiles(mod: any): Promise<void> {
+    console.log('[firmware] preloading .sprx files into MEMFS...');
+    const base = `${process.env.PUBLIC_URL || ''}`;
+    let totalBytes = 0;
+    let loadedCount = 0;
+    let missingCount = 0;
+
+    for (const guestPath of FIRMWARE_PRELOAD_PATHS) {
+        // guestPath like "/dev_flash/sys/external/liblv2.sprx".
+        // Fetch URL is server-side (under public/dev_flash/...) — same
+        // layout, easy. WRITE path is the host-side mount target.
+        const fetchUrl = base + guestPath;
+        const relative = guestPath.replace(/^\/dev_flash\//, '');
+        const memfsPath = MEMFS_DEV_FLASH_HOST + relative;
+        try {
+            const resp = await fetch(fetchUrl);
+            if (!resp.ok) {
+                console.warn(`[firmware] missing ${guestPath} (HTTP ${resp.status}) — falling back to HLE`);
+                missingCount++;
+                continue;
+            }
+            const buf = new Uint8Array(await resp.arrayBuffer());
+            // Create parent dirs in MEMFS for the host-side path.
+            const parts = memfsPath.split('/').filter(Boolean);
+            let cur = '';
+            for (let i = 0; i < parts.length - 1; i++) {
+                cur += '/' + parts[i];
+                try { mod.FS.mkdir(cur); } catch (_) { /* EEXIST */ }
+            }
+            mod.FS.writeFile(memfsPath, buf);
+            totalBytes += buf.length;
+            loadedCount++;
+            console.log(`[firmware] loaded ${guestPath} → ${memfsPath} (${buf.length} bytes)`);
+        } catch (e) {
+            console.warn(`[firmware] fetch failed for ${guestPath}:`, e);
+            missingCount++;
+        }
+    }
+
+    console.log(`[firmware] preload complete: ${loadedCount} files (${(totalBytes/1024).toFixed(0)} KB), ${missingCount} missing`);
+}
+
 async function loadRpcs3Module(ramParam: string | null): Promise<{ moduleFunction: any; jsFileName: string }> {
     let moduleFunction: any;
     let jsFileName: string;
@@ -145,6 +223,23 @@ export let initRpcs3Module = async function () {
 
         console.log('Creating /work directory in MEMFS...');
         Rpcs3Module.FS.mkdir("/work");
+
+        // Pre-populate /dev_flash/ in MEMFS with critical PS3 firmware
+        // .sprx files. rpcs3 only logs "Failed to load .../liblv2.sprx"
+        // and falls back to HLE stubs when these aren't present — but the
+        // HLE stubs leave gaps (null callback dispatch tables, missing
+        // export resolution) that fail real games like Terraria. With
+        // liblv2.sprx + libsysmodule.sprx in place, the loader links
+        // against the real firmware exports.
+        //
+        // Files are served by the dev server from public/dev_flash/ (a
+        // symlink to the host's existing rpcs3 install). Fetched only on
+        // demand — we don't bundle 188 MB of firmware into the wasm.
+        try {
+            await preloadFirmwareFiles(Rpcs3Module);
+        } catch (e) {
+            console.warn('[firmware] preload failed (non-fatal — boot continues with HLE):', e);
+        }
 
         console.log('Initializing DiscImageDevice...');
         Rpcs3Module.discImageDevice = new DiscImageDevice(Rpcs3Module);

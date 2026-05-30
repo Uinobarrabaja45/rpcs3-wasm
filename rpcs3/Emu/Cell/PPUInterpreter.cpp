@@ -6815,17 +6815,24 @@ auto UNK()
 			}
 
 #if defined(__EMSCRIPTEN__)
-			// wasm32: BIND_FUNC's `cia += 4` after an HLE function returns
-			// from within the HLE region lands the thread at the *next* OPD
-			// address (cia % 8 == 0). With `-fno-exceptions` the throw below
-			// lowers to `unreachable` and kills the worker. For HLE-region
-			// addresses, that's the natural "thread finished its HLE entry"
-			// signal — set ret/stop so the cpu_task loop exits cleanly.
+			// wasm32: after BIND_FUNC's `cia += 4` post-HLE-call, cia lands
+			// on the *next* OPD slot (cia % 8 == 0) whose "raw" is the
+			// encoded function-descriptor pointer (not a valid PPC opcode).
+			// The throw_exception below lowers to `unreachable` under
+			// `-fno-exceptions` and kills the worker.
+			//
+			// PowerPC ABI: when a function finishes, it does `blr` — branch
+			// to link register. The caller resumes at LR. Mimic that here:
+			// set cia = lr & ~3, leave state alone, and let cpu_task's next
+			// iteration dispatch the caller's instruction. This unstrands
+			// main_thread when the game returns from an HLE call whose
+			// followup landed in HLE OPD padding.
 			const u32 hle_base = g_fxo->get<ppu_function_manager>().addr;
 			if (hle_base && ppu.cia >= hle_base && index < hle_funcs.size())
 			{
-				ppu_log.notice("UNK in HLE region (cia=0x%x op=0x%08x) — wasm32 clean exit", ppu.cia, op.opcode);
-				ppu.state += cpu_flag::ret;
+				const u32 new_cia = static_cast<u32>(ppu.lr) & ~3u;
+				ppu_log.notice("UNK in HLE region (cia=0x%x lr=0x%x) — wasm32 blr-emulate to lr", ppu.cia, ppu.lr);
+				ppu.cia = new_cia;
 				return;
 			}
 #endif

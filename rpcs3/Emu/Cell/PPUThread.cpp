@@ -152,6 +152,21 @@ void fmt_class_string<typename ppu_thread::syscall_history_t>::format(std::strin
 extern const ppu_decoder<ppu_itype> g_ppu_itype{};
 extern const ppu_decoder<ppu_iname> g_ppu_iname{};
 
+#if defined(__EMSCRIPTEN__)
+// wasm32 null-TOC cascade fix. main_thread starts in LLE liblv2 (valid TOC),
+// then hands off to the EBOOT — but r2(TOC) arrives as 0. Once zero, the
+// ELFv1 `std r2,0x28(r1)` / `ld r2,0x28(r1)` save/restore only re-propagates
+// 0 (the on-stack saved TOC is already 0), so every TOC-relative global load
+// reads 0, object chains collapse to null, and indirect calls land at cia=0.
+// r2 is a per-module CONSTANT (the EBOOT's .toc pointer), so the dispatch
+// loop simply re-establishes it whenever EBOOT code executes with r2==0.
+// These are captured once in ppu_load_exec (from the OPD at e_entry + the
+// EBOOT code segment) before any PPU thread runs.
+atomic_t<u32> g_eboot_toc = 0;
+atomic_t<u32> g_eboot_code_beg = 0;
+atomic_t<u32> g_eboot_code_end = 0;
+#endif
+
 template <>
 bool serialize<ppu_thread::cr_bits>(utils::serial& ar, typename ppu_thread::cr_bits& o)
 {
@@ -2442,6 +2457,12 @@ void ppu_thread::exec_task()
 	const auto cache = vm::g_exec_addr;
 	const auto mem_ = vm::g_base_addr;
 #if defined(__EMSCRIPTEN__)
+	// Snapshot the EBOOT TOC + code range once (populated in ppu_load_exec
+	// before any PPU thread starts) so the null-TOC cascade fix in the hot
+	// loop is a couple of register compares, not per-instruction atomic loads.
+	const u32 eboot_toc = g_eboot_toc.load();
+	const u32 eboot_beg = g_eboot_code_beg.load();
+	const u32 eboot_end = g_eboot_code_end.load();
 	// Cheap heartbeat: emit "alive" every 5M instructions. Lets us see
 	// when a PPU thread is stuck in a tight loop vs actually progressing
 	// through code, without taxing the hot path (one printf per ~10s of
@@ -2465,10 +2486,440 @@ void ppu_thread::exec_task()
 		gv_zeroupper();
 
 #if defined(__EMSCRIPTEN__)
-		if ((++s_hb & 0x4FFFFF) == 0)
+		++s_hb;
+		// [exec_task hb] heartbeat silenced — spin location identified
+		// (0x41c294, EE ResourceLoop); SPIN-WATCH below tracks it.
+
+		// HLE the inflate match-copy loop — the decompression hot path that
+		// throttles EE ResourceLoop to ~2.5KB/s (~400 instr/byte) and stops the
+		// boot reaching its first flip before the ~8min headless-Chrome ceiling.
+		// 0x41c294 is a CTR-counted (mtctr r5 @0x41c290) byte-FORWARD copy from
+		// r8(src) → [r3+0x28](dst), exiting via bdz @0x41c2b4 → 0x41c378. We copy
+		// the bulk natively but leave the LAST byte to the interpreter so it
+		// finalizes every register + the bdz exit with zero desync risk. Forward
+		// byte copy == overlap-safe LZ77/RLE semantics (identical to the loop).
+		if (cia == 0x41c294) [[unlikely]]
 		{
-			printf("[exec_task hb] cia=0x%x raw=0x%x hb=%u\n", cia,
-				reinterpret_cast<be_t<u32>*>(mem_ + u64{cia})->value(), s_hb);
+			const u32 n   = static_cast<u32>(ctr);
+			const u32 r3v = static_cast<u32>(gpr[3]);
+			// Guard r3v before dereferencing [r3+0x28]; the guest vm region is
+			// 0..0x60000000 (1.5 GiB), so anything outside is wild — skip to the
+			// interpreter (which masks each access + page-faults safely).
+			if (n >= 2 && n <= 0x40000 && r3v >= 0x10000 && r3v < 0x5fff0000)
+			{
+				const u32 dst = reinterpret_cast<be_t<u32>*>(mem_ + (u64{r3v} + 0x28))->value();
+				const u32 src = static_cast<u32>(gpr[8]);
+				// Only HLE when the WHOLE copy lies inside the guest vm. A
+				// malformed back-ref (src = dst - distance) can underflow to a
+				// wild address; the byte-loop interpreter tolerates that via
+				// 32-bit masking + vm fault handling, but our raw host copy must
+				// not run off the wasm heap. Out-of-range → fall back.
+				if (dst >= 0x10000 && src >= 0x10000 &&
+				    u64{dst} + n <= 0x60000000 && u64{src} + n <= 0x60000000)
+				{
+					const u32 bulk = n - 1;
+					u8* const gmem = reinterpret_cast<u8*>(mem_);
+					for (u32 i = 0; i < bulk; i++)
+						gmem[u64{dst} + i] = gmem[u64{src} + i];
+					*reinterpret_cast<be_t<u32>*>(mem_ + (u64{r3v} + 0x28)) = dst + bulk;
+					gpr[8] = src + bulk;
+					ctr = 1; // interpreter copies the final byte, then bdz exits cleanly
+				}
+			}
+		}
+
+		// INFLATE-DUMP / STREAM-WATCH / INFLATE-TRACE diagnostics removed: the
+		// match-copy is now HLE'd (above) so the boot races ~30x faster, and
+		// these high-rate per-instruction printf logs flooded the CDP console
+		// (~20 msgs/sec), triggering an early headless-renderer disconnect.
+		// Decompression confirmed finite-but-slow; no longer need to trace it.
+
+		// SLOT-WATCH: the game's master singleton pointer G lives in EBOOT data
+		// slot (eboot_toc - 0x7780) == 0x59fcc8. The CHAIN diag proved G=*slot is
+		// a VALID heap ptr (0x9714f0) but G's object is entirely ZEROED -> it was
+		// allocated yet never constructed (vtable G[0]=0, manager G[0x10]=0). The
+		// open question is WHY the ctor never ran. Answer it empirically in ONE
+		// run by logging, cross-thread and one-shot:
+		//   (a) the exact STORE SITE that writes G into the slot, with a wide code
+		//       window so we can read whether a `bl <ctor>` is emitted around it;
+		//   (b) whether G[0] (vtable) or G[0x10] (manager) EVER become non-zero
+		//       later (=> ctor does run, just late/raced) or stay zero (=> the ctor
+		//       call is genuinely never reached / writes elsewhere).
+		// Cheap: 1-3 absolute memory loads per instruction until all flags latch.
+		// DISABLED (s_diag_g=false): the G-singleton ctor question is RESOLVED
+		// (G0-WRITE fired — G is constructed; the boot runs far past it). In
+		// practice this block did ~6 atomic_t loads + an rdw() + a ring write on
+		// EVERY PPU instruction, which on wasm/SharedArrayBuffer throttled the
+		// interpreter to ~167K instr/s — far too slow for the resource-load boot
+		// (EE ResourceLoop streaming 200+ zlib assets) to reach the first flip in
+		// a capture window. Gating it off (one thread-local bool test) restores
+		// interpreter speed. Set s_diag_g=true to re-arm the G investigation.
+		static thread_local bool s_diag_g = false;
+		if (eboot_toc && s_diag_g) [[unlikely]]
+		{
+			const u32 kSlot = eboot_toc - 0x7780; // 0x59fcc8
+			static atomic_t<u32> s_slot_done{0};
+			static atomic_t<u32> s_G{0};
+			static atomic_t<u32> s_vt_done{0};
+			static atomic_t<u32> s_mgr_done{0};
+			const auto rdw = [mem_](u32 a) -> u32 {
+				return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value();
+			};
+			// SPIN-WATCH: post-init the game loop busy-spins at 0x41c294
+			// (lwz r11,0x28(r3)) polling [r3+0x28], never reaching a GCM flip.
+			// Identify the polled object (r3), its vtable + the two polled
+			// fields, the thread, and whether the value EVER changes. Log the
+			// first few hits then sparsely so we can see motion vs deadlock.
+			if (cia == 0x41c294) [[unlikely]]
+			{
+				static atomic_t<u32> s_spin{0};
+				static atomic_t<u32> s_first28{0};
+				const u32 n = s_spin.fetch_add(1);
+				const u32 v28 = rdw(static_cast<u32>(gpr[3]) + 0x28);
+				if (n == 0) s_first28 = v28;
+				if (n < 4 || (n & 0x3FFFFF) == 0)
+				{
+					const u32 r3 = static_cast<u32>(gpr[3]);
+					// Dump the inflate-state struct header (r3+0x00..0x3c) so we
+					// can find the monotonically-growing total_out / next_out
+					// field. If one field climbs steadily across samples the
+					// decompression is FINITE-but-slow; if all are frozen it is
+					// genuinely stuck.
+					printf("[SPIN-STATE] n=%u r3=0x%x | +00=%08x +04=%08x +08=%08x +0c=%08x +10=%08x +14=%08x +18=%08x +1c=%08x +20=%08x +24=%08x +28=%08x +2c=%08x +30=%08x +34=%08x +38=%08x +3c=%08x\n",
+						n, r3,
+						rdw(r3 + 0x00), rdw(r3 + 0x04), rdw(r3 + 0x08), rdw(r3 + 0x0c),
+						rdw(r3 + 0x10), rdw(r3 + 0x14), rdw(r3 + 0x18), rdw(r3 + 0x1c),
+						rdw(r3 + 0x20), rdw(r3 + 0x24), rdw(r3 + 0x28), rdw(r3 + 0x2c),
+						rdw(r3 + 0x30), rdw(r3 + 0x34), rdw(r3 + 0x38), rdw(r3 + 0x3c));
+				}
+			}
+			// Ring buffer of recent block-entry cias on THIS thread. The slot
+			// store lands BETWEEN block boundaries (we saw "first seen" land on
+			// a liblv2 trampoline @0xbe0000, NOT the real store), so to find
+			// the store site we replay the call path that led up to it.
+			static thread_local u32 s_ring[32] = {0};
+			static thread_local u32 s_ring_i = 0;
+			s_ring[s_ring_i & 31] = cia;
+			s_ring_i++;
+			// MAIN-TRACE: main() (0x141d84..0x142150) runs only on main_thread.
+			// The G[0] sub-manager is constructed by one of main's early `bl`
+			// calls; if an HLE call returns the wrong status, main takes an error
+			// branch and SKIPS that construction, leaving G[0]=0 (the crash). Log
+			// main's own block path + r3 (= prior call's return value at a return
+			// block) so we can see exactly which branch diverges. One-shot, capped.
+			if (cia >= 0x141d84 && cia < 0x143000) [[unlikely]]
+			{
+				static thread_local u32 s_mt = 0;
+				if (s_mt < 400)
+				{
+					s_mt++;
+					printf("[MAIN-TRACE] cia=0x%x r3=%llx r4=%llx r5=%llx r6=%llx lr=0x%llx\n",
+						cia, gpr[3], gpr[4], gpr[5], gpr[6], static_cast<unsigned long long>(lr));
+				}
+			}
+			// GLOBAL G[0] WRITE-WATCH: is *(0x9714f0)=G[0] EVER written non-zero by
+			// ANY thread across the WHOLE boot? The 56-block AFTER-STORE window was
+			// too narrow. If this never prints, the sub-manager's construction is
+			// genuinely never executed (definitive); if it prints, we learn the
+			// writer's cia/thread (=> it writes late or to a racing address).
+			{
+				static atomic_t<u32> s_g0_seen{0};
+				if (!s_g0_seen.load()) [[unlikely]]
+				{
+					const u32 g0 = rdw(0x9714f0);
+					if (g0 && s_g0_seen.exchange(1) == 0)
+					{
+						const auto spn = ppu_tname.load();
+						printf("[G0-WRITE] *(0x9714f0)=0x%x first non-zero at cia=0x%x lr=0x%llx thread='%s'\n",
+							g0, cia, static_cast<unsigned long long>(lr),
+							(spn && !spn->empty()) ? spn->c_str() : "<unnamed>");
+					}
+				}
+			}
+			// RWLOCK-EFAULT live args: dump GPRs at the failing
+			// sys_rwlock_create call site (0x42f92c). r3=rw_lock_id (0x971664),
+			// r4=attr (logged as 0 → EFAULT). If r4 should be a stack ptr
+			// (r1+N) this is an arg-setup bug; if r4 is genuinely 0 it's by
+			// design. Also dump r1 to confirm the stack pointer is sane.
+			{
+				static atomic_t<u32> s_rwl_seen{0};
+				if (cia == 0x42f92c && s_rwl_seen.exchange(1) == 0)
+				{
+					printf("[RWL-ARGS] cia=0x%x r1=0x%llx r3=0x%llx r4=0x%llx r5=0x%llx r2=0x%llx lr=0x%llx\n",
+						cia,
+						static_cast<unsigned long long>(gpr[1]),
+						static_cast<unsigned long long>(gpr[3]),
+						static_cast<unsigned long long>(gpr[4]),
+						static_cast<unsigned long long>(gpr[5]),
+						static_cast<unsigned long long>(gpr[2]),
+						static_cast<unsigned long long>(lr));
+				}
+			}
+			// AFTER-STORE forward trace: once the slot is written, dump the
+			// next N block entries on the storing thread. Decisive question:
+			// does a ctor `bl` follow the alloc+store (G should fill) or does
+			// the game proceed with G still zeroed?
+			static thread_local u32 s_after = 0; // remaining after-trace blocks
+			if (s_after)
+			{
+				const u32 g = s_G.load();
+				printf("[AFTER-STORE] cia=0x%x lr=0x%llx r3=%llx r4=%llx | G[0]=%08x G[0x10]=%08x\n",
+					cia, static_cast<unsigned long long>(lr), gpr[3], gpr[4],
+					rdw(g), rdw(g + 0x10));
+				s_after--;
+			}
+			const u32 gnow = rdw(kSlot);
+			if (gnow && !s_slot_done.load() && s_slot_done.exchange(1) == 0)
+			{
+				s_G = gnow;
+				s_after = 56; // begin after-trace on this thread next iteration
+				const auto sp_name = ppu_tname.load();
+				const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+				printf("[SLOT-WATCH store] thread='%s' slot=0x%x -> G=0x%x first seen at cia=0x%x lr=0x%llx\n",
+					nm, kSlot, gnow, cia, static_cast<unsigned long long>(lr));
+				printf("  r3=%llx r4=%llx r28=%llx r29=%llx r30=%llx r31=%llx\n",
+					gpr[3], gpr[4], gpr[28], gpr[29], gpr[30], gpr[31]);
+				printf("  G[0x00..0x20]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+					rdw(gnow), rdw(gnow + 4), rdw(gnow + 8), rdw(gnow + 0xc),
+					rdw(gnow + 0x10), rdw(gnow + 0x14), rdw(gnow + 0x18), rdw(gnow + 0x1c));
+				// Recent block path (oldest -> newest); s_ring_i points at the
+				// oldest slot. The most-recent EBOOT-range entry is the likely
+				// store block.
+				printf("  ring (oldest->newest):\n");
+				for (u32 k = 0; k < 32; k++)
+					printf("    r[%u]=0x%x\n", k, s_ring[(s_ring_i + k) & 31]);
+				// Code windows for the last 4 distinct recent blocks so the
+				// alloc/store/ctor emission is disassemblable.
+				for (u32 k = 1; k <= 4; k++)
+				{
+					const u32 c = s_ring[(s_ring_i - k) & 31] & ~3u;
+					if (!c) continue;
+					printf("  win[-%u] @0x%x:", k, c);
+					for (u32 a = c - 0x20; a <= c + 0x20; a += 4)
+						printf(" %08x", rdw(a));
+					printf("\n");
+				}
+			}
+			// SLOT-CHANGE: does the slot ever get OVERWRITTEN after load? The
+			// relocated value (0x9714f0, a zeroed .bss placeholder) might be
+			// meant to be replaced by a heap `new Manager()`. If we never see a
+			// change, G is a static singleton filled in-place (and its in-place
+			// init is what's missing); if we DO see a change, a skipped `new`
+			// is the bug.
+			{
+				static atomic_t<u32> s_slot_last{0xffffffffu};
+				const u32 prev = s_slot_last.load();
+				if (prev != gnow)
+				{
+					if (prev != 0xffffffffu)
+					{
+						const auto sp_name = ppu_tname.load();
+						const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+						printf("[SLOT-CHANGE] thread='%s' slot 0x%x: 0x%x -> 0x%x at cia=0x%x lr=0x%llx\n",
+							nm, kSlot, prev, gnow, cia, static_cast<unsigned long long>(lr));
+					}
+					s_slot_last = gnow;
+				}
+			}
+			// G-AS-THIS: catch any method/ctor invoked with this==G. The
+			// dispatcher reads G via TOC (r3 is unrelated there), so a hit here
+			// means the game DID try to construct/use G as an object. If this
+			// never fires before the crash, G is never touched as an object ->
+			// its construction was gated out entirely (HLE result?).
+			{
+				static atomic_t<u32> s_gthis{0};
+				const u32 gg = s_G.load();
+				if (gg && static_cast<u32>(gpr[3]) == gg && s_gthis.load() < 16 && s_gthis.exchange(s_gthis.load() + 1) < 16)
+				{
+					const auto sp_name = ppu_tname.load();
+					const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+					printf("[G-THIS] thread='%s' cia=0x%x lr=0x%llx r3==G=0x%x | G[0]=%08x\n",
+						nm, cia, static_cast<unsigned long long>(lr), gg, rdw(gg));
+				}
+			}
+			const u32 g = s_G.load();
+			if (g && !s_vt_done.load() && rdw(g) != 0 && s_vt_done.exchange(1) == 0)
+			{
+				const auto sp_name = ppu_tname.load();
+				const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+				printf("[SLOT-WATCH vtable] thread='%s' G[0]=0x%x became non-zero at cia=0x%x lr=0x%llx\n",
+					nm, rdw(g), cia, static_cast<unsigned long long>(lr));
+				const u32 c = cia & ~3u;
+				for (u32 a = c - 0x40; a <= c + 0x10; a += 0x10)
+					printf("  vw @0x%x: %08x %08x %08x %08x\n", a, rdw(a), rdw(a + 4), rdw(a + 8), rdw(a + 0xc));
+			}
+			if (g && !s_mgr_done.load() && rdw(g + 0x10) != 0 && s_mgr_done.exchange(1) == 0)
+			{
+				const auto sp_name = ppu_tname.load();
+				const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+				printf("[SLOT-WATCH manager] thread='%s' G[0x10]=0x%x became non-zero at cia=0x%x lr=0x%llx\n",
+					nm, rdw(g + 0x10), cia, static_cast<unsigned long long>(lr));
+				const u32 c = cia & ~3u;
+				for (u32 a = c - 0x40; a <= c + 0x10; a += 0x10)
+					printf("  mw @0x%x: %08x %08x %08x %08x\n", a, rdw(a), rdw(a + 4), rdw(a + 8), rdw(a + 0xc));
+			}
+
+			// EBOOT-ENTRY WATCH: G@0x9714f0 lives in EBOOT .bss and must be
+			// filled by a C++ global constructor that the EBOOT CRT invokes.
+			// The TOC-fix first fires at cia=0x103ac but e_entry is 0x10230 — if
+			// liblv2 jumps PAST the CRT's .init_array/ctor loop, every static
+			// singleton stays zeroed (exactly our symptom). Log each thread's
+			// first EBOOT instr (cia + caller lr) and dump the e_entry CRT code
+			// once so the ctor-invocation sequence can be disassembled.
+			static thread_local bool s_tl_eboot_entry = false;
+			if (cia >= eboot_beg && cia < eboot_end && !s_tl_eboot_entry)
+			{
+				s_tl_eboot_entry = true;
+				const auto sp_name = ppu_tname.load();
+				const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+				printf("[EBOOT-ENTRY] thread='%s' first EBOOT instr cia=0x%x lr=0x%llx (e_entry=0x10230)\n",
+					nm, cia, static_cast<unsigned long long>(lr));
+				static atomic_t<u32> s_ee_dump{0};
+				if (s_ee_dump.exchange(1) == 0)
+				{
+					for (u32 a = 0x10230; a <= 0x10230 + 0x180; a += 0x10)
+						printf("  ee @0x%x: %08x %08x %08x %08x\n", a, rdw(a), rdw(a + 4), rdw(a + 8), rdw(a + 0xc));
+				}
+			}
+
+			// CTOR-WALK probe: __do_global_ctors_aux @0x3bf8a8 is the GCC global
+			// constructor walker that _init (0x10200) calls (bl @0x10470, BEFORE
+			// main @0x104d4). The ctor list at TOC[0x515c]=0x59006c is POPULATED
+			// (26 entries, descriptors 0x593df0..0x59ebf0 with VALID OPDs e=0x10b08
+			// / 0x4916d8), yet G's vtable stays 0. The static interpreter dispatches
+			// at BLOCK boundaries, so the mid-block bctrl (0x3bf8e8) is never a loop
+			// `cia` — probe the loop-BODY entry 0x3bf8d0 (gpr[9]=current OPD ptr),
+			// the bctrl RETURN 0x3bf8ec (a ctor returned), and EXIT 0x3bf900. This
+			// reveals how many ctors are dispatched, which entries, and whether each
+			// one returns (a hang/diverge in ctor #k would stop the walk at k).
+			static thread_local u32 s_cw_body = 0; // loop-body entries (dispatches)
+			static thread_local u32 s_cw_ret  = 0; // ctor returns
+			if (cia == 0x3bf8a8) [[unlikely]]
+			{
+				static thread_local bool s_cw_seen = false;
+				if (!s_cw_seen)
+				{
+					s_cw_seen = true;
+					const auto sp_name = ppu_tname.load();
+					const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+					printf("[CTORW] thread='%s' ENTERED ctors_aux r2=0x%llx TOC[0x515c]=0x%x OPD@0x59ebf0.e=0x%x OPD@0x593df0.e=0x%x\n",
+						nm, static_cast<unsigned long long>(gpr[2]), rdw(eboot_toc + 0x515c), rdw(0x59ebf0), rdw(0x593df0));
+					// FULL ctor-list dump — tests the "truncated .ctors / ignored
+					// .init_array" hypothesis directly. GCC __CTOR_LIST__ layout:
+					// [0]=count (or 0xffffffff = "scan to NULL"), [1..n]=OPD ptrs,
+					// [n+1]=0 terminator. Walk it raw; for each entry print the OPD
+					// ptr and its function entry word (OPD[0]). If the writer of
+					// G[0] (0x9714f0) is a ctor, its code must appear in this list.
+					const u32 clp = rdw(eboot_toc + 0x515c);
+					printf("[CTORW-LIST] base=0x%x count_word=0x%x\n", clp, rdw(clp));
+					for (u32 i = 1; i <= 48; i++)
+					{
+						const u32 opd = rdw(clp + i * 4);
+						if (opd == 0) { printf("[CTORW-LIST] #%u = 0 (terminator)\n", i); break; }
+						printf("[CTORW-LIST] #%u opd=0x%x entry=0x%x\n", i, opd, rdw(opd));
+					}
+				}
+			}
+			else if (cia == 0x3bf8d0) [[unlikely]]
+			{
+				// gpr[9] = current ctor list entry (OPD ptr), verified != -1.
+				if (s_cw_body < 2)
+					printf("[CTORW] body #%u desc=0x%llx entry=0x%x\n",
+						s_cw_body, static_cast<unsigned long long>(gpr[9]), rdw(static_cast<u32>(gpr[9])));
+				s_cw_body++;
+			}
+			else if (cia == 0x3bf8ec) [[unlikely]]
+			{
+				s_cw_ret++;
+			}
+			else if (cia == 0x10474) [[unlikely]]
+			{
+				// 0x10474 = the instruction in _init (0x10200) right AFTER the
+				// `bl __do_global_ctors_aux` at 0x10470 — i.e. the point control
+				// returns to once the WHOLE ctor walk is done. This is a real
+				// block-entry (call-return), so unlike 0x3bf900 it actually fires.
+				// If returned < dispatched, a ctor diverged / broke out early
+				// (band-aid) WITHOUT returning => it never finished registering
+				// its handler => the null-OPD dispatch crash downstream.
+				static thread_local bool s_cw_exit = false;
+				if (!s_cw_exit && s_cw_body > 0)
+				{
+					s_cw_exit = true;
+					// Re-read G[0] (*0x9714f0) the instant the WHOLE ctor walk
+					// returns. If it's still 0 here, NO global ctor wrote it →
+					// G's sub-object is filled by a runtime/lazy path (HLE-gated),
+					// not by the ctor walk → kills hypothesis (a), leaves (b).
+					printf("[CTORW] RETURN to _init@0x10474: dispatched=%u returned=%u G[0]=*(0x9714f0)=0x%x\n",
+						s_cw_body, s_cw_ret, rdw(0x9714f0));
+				}
+			}
+
+			// WORKER-SPIN probe: WorkerThread (func 0x420fac) ends up spinning at
+			// 0x3c4ae0 → 0x3c4af8 → 0x3c4b04 (TOC-FIX cycles those exact 3 blocks),
+			// calling into liblv2 each iteration — a poll/wait loop. It never
+			// reaches the code that would create G[0] (the all-thread [G0-WRITE]
+			// watch stays silent for ~12s), so boot is a multi-thread deadlock:
+			// main races to the G[0] dispatch and crashes while WorkerThread waits
+			// here forever. One-shot dump of the loop body + GPRs to identify the
+			// poll target (which flag/event/var it waits on → who should set it).
+			if (cia == 0x3c4ae0) [[unlikely]]
+			{
+				static thread_local bool s_ws = false;
+				if (!s_ws)
+				{
+					s_ws = true;
+					const auto spn = ppu_tname.load();
+					printf("[WORKER-SPIN] thread='%s' @0x3c4ae0 loop body:\n",
+						(spn && !spn->empty()) ? spn->c_str() : "<unnamed>");
+					for (u32 a = 0x3c4ac0; a <= 0x3c4b10; a += 4)
+						printf("  i @0x%x: %08x\n", a, rdw(a));
+					printf("  GPR r3=%llx r4=%llx r5=%llx r6=%llx r7=%llx r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx\n",
+						static_cast<unsigned long long>(gpr[3]), static_cast<unsigned long long>(gpr[4]), static_cast<unsigned long long>(gpr[5]),
+						static_cast<unsigned long long>(gpr[6]), static_cast<unsigned long long>(gpr[7]), static_cast<unsigned long long>(gpr[8]),
+						static_cast<unsigned long long>(gpr[9]), static_cast<unsigned long long>(gpr[10]), static_cast<unsigned long long>(gpr[11]),
+						static_cast<unsigned long long>(gpr[12]));
+					printf("  GPR r24=%llx r25=%llx r26=%llx r27=%llx r28=%llx r29=%llx r30=%llx r31=%llx\n",
+						static_cast<unsigned long long>(gpr[24]), static_cast<unsigned long long>(gpr[25]), static_cast<unsigned long long>(gpr[26]),
+						static_cast<unsigned long long>(gpr[27]), static_cast<unsigned long long>(gpr[28]), static_cast<unsigned long long>(gpr[29]),
+						static_cast<unsigned long long>(gpr[30]), static_cast<unsigned long long>(gpr[31]));
+					// Dump the 3 functions the poll loop calls (bl 0x4cf508 = poll,
+					// bl 0x4cf588 = sleep(r4=ms*1000), bl 0x4cf528 = poll). Reveals
+					// what memory/flag the loop tests (the condition that never
+					// becomes true) and whether they thunk to liblv2/HLE imports.
+					const u32 pollfns[3] = {0x4cf508u, 0x4cf528u, 0x4cf588u};
+					for (u32 k = 0; k < 3; k++)
+					{
+						const u32 fbase = pollfns[k];
+						printf("  [POLL-FN] @0x%x:\n", fbase);
+						for (u32 a = fbase; a < fbase + 0x40; a += 4)
+							printf("    %08x: %08x\n", a, rdw(a));
+					}
+				}
+			}
+
+			// MAIN-TRACE probe: main() @0x141d84 runs a long bl-sequence of init
+			// calls; the crash is a null OBJECT pointer (r27=0) used after one of
+			// these returns. The block-granularity interpreter only surfaces
+			// bl-RETURN addresses as dispatch `cia`, so logging every block-entry
+			// within main's body [0x141d84..0x142150] captures r3 = the value the
+			// just-returned callee produced. The first init that returns 0 / null /
+			// an error code is the root: main bails and the cleanup/lookup path
+			// dereferences the unconstructed .bss singleton.
+			if (cia >= 0x141d84 && cia <= 0x142150) [[unlikely]]
+			{
+				static thread_local u32 s_mt = 0;
+				if (s_mt < 80)
+					printf("[MAIN] #%u cia=0x%x lr=0x%llx r3=0x%llx r4=0x%llx r27=0x%llx r29=0x%llx r30=0x%llx r31=0x%llx\n",
+						s_mt, cia,
+						static_cast<unsigned long long>(lr),
+						static_cast<unsigned long long>(gpr[3]),
+						static_cast<unsigned long long>(gpr[4]),
+						static_cast<unsigned long long>(gpr[27]),
+						static_cast<unsigned long long>(gpr[29]),
+						static_cast<unsigned long long>(gpr[30]),
+						static_cast<unsigned long long>(gpr[31]));
+				s_mt++;
+			}
 		}
 #endif
 
@@ -2476,6 +2927,251 @@ void ppu_thread::exec_task()
 		const auto op = reinterpret_cast<be_t<u32>*>(mem_ + u64{cia});
 		const auto fn = reinterpret_cast<ppu_intrp_func*>(cache + u64{cia} * 2);
 #if defined(__EMSCRIPTEN__)
+		// NULL-TOC CASCADE FIX (see g_eboot_toc definition near top of file).
+		// main_thread hands off from LLE liblv2 into the EBOOT, but liblv2 calls
+		// the EBOOT _start WITHOUT loading the EBOOT TOC, so the game's C-runtime
+		// and C++ global constructors run with the WRONG r2 (either 0 or liblv2's
+		// own TOC 0xc08ab0). Wrong r2 => every TOC-relative global read is garbage
+		// => static initialization leaves singletons zeroed => later virtual /
+		// callback calls fetch a null function pointer (cia=0 null-fn traps) and
+		// worker threads dereference null objects (memory-access OOB).
+		// In PPC64 ELFv1 r2 is a per-module CONSTANT: EVERY instruction in the
+		// EBOOT module must execute with r2 == the EBOOT TOC (the caller sets it
+		// via the OPD before any cross-module call; intra-module flow never
+		// changes it). So we enforce that invariant directly: whenever EBOOT-range
+		// code is about to run with r2 != eboot_toc, restore it. This is correct
+		// (not a band-aid) and also self-heals stale on-stack saved-TOC values,
+		// because the next `std r2,0x28(r1)` then saves the corrected TOC.
+		if (eboot_toc && cia >= eboot_beg && cia < eboot_end && gpr[2] != eboot_toc) [[unlikely]]
+		{
+			const u32 bad_r2 = static_cast<u32>(gpr[2]);
+			gpr[2] = eboot_toc;
+			static thread_local bool s_entered = false;
+			static thread_local u32 s_tocfix = 0;
+			const auto sp_name = ppu_tname.load();
+			const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+			if (!s_entered)
+			{
+				s_entered = true;
+				printf("[TOC-ENTER] thread='%s' first wrong-r2 EBOOT instr: cia=0x%x had r2=0x%x -> 0x%x\n",
+					nm, cia, bad_r2, eboot_toc);
+			}
+			if (s_tocfix++ < 6)
+			{
+				printf("[TOC-FIX #%u] thread='%s' r2 0x%x->0x%x at cia=0x%x lr=0x%llx\n",
+					s_tocfix, nm, bad_r2, eboot_toc, cia, static_cast<unsigned long long>(lr));
+			}
+		}
+		// === MAIN-RET disasm (stackwalk49) ===
+		// With online init skipped, 0x409a90 returns r3=0 to main@0x142148 and main
+		// takes a cleanup/exit path (cellPadEnd/sys_config_stop) instead of proceeding
+		// to cellGcmInit. Dump main's post-0x409a90 check ONCE to find the success
+		// condition (what r3/value avoids the bail), so we can drive main toward
+		// rendering. Fires even without a crash (the one-shot DIAG needs a null-fn).
+		if (cia == 0x142148) [[unlikely]]
+		{
+			static thread_local bool s_mret = false;
+			if (!s_mret)
+			{
+				s_mret = true;
+				const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+				printf("[MAIN-RET] 0x409a90 -> r3=0x%llx ; main disasm 0x142144..0x142284:\n",
+					static_cast<unsigned long long>(gpr[3]));
+				for (u32 p = 0x142144; p < 0x142284; p += 0x10)
+					printf("  [MAIN-DIS] @0x%x: %08x %08x %08x %08x\n", p, rdm(p), rdm(p + 4), rdm(p + 8), rdm(p + 0xc));
+			}
+			// DRIVE SUCCESS PATH (stackwalk50): main does `if ((r3 & 0xff) != 0) goto
+			// 0x142264 (success → game/cellGcmInit)` else falls through to cleanup+exit.
+			// With ONLINE-SKIP, 0x409a90 returns 0 → main bails. Force r3=1 so main takes
+			// the success branch. EXPERIMENT to test if real rendering (GCM) is reachable
+			// now that the rest of 0x409a90's container init DID run (unlike the whole-skip
+			// which crashed at 0x2d65b8). Any pixels come from real GCM, not faked.
+			if (gpr[3] == 0)
+			{
+				printf("[MAIN-FORCE] 0x409a90 r3=0 -> forcing r3=1 (take success path 0x142264)\n");
+				gpr[3] = 1;
+			}
+		}
+		// === ONLINE-SKIP (stackwalk48) — reachability experiment ===
+		// main@0x142144 -> 0x409a90 -> bctrl@0x409bf8 -> 0x1d6e90 -> 0x65614 ->
+		// 0x1be60 (np init, a0=0x974b2c) -> ... -> fn7f (reads unconstructed G[0]=0).
+		// The whole np/online init subtree depends on managers the type-registration
+		// never built. Skip JUST this subtree (entry 0x1d6e90, guarded to the
+		// bctrl@0x409bf8 caller so it's surgical) and return success, letting the REST
+		// of 0x409a90 finish its real container init and main proceed toward
+		// cellGcmInit. NOT faking pixels — stubbing a broken subsystem to test whether
+		// real rendering is reachable. Self-disables once G[0] is built.
+		if (cia == 0x1d6e90 && (static_cast<u32>(lr) & ~3u) == 0x409bfc &&
+			reinterpret_cast<be_t<u32>*>(mem_ + u64{0x9714f0})->value() == 0) [[unlikely]]
+		{
+			printf("[ONLINE-SKIP] skip 0x1d6e90 online/np init (G[0]=0) -> r3=0 ret to 0x%x\n",
+				static_cast<u32>(lr) & ~3u);
+			gpr[3] = 0;
+			cia = static_cast<u32>(lr) & ~3u;
+			continue;
+		}
+		// === fn7f BYPASS (stackwalk32) — empirical: skip the G[0] consumer ===
+		// fn7f @0x7f8e4 unconditionally derefs G[0]=*(0x9714f0) (lwz r5,0(r6);
+		// lwz r28,0x10(r5) @0x7f944, NO null guard). G[0] is NEVER constructed in
+		// this limping boot — every static writer scan (G-SET/G-CTOR/G-ABS) = 0
+		// AND the runtime G0-WRITE poll never fires. So fn7f always cascades into a
+		// null vtable call (null-fn @0x7f9c8) and main wedges after 3 band-aids.
+		// Rather than band-aid the downstream null calls, skip fn7f at its entry
+		// (0x7f8e4 is a reliable bl-target block start) and return r3=0 to its
+		// caller (lr=0x1d6fbc, the per-node registry dispatch). GOAL: let main
+		// proceed PAST the 0x409a90 type-registry walk toward cellGcmInit so the
+		// RSX actually flips real pixels. Guarded on G[0]==0 so it self-disables if
+		// G[0] ever gets built. If main still wedges right after, escalate to
+		// skipping the whole 0x409a90 walk (return r3=1 to main@0x142148).
+		if (cia == 0x7f8e4 &&
+			reinterpret_cast<be_t<u32>*>(mem_ + u64{0x9714f0})->value() == 0) [[unlikely]]
+		{
+			static thread_local u32 s_fn7f_skip = 0;
+			if (s_fn7f_skip++ < 8)
+			{
+				const auto sp_name = ppu_tname.load();
+				const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+				printf("[fn7f BYPASS #%u] thread='%s' skip 0x7f8e4 (G[0]=0) -> r3=0 ret to lr=0x%llx\n",
+					s_fn7f_skip, nm, static_cast<unsigned long long>(lr));
+			}
+			gpr[3] = 0;
+			cia = static_cast<u32>(lr) & ~3u;
+			continue;
+		}
+		// === 0x409a90 WHOLE-INIT SKIP (stackwalk33) — empirical whack-a-mole exit ===
+		// fn7f was only ONE of many G[0]/manager consumers reached from main's big
+		// init bl 0x409a90 (main@0x142144). Bypassing fn7f just exposed the next
+		// crash at 0x418ea0/0x419164 (bctrl on null r0, because r25=0 — yet another
+		// uninitialized manager). The whole 0x409a90 subtree assumes the master
+		// manager G[0] exists, which it never does. So skip the ENTIRE 0x409a90 call
+		// and fake success (r3=1), to test whether main can still reach an ACTUAL
+		// cellGcmInit + WebGPUGSRender::flip without it. If main proceeds far (new
+		// MAIN-TRACE addrs past 0x142148, ideally cellGcm activity) -> progress; if
+		// main bails immediately -> 0x409a90 is essential and G[0] MUST be built.
+		// Guarded on G[0]==0 so it self-disables once the manager exists.
+		static const bool k409skip = false; // DISABLED (stackwalk39): let 0x409a90 RUN so GI-RUN can observe registration during main's init
+		if (k409skip && cia == 0x409a90 &&
+			reinterpret_cast<be_t<u32>*>(mem_ + u64{0x9714f0})->value() == 0) [[unlikely]]
+		{
+			static thread_local u32 s_409_skip = 0;
+			if (s_409_skip++ < 8)
+			{
+				const auto sp_name = ppu_tname.load();
+				const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+				printf("[409a90 SKIP #%u] thread='%s' skip whole init (G[0]=0) -> r3=1 ret to lr=0x%llx\n",
+					s_409_skip, nm, static_cast<unsigned long long>(lr));
+			}
+			gpr[3] = 1;
+			cia = static_cast<u32>(lr) & ~3u;
+			continue;
+		}
+		// === 0x4300b0 / 0x43b05c RUNTIME WATCH (stackwalk36) ===
+		// 0x4300b0 = find-or-create node in list@arg0 (wlock G's rwlock, 8-byte
+		// nodes); 0x43b05c = the OTHER wlock(0x7d) fn (NOT subregion-based) -
+		// candidate manager getInstance that reaches G's rwlock via G+0x174 and
+		// may store the real >=0x14-byte manager to G[0]. wlock is logged at
+		// TRACE (filtered) so syscall-log absence is NOT proof. Watch entries
+		// directly: which fns run, with what args, and G[0] before each.
+		if (cia == 0x4300b0 || cia == 0x43b05c || cia == 0x424254 || cia == 0x40d188) [[unlikely]]
+		{
+			static thread_local u32 s_giw = 0;
+			if (s_giw++ < 40)
+			{
+				const u32 g0 = reinterpret_cast<be_t<u32>*>(mem_ + u64{0x9714f0})->value();
+				const auto sp_name = ppu_tname.load();
+				const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+				printf("[GI-RUN #%u] '%s' fn=0x%x(a0=0x%llx a1=0x%llx a2=0x%llx a3=0x%llx) G[0]=0x%x lr=0x%llx%s\n",
+					s_giw, nm, cia,
+					static_cast<unsigned long long>(gpr[3]), static_cast<unsigned long long>(gpr[4]),
+					static_cast<unsigned long long>(gpr[5]), static_cast<unsigned long long>(gpr[6]),
+					g0, static_cast<unsigned long long>(lr),
+					(static_cast<u32>(gpr[3]) == 0x9714f0u) ? "  <-- arg0==&G : sets G[0]!" : "");
+			}
+		}
+		// === CTOR/registration dispatch WATCH (stackwalk37) ===
+		// GI-RUN proved the registry-insert fns (0x4300b0/0x43b05c) never run,
+		// so the type registries (incl. G[0]'s list) stay empty. Their callers
+		// are the static-init region 0x3bfca0/d0/d00 + 0x40d188, dispatched
+		// (per stale note) via 0x3bf8a8. Watch whether the dispatcher and the
+		// registration fns actually execute, and who calls them (lr).
+		if (cia == 0x3bf8a8 || cia == 0x3bfca0 || cia == 0x3bfcd0 || cia == 0x3bfd00 || cia == 0x40d188) [[unlikely]]
+		{
+			static thread_local u32 s_ctr = 0;
+			if (s_ctr++ < 60)
+			{
+				const auto sp_name = ppu_tname.load();
+				const char* nm = (sp_name && !sp_name->empty()) ? sp_name->c_str() : "<unnamed>";
+				printf("[CTOR-RUN #%u] '%s' fn=0x%x lr=0x%llx r3=0x%llx r2=0x%llx\n",
+					s_ctr, nm, cia, static_cast<unsigned long long>(lr),
+					static_cast<unsigned long long>(gpr[3]), static_cast<unsigned long long>(gpr[2]));
+			}
+		}
+		// === 0x409a90 SUBTREE error-return TRACE (stackwalk42) ===
+		// G[0] is never constructed; the game boots on native rpcs3 so a wasm-
+		// specific divergence makes init skip construction. Trace call RETURN
+		// values in main's init subtree (cia==0x409a90 .. fn7f@0x7f8e4): a block
+		// entry whose preceding instr is bl/bctrl/bclrl is a return point, r3=its
+		// return value. Flag error/neg returns (>=0x80000000) - a call failing
+		// where the game expects success likely gates the skipped construction.
+		{
+			static thread_local u32 s_rt_on = 0;
+			static thread_local u32 s_rt_n = 0;
+			if (cia == 0x409a90) s_rt_on = 1;
+			if (cia == 0x7f8e4) s_rt_on = 0;
+			if (s_rt_on && s_rt_n < 80)
+			{
+				const u32 pcia = (cia - 4) & ~3u;
+				const u32 pi = reinterpret_cast<be_t<u32>*>(mem_ + u64{pcia})->value();
+				const bool isret = ((pi >> 26) == 18 && (pi & 1u) == 1u) || pi == 0x4e800421u || pi == 0x4e800021u;
+				const u32 r3 = static_cast<u32>(gpr[3]);
+				if (isret && r3 >= 0x80000000u)
+				{
+					printf("[409RET #%u] ret@0x%x aftercall@0x%x r3=0x%x <-- ERROR/neg\n", s_rt_n, cia, pcia, r3);
+					s_rt_n++;
+				}
+			}
+		}
+		// === 0x409a90 SUBTREE call-tree TRACE (stackwalk45) ===
+		// Map the call tree from main's init (cia==0x409a90) toward fn7f: a block
+		// entry whose lr-4 is a bl/bctrl is a CALL entry (target=cia, caller=lr-4).
+		// Log target, caller, arg0, and G[0] so I can see the exact function
+		// sequence and spot where the manager construction is skipped, or any call
+		// after which G[0] flips non-zero (the constructor).
+		{
+			static thread_local u32 s_ct_on = 0;
+			static thread_local u32 s_ct_n = 0;
+			if (cia == 0x409a90) s_ct_on = 1;
+			if (s_ct_on && s_ct_n < 400)
+			{
+				const u32 lrm4 = (static_cast<u32>(lr) - 4) & ~3u;
+				const u32 li = reinterpret_cast<be_t<u32>*>(mem_ + u64{lrm4})->value();
+				const bool isbl = ((li >> 26) == 18 && (li & 1u) == 1u);
+				const bool isbctrl = (li == 0x4e800421u);
+				bool ok = isbctrl;
+				if (isbl) { s32 d = static_cast<s32>(li & 0x03fffffcu); if (d & 0x02000000) d -= 0x04000000; ok = (lrm4 + static_cast<u32>(d) == cia); }
+				if (ok)
+				{
+					const u32 g0 = reinterpret_cast<be_t<u32>*>(mem_ + u64{0x9714f0})->value();
+					printf("[409CALL #%u] ->0x%x from 0x%x a0=0x%x G0=0x%x%s\n",
+						s_ct_n, cia, lrm4, static_cast<u32>(gpr[3]), g0, isbctrl ? " (bctrl)" : "");
+					s_ct_n++;
+				}
+			}
+		}
+		// === CTOR8 rldicl interpreter-correctness canary (stackwalk51) ===
+		// ctor #8 (0x3bfbe4): `li r4,-1; rldicl r4,r4,0,48` -> r4 MUST be 0xffff (mask
+		// keeps low 16 bits; PPC split-field mb=48). Then 0x3bfb58 does real work only
+		// `if (r3==1 && r4==0xffff)`. Testable WITHOUT a native trace: the answer is
+		// known. If the wasm static interpreter mis-decodes the 64-bit rotate-mask
+		// split field, r4 != 0xffff -> guard bails -> work skipped; and such a bug would
+		// mis-evaluate MANY branches (plausibly the registration that never runs).
+		if (cia == 0x3bfb58) [[unlikely]]
+		{
+			printf("[CTOR8 guard] @0x3bfb58 r3=0x%llx r4=0x%llx lr=0x%llx %s\n",
+				static_cast<unsigned long long>(gpr[3]), static_cast<unsigned long long>(gpr[4]),
+				static_cast<unsigned long long>(lr),
+				(static_cast<u32>(gpr[4]) == 0xffffu) ? "(rldicl OK)" : "<-- rldicl WRONG: interp bug!");
+		}
 		if (s_first || !fn->fn) [[unlikely]]
 		{
 			const auto sp_name = ppu_tname.load();
@@ -2486,11 +3182,616 @@ void ppu_thread::exec_task()
 			s_first = false;
 			if (!fn->fn)
 			{
-				// Stop the thread cleanly instead of letting wasm trap.
-				// Surface the dead cia to PPU stop flag; caller sees it as
-				// a normal exit rather than a vanished worker.
-				state += cpu_flag::stop;
-				return;
+				// Rich one-shot diagnostic: a null dispatch means the guest
+				// branched to an address with no decoded instruction (almost
+				// always cia==0 → it called a function pointer that read back
+				// as 0). On wasm32 this is a correctness bug, not a missing
+				// HLE export (the same games boot on native rpcs3). Dump the
+				// register file + the raw call-site instructions so we can
+				// decode WHICH pointer load produced the 0. Capped so other
+				// threads hitting null later don't flood the console.
+				static thread_local u32 s_nullcnt = 0;
+				if (s_nullcnt++ < 6)
+				{
+					const auto rd = [mem_](u32 a) -> u32 {
+						return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value();
+					};
+					printf("[null-fn DIAG #%u] thread='%s' cia=0x%x lr=0x%llx ctr=0x%llx r2(TOC)=0x%llx\n",
+						s_nullcnt, nm, cia, lr, ctr, gpr[2]);
+					// Full GPR file. r25-r31 are callee-saved and almost always
+					// hold the C++ `this` / object / function-descriptor pointer
+					// that read back null — dumping them tells us WHICH object.
+					for (u32 r = 0; r < 32; r += 4)
+					{
+						printf("  r%u=%llx r%u=%llx r%u=%llx r%u=%llx\n",
+							r, gpr[r], r + 1, gpr[r + 1], r + 2, gpr[r + 2], r + 3, gpr[r + 3]);
+					}
+					// Call site: dump a WIDE window backward (0x100 bytes = 64
+					// instrs) so we capture the function prologue and the actual
+					// load that set the null object register (lwz/ld r27 =
+					// 0x836.. / 0xEB6.. , addi r27 = 0x3B6.., mr r27 = 0x7..B378).
+					// The bctrl/bclrl itself is at base-4.
+					const u32 base = static_cast<u32>(lr) & ~3u;
+					for (u32 k = 0x100; k >= 4; k -= 0x10)
+					{
+						printf("  cs @0x%x: %08x %08x %08x %08x\n", base - k,
+							rd(base - k), rd(base - k + 4), rd(base - k + 8), rd(base - k + 0xc));
+					}
+					// Deref the callee-saved object-pointer candidates: the 8
+					// bytes at each (an OPD reads as [entry,toc]; an object reads
+					// as [vtable_ptr, ...]). A null/zero result pinpoints the bad one.
+					for (u32 r = 24; r <= 31; r++)
+					{
+						const u32 p = static_cast<u32>(gpr[r]);
+						printf("  *r%u(0x%x)=[%08x %08x]\n", r, p, rd(p), rd(p + 4));
+					}
+					// Recover the game TOC saved on the stack: ELFv1 frames do
+					// `std r2,0x28(r1)` before an indirect call, so *(sp+0x28) is
+					// the caller's TOC even though r2 itself was clobbered to the
+					// (null) callee TOC. For the known 0x7f9cc site, walk the
+					// global→singleton→field chain that produced the null:
+					//   r6=*(TOC-0x7780); r5=*r6; r28=*(r5+0x10)  ← the root null.
+					// This distinguishes a DATA-LOAD bug (global/r6 itself null)
+					// from an INIT bug (global valid, but singleton field +0x10 null).
+					const u32 sp_ = static_cast<u32>(gpr[1]);
+					const u32 saved_toc = rd(sp_ + 0x28);
+					printf("  saved_toc(@sp+0x28)=0x%x\n", saved_toc);
+					// Back-chain stack walk (PPC64 ELFv1: *(sp)=caller's sp;
+					// *(caller_sp+0x10)=the LR saved by the callee = return addr
+					// into its caller). Recovers the CALL PATH that reached this
+					// null indirect call. Decisive for the "C++ global ctors never
+					// run" theory: if the path traces back through the CRT init
+					// routines (0x492270/0x49bd24/0x497dd0/0x49c1a0/0x49ce40 — the
+					// bl-sequence in _start at 0x102ac+), 0x7f8e4 is a global ctor
+					// (or the ctor-iterator) and the bug is in ctor dispatch; if it
+					// traces back through main(), the singleton init was simply
+					// never invoked before first use.
+					// PPC64 ELFv1 frames are 64-bit doublewords: the 32-bit vm
+					// address sits in the LOW half, so back-chain = *(sp+4) and the
+					// callee-saved LR = *(caller_sp+0x14) (the +0x10 doubleword's
+					// low word). Reading +0/+0x10 yields the zero high word.
+					{
+						u32 wsp = sp_;
+						for (u32 i = 0; i < 24; i++)
+						{
+							const u32 back = rd(wsp + 4);
+							if (back == 0 || back <= wsp) { printf("  [stk] #%u sp=0x%x <end back=0x%x>\n", i, wsp, back); break; }
+							const u32 slr = rd(back + 0x14);
+							// Also dump the call site (the 2 instrs preceding the
+							// return addr): identifies a `bl`/`bctrl`/`blrl` and lets
+							// us name each caller function and decode the CRT path.
+							printf("  [stk] #%u sp=0x%x caller_sp=0x%x ret=0x%x callsite[%08x %08x]\n",
+								i, wsp, back, slr, rd((slr - 8) & ~3u), rd((slr - 4) & ~3u));
+							wsp = back;
+						}
+						// One-shot: dump the CRT main (the function _start calls at
+						// 0x1024c -> 0x10354). Reading its body reveals whether it
+						// runs an .init_array/global-ctor loop before calling main,
+						// and where each chain return addr (0x104d8 etc.) lands.
+						static atomic_t<u32> s_crt_dump{0};
+						if (s_crt_dump.exchange(1) == 0)
+						{
+							for (u32 a = 0x10354; a <= 0x10354 + 0x190; a += 0x10)
+								printf("  crt @0x%x: %08x %08x %08x %08x\n", a, rd(a), rd(a + 4), rd(a + 8), rd(a + 0xc));
+							// CTORS CONFIRMED RUNNING (cap_stackwalk12): all 26 dispatch
+							// via 0x3bf8a8 to valid code. Crash is in main (0x141d84):
+							// main@0x142144 -> 0x40ea90 -> 0x409a90 release -> null vtable
+							// call. Dump main's body up to the crash call (to read its
+							// init `bl` sequence + which call leads to 0x142144) and the
+							// crash function 0x40ea90, so we can find the FIRST init step
+							// that fails (returns 0/error) and leaves a .bss object zero.
+							for (u32 a = 0x141d84; a <= 0x142150; a += 0x10)
+								printf("  main @0x%x: %08x %08x %08x %08x\n", a, rd(a), rd(a + 4), rd(a + 8), rd(a + 0xc));
+							for (u32 a = 0x40ea90; a <= 0x40ea90 + 0xb0; a += 0x10)
+								printf("  f40ea90 @0x%x: %08x %08x %08x %08x\n", a, rd(a), rd(a + 4), rd(a + 8), rd(a + 0xc));
+							// SIBLING REGISTRY: 0x40ea90 compares r4 against *(TOC+0x5a14).
+							// If this sibling is non-null while G[0] is null, the failure
+							// is G-specific (one manager's init was skipped), not systemic.
+							{
+								const u32 sib = rd(0x5ace5c); // = *(eboot_toc + 0x5a14)
+								printf("  [REG] sibling *(TOC+0x5a14)=*0x5ace5c=0x%x deref=0x%x [%08x %08x %08x %08x]\n",
+									sib, rd(sib), rd(sib), rd(sib + 4), rd(sib + 8), rd(sib + 0xc));
+							}
+							// LOCATE G[0]'s INITIALIZER: G is loaded via `lwz rX,-0x7780(r2)`
+							// (== (word & 0xFC1FFFFF)==0x80028880). Its first-field writer
+							// does `stw rZ,0(rX)` within a few instrs. Scan the loaded EBOOT
+							// for that pair so we can name the function that SHOULD set G[0]
+							// and trace why it's never executed.
+							{
+								// ROBUST G-SETTER FINDER. G is the game global pointer at
+								// *(TOC-0x7780)==0x9714f0; it should be written by
+								//   lwz rA,-0x7780(r2) ; ...(maybe calls)... ; stw/std rZ,0(rA)
+								// The earlier tight lwz+stw(<=20,same-reg) scan found 0 writers.
+								// Widen decisively: scan EVERY store-to-0(rA) in the EBOOT text
+								// (stw op36 D==0, AND std op62 DS==0 — pointers may be 8-byte),
+								// then back-search up to 64 instrs for the G-load into the SAME
+								// base rA. Callee-saved bases survive `bl`, so the store can be
+								// far from the load. This finds the setter even when it spans
+								// allocator/ctor calls.
+								u32 setters = 0;
+								for (u32 a = 0x10000; a < 0x588ce8; a += 4)
+								{
+									const u32 w = rd(a);
+									const u32 op = w >> 26;
+									u32 rZ = 0, rA = 0; bool store0 = false; const char* knd = "stw";
+									if (op == 36 && (w & 0xffffu) == 0) { store0 = true; rZ = (w >> 21) & 0x1f; rA = (w >> 16) & 0x1f; knd = "stw"; }
+									else if (op == 62 && (w & 0x3u) == 0 && (w & 0xfffcu) == 0) { store0 = true; rZ = (w >> 21) & 0x1f; rA = (w >> 16) & 0x1f; knd = "std"; }
+									if (!store0 || rA == 0) continue;
+									for (u32 j = 1; j <= 64; j++)
+									{
+										const u32 wb = rd(a - j * 4);
+										if ((wb & 0xFC1FFFFFu) == 0x80028880u && ((wb >> 21) & 0x1f) == rA)
+										{
+											if (setters < 40)
+												printf("  [G-SET] store@0x%x %s r%u,0(r%u) <- G-load@0x%x gap=%u\n",
+													a, knd, rZ, rA, a - j * 4, j);
+											setters++;
+											break;
+										}
+									}
+								}
+								// Enumerate G-load sites and flag LAZY-INIT candidates: a
+								// getInstance does `lwz rX,G; lwz rY,0(rX); cmp[l]wi rY,0; b<cc>`
+								// before allocating. Finding the null-check site points to the
+								// function that SHOULD construct G[0] on first use.
+								u32 gloads = 0, checks = 0;
+								for (u32 a = 0x10000; a < 0x588ce8 && gloads < 40; a += 4)
+								{
+									const u32 w = rd(a);
+									if ((w & 0xFC1FFFFFu) != 0x80028880u) continue;
+									const u32 rX = (w >> 21) & 0x1f;
+									gloads++;
+									bool lazy = false; u32 chk_at = 0;
+									for (u32 j = 1; j <= 8; j++)
+									{
+										const u32 w2 = rd(a + j * 4);
+										if (((w2 >> 26) == 11 || (w2 >> 26) == 10) && (w2 & 0xffffu) == 0) { lazy = true; chk_at = a + j * 4; break; }
+									}
+									if (lazy) { checks++; printf("  [G-CHK] @0x%x lwz r%u,G then cmp-zero@0x%x (lazy-init candidate)\n", a, rX, chk_at); }
+								}
+								printf("  [G-SCAN] setters(stw/std@0,<=64back)=%u gloads=%u nullcheck-sites=%u\n",
+									setters, gloads, checks);
+								// === G[0] CONSTRUCTOR HUNT ===
+								// stackwalk25 settled it: the only -0x7780(r2) writer (0x80170)
+								// lives INSIDE the big crash fn 0x7f8e4 (stdu r1,-688 prologue,
+								// no intervening prologue down to 0x80178). That fn READS G[0]
+								// at 0x7f940 (null-deref @0x7f944) AND reads OLD G[0]->0x10 at
+								// 0x80114 before re-storing at 0x80170 — so it ASSUMES G[0] is
+								// already valid. It is NOT the constructor. The real ctor must
+								// form &G=0x9714f0 with the absolute lis/addi pair (typical
+								// static-init for a file-scope global) and store the allocated
+								// manager there. Hunt it: lis rA,0x97 ; addi/ori rA,rA,0x14f0 ;
+								// then stw/std rZ,0(rA).
+								{
+									u32 ctors = 0;
+									for (u32 a = 0x10000; a < 0x588ce8 && ctors < 24; a += 4)
+									{
+										const u32 w = rd(a);
+										if ((w >> 26) != 15) continue;          // addis
+										if (((w >> 16) & 0x1f) != 0) continue;  // lis: RA(src)=0
+										if ((w & 0xffffu) != 0x0097u) continue; // hi(0x9714f0)
+										const u32 rA = (w >> 21) & 0x1f;
+										u32 lo_at = 0;
+										for (u32 j = 1; j <= 8; j++)
+										{
+											const u32 w2 = rd(a + j * 4);
+											const u32 op2 = w2 >> 26;
+											const bool lo = (op2 == 14 || op2 == 24)
+												&& ((w2 >> 21) & 0x1f) == rA
+												&& ((w2 >> 16) & 0x1f) == rA
+												&& (w2 & 0xffffu) == 0x14f0u;
+											if (lo) { lo_at = a + j * 4; break; }
+										}
+										if (!lo_at) continue;
+										u32 store_at = 0, rZ = 0; const char* knd = "none";
+										for (u32 j = 1; j <= 48; j++)
+										{
+											const u32 w3 = rd(lo_at + j * 4);
+											const u32 op3 = w3 >> 26;
+											if (op3 == 36 && ((w3 >> 16) & 0x1f) == rA && (w3 & 0xffffu) == 0)
+												{ store_at = lo_at + j * 4; rZ = (w3 >> 21) & 0x1f; knd = "stw"; break; }
+											if (op3 == 62 && ((w3 >> 16) & 0x1f) == rA && (w3 & 0x3u) == 0 && (w3 & 0xfffcu) == 0)
+												{ store_at = lo_at + j * 4; rZ = (w3 >> 21) & 0x1f; knd = "std"; break; }
+										}
+										printf("  [G-CTOR] lis@0x%x lo@0x%x rA=r%u store=%s r%u,0(rA)@0x%x\n",
+											a, lo_at, rA, knd, rZ, store_at);
+										ctors++;
+									}
+									printf("  [G-CTOR] %u absolute &G(0x9714f0) formation site(s)\n", ctors);
+
+									// Confirm 0x80170 is inside crash-fn 0x7f8e4: next prologue
+									// (stdu/stwu r1,-N(r1)) after it must be > 0x80170.
+									u32 nextfn = 0;
+									for (u32 a = 0x7f8e8; a < 0x81000 && !nextfn; a += 4)
+									{
+										const u32 w = rd(a);
+										const u32 op = w >> 26;
+										const bool stdu1 = (op == 62) && (((w >> 21) & 0x1f) == 1) && (((w >> 16) & 0x1f) == 1) && ((w & 3u) == 1);
+										const bool stwu1 = (op == 37) && (((w >> 21) & 0x1f) == 1) && (((w >> 16) & 0x1f) == 1);
+										if (stdu1 || stwu1) nextfn = a;
+									}
+									printf("  [G-CTOR] crash-fn 0x7f8e4 nextProlog@0x%x setter0x80170-inside=%s\n",
+										nextfn, (nextfn && 0x80170u < nextfn) ? "yes" : "no");
+								}
+
+								// === ABSOLUTE-DISPLACEMENT G[0] WRITER SCAN (stackwalk31) ===
+								// stackwalk30 DISPROVED the body#1 theory: body#1 (0x42fa28) ONLY
+								// calls helper 0x42f8e8 which creates G's rwlock at G+0x174
+								// (li r4,0=null attr; li r11,0x78; sc) and returns — no manager
+								// alloc, no G[0] store. So the rwlock guards LAZY construction
+								// (double-checked-locking singleton) and the real getInstance was
+								// MISSED by prior scans. They only checked the TOC-load+store@0 and
+								// the addi-formed absolute. The UNCHECKED form is the displacement-
+								// folded absolute store: `lis rA,0x97 [; addi rA,rA,k] ; stw/std
+								// rZ,0x14f0(rA)` (0x970000+0x14f0 = 0x9714f0 = &G[0]) — the usual
+								// compiler output for a file-scope pointer write. Scan for it.
+								{
+									u32 hits = 0;
+									for (u32 a = 0x10000; a < 0x588ce8 && hits < 40; a += 4)
+									{
+										const u32 w = rd(a);
+										if ((w >> 26) != 15) continue;          // addis
+										if (((w >> 16) & 0x1f) != 0) continue;  // lis: RA(src)=0
+										if ((w & 0xffffu) != 0x0097u) continue; // hi = 0x97
+										const u32 rA = (w >> 21) & 0x1f;
+										s32 adj = 0;
+										for (u32 j = 1; j <= 48; j++)
+										{
+											const u32 w2 = rd(a + j * 4);
+											const u32 op2 = w2 >> 26;
+											if (op2 == 14 && ((w2 >> 21) & 0x1f) == rA && ((w2 >> 16) & 0x1f) == rA)
+											{ adj += static_cast<s16>(w2 & 0xffffu); continue; } // addi rA,rA,k
+											if (op2 == 36 && ((w2 >> 16) & 0x1f) == rA)            // stw rZ,d(rA)
+											{
+												const s32 d = static_cast<s16>(w2 & 0xffffu);
+												if (d + adj == 0x14f0)
+												{ printf("  [G-ABS] lis@0x%x rA=r%u stw r%u,%d(rA)@0x%x adj=%d -> &G[0]\n",
+													a, rA, (w2 >> 21) & 0x1f, d, a + j * 4, adj); hits++; break; }
+											}
+											if (op2 == 62 && ((w2 >> 16) & 0x1f) == rA && (w2 & 3u) == 0) // std rZ,d(rA)
+											{
+												const s32 d = static_cast<s16>(w2 & 0xfffcu);
+												if (d + adj == 0x14f0)
+												{ printf("  [G-ABS] lis@0x%x rA=r%u std r%u,%d(rA)@0x%x adj=%d -> &G[0]\n",
+													a, rA, (w2 >> 21) & 0x1f, d, a + j * 4, adj); hits++; break; }
+											}
+											if (op2 == 15 && ((w2 >> 21) & 0x1f) == rA) break; // base reloaded
+										}
+									}
+									printf("  [G-ABS] %u absolute lis-0x97+store@0x14f0 site(s)\n", hits);
+								}
+								// === getInstance LOCATOR via rwlock LOCK syscall (stackwalk34) ===
+								// Store-pattern scans (G-SET/G-CTOR/G-ABS) all failed: the ctor gets
+								// &G as an ARG (store `stw rZ,0(rArg)` in a callee, provenance in the
+								// caller). The DCL getInstance is immune - it MUST issue a rwlock LOCK
+								// syscall on G's rwlock. lv2: 0x78 create,0x79 destroy,0x7a rlock,
+								// 0x7c runlock,0x7d wlock,0x7f wunlock. Scan EBOOT for
+								// `li r11,N(0x78..0x7f) ; sc` + each site's fn entry (back-scan to
+								// stwu/stdu r1 prologue). The 0x7d(wlock) site's fn == getInstance or
+								// its lock-helper. Runtime shows NO wlock executes => getInstance is
+								// compiled but never invoked (the real question).
+								{
+									u32 lk = 0;
+									for (u32 a = 0x10000; a < 0x588ce8 && lk < 40; a += 4)
+									{
+										const u32 w = rd(a);
+										if ((w >> 26) != 14) continue;            // addi
+										if (((w >> 21) & 0x1f) != 11) continue;   // rD=r11
+										if (((w >> 16) & 0x1f) != 0) continue;    // rA=0 => li r11,N
+										const u32 num = w & 0xffffu;
+										if (num < 0x78 || num > 0x7f) continue;   // rwlock family
+										u32 sc_at = 0;
+										for (u32 j = 1; j <= 8 && !sc_at; j++)
+											if (rd(a + j * 4) == 0x44000002u) sc_at = a + j * 4;
+										if (!sc_at) continue;
+										u32 fent = 0;
+										for (u32 b = a; b > 0x10000 && a - b < 0x800 && !fent; b -= 4)
+										{
+											const u32 wb = rd(b); const u32 ob = wb >> 26;
+											const bool p62 = (ob == 62) && (((wb >> 21) & 0x1f) == 1) && (((wb >> 16) & 0x1f) == 1) && ((wb & 3u) == 1);
+											const bool p37 = (ob == 37) && (((wb >> 21) & 0x1f) == 1) && (((wb >> 16) & 0x1f) == 1);
+											if (p62 || p37) fent = b;
+										}
+										printf("  [RWL-LK] li r11,0x%x @0x%x sc@0x%x fnEntry=0x%x\n", num, a, sc_at, fent);
+										lk++;
+									}
+									printf("  [RWL-LK] %u rwlock lock/unlock syscall sites\n", lk);
+									// getInstance reaches G's rwlock id (0x971664) via sub-region ptr
+									// 0x9715b0 loaded from TOC+0x5bac. `lwz rX,0x5bac(r2)`==0x80025bac
+									// (masked over rD). The fn that loads subrgn AND is a [RWL-LK]
+									// fnEntry is getInstance.
+									u32 sr = 0;
+									for (u32 a = 0x10000; a < 0x588ce8 && sr < 30; a += 4)
+									{
+										const u32 w = rd(a);
+										if ((w & 0xFC1FFFFFu) != 0x80025bacu) continue;
+										u32 fent = 0;
+										for (u32 b = a; b > 0x10000 && a - b < 0x800 && !fent; b -= 4)
+										{
+											const u32 wb = rd(b); const u32 ob = wb >> 26;
+											const bool p62 = (ob == 62) && (((wb >> 21) & 0x1f) == 1) && (((wb >> 16) & 0x1f) == 1) && ((wb & 3u) == 1);
+											const bool p37 = (ob == 37) && (((wb >> 21) & 0x1f) == 1) && (((wb >> 16) & 0x1f) == 1);
+											if (p62 || p37) fent = b;
+										}
+										printf("  [SUBRGN] lwz r%u,0x5bac(r2)@0x%x fnEntry=0x%x\n", (w >> 21) & 0x1f, a, fent);
+										sr++;
+									}
+									printf("  [SUBRGN] %u subregion-ptr load sites\n", sr);
+								}
+								// === getInstance(0x4300b0) BODY + CALLER discovery (stackwalk35) ===
+								// 0x4300b0 loads G's subregion (0x5bac(r2)) AND wlocks(0x7d)/wunlocks
+								// (0x7f) G's rwlock => it IS the DCL constructor of G[0]. Runtime shows
+								// it NEVER runs (no wlock syscall). To make the GAME's real ctor build
+								// G[0] honestly we must either fix why its natural caller is skipped or
+								// force-call it. Both need: (a) its prologue/args, (b) who calls it.
+								{
+									// (a) disasm getInstance body (prologue + arg usage + what it builds)
+									for (u32 p = 0x4300b0; p < 0x4300b0 + 0x1c0; p += 0x10)
+										printf("  [GI-DIS] @0x%x: %08x %08x %08x %08x\n", p, rd(p), rd(p + 4), rd(p + 8), rd(p + 0xc));
+									// (b) direct `bl 0x4300b0` callers (op18,LK=1,AA=0; tgt=a+sext(LI))
+									u32 callers = 0;
+									for (u32 a = 0x10000; a < 0x588ce8 && callers < 30; a += 4)
+									{
+										const u32 w = rd(a);
+										if ((w >> 26) != 18) continue;
+										if ((w & 1u) != 1u) continue;   // LK=1 (bl)
+										if ((w & 2u) != 0u) continue;   // AA=0 (relative)
+										s32 li = static_cast<s32>(w & 0x03fffffcu);
+										if (li & 0x02000000) li -= 0x04000000;
+										if (a + static_cast<u32>(li) != 0x4300b0u) continue;
+										u32 fent = 0;
+										for (u32 b = a; b > 0x10000 && a - b < 0x1000 && !fent; b -= 4)
+										{
+											const u32 wb = rd(b); const u32 ob = wb >> 26;
+											const bool p62 = (ob == 62) && (((wb >> 21) & 0x1f) == 1) && (((wb >> 16) & 0x1f) == 1) && ((wb & 3u) == 1);
+											const bool p37 = (ob == 37) && (((wb >> 21) & 0x1f) == 1) && (((wb >> 16) & 0x1f) == 1);
+											if (p62 || p37) fent = b;
+										}
+										printf("  [GI-CALL] bl 0x4300b0 @0x%x callerFn=0x%x [ctx %08x %08x %08x]\n", a, fent, rd(a - 4), rd(a), rd(a + 4));
+										callers++;
+									}
+									printf("  [GI-CALL] %u direct bl callers of getInstance\n", callers);
+									// (c) data words == 0x4300b0 (OPD entry / fn-ptr table -> indirect call)
+									u32 refs = 0;
+									for (u32 a = 0x10000; a < 0x600000 && refs < 30; a += 4)
+									{
+										if (rd(a) != 0x4300b0u) continue;
+										printf("  [GI-PTR] word 0x4300b0 @0x%x next=0x%x\n", a, rd(a + 4));
+										refs++;
+									}
+									printf("  [GI-PTR] %u data refs to 0x4300b0\n", refs);
+								}
+								// === disasm 0x43b05c = the OTHER wlock(0x7d) fn (stackwalk36) ===
+								// Not subregion(0x5bac)-based, so it reaches its rwlock another way -
+								// candidate real manager getInstance (wlock G+0x174, alloc manager,
+								// store to G[0]). Disasm prologue/args + its TOC slot & store offsets.
+								{
+									for (u32 p = 0x43b05c; p < 0x43b05c + 0x180; p += 0x10)
+										printf("  [GI2-DIS] @0x%x: %08x %08x %08x %08x\n", p, rd(p), rd(p + 4), rd(p + 8), rd(p + 0xc));
+								}
+								// === disasm ctor/registration region + ctor-table scan (stackwalk37) ===
+								// Resolve the contradiction: is 0x3bf8a8 reached & does it reach the
+								// bl 0x4300b0 sites (0x3bfcb4/ce4/d14)? Disasm entry+region to find the
+								// gate. Then find 0x3bf8a8 / 0x3bfca0 / 0x40d188 as data (ctor-table or
+								// OPD entries) to learn how static init was SUPPOSED to invoke them.
+								{
+									for (u32 p = 0x3bf880; p < 0x3bfd30; p += 0x10)
+										printf("  [CTOR-DIS] @0x%x: %08x %08x %08x %08x\n", p, rd(p), rd(p + 4), rd(p + 8), rd(p + 0xc));
+									u32 cp = 0;
+									for (u32 a = 0x10000; a < 0x600000 && cp < 40; a += 4)
+									{
+										const u32 w = rd(a);
+										if (w == 0x3bf8a8u || w == 0x3bfca0u || w == 0x3bfcd0u || w == 0x3bfd00u || w == 0x40d188u)
+										{
+											printf("  [CTOR-PTR] word 0x%x @0x%x [prev=0x%x next=0x%x]\n", w, a, rd(a - 4), rd(a + 4));
+											cp++;
+										}
+									}
+									printf("  [CTOR-PTR] %u data refs to ctor/registration fns\n", cp);
+								}
+								// === CTOR TABLE dump (stackwalk38) ===
+								// 0x3bf8a8 iterates the global-ctor table: head=*(TOC+0x515c), start at
+								// head-4, walk DOWN by 4 calling each entry's OPD until entry==-1. Dump
+								// the raw table + resolve each OPD->fn. If the first entry is -1 (or the
+								// table is short/empty) the loader never populated it => no ctors run =>
+								// no type-registration => G[0]=0. Also dump the registration-thunk vtable
+								// at 0x598948 (0x3bfca0/d0/d00 OPDs) for layout.
+								{
+									const u32 head = rd(eboot_toc + 0x515c);
+									printf("  [CTORTAB] head=*(TOC+0x515c)=0x%x iterStart=0x%x\n", head, head - 4);
+									for (u32 p = 0x590000; p < 0x590078; p += 0x10)
+										printf("  [CTORTAB] raw @0x%x: %08x %08x %08x %08x\n", p, rd(p), rd(p + 4), rd(p + 8), rd(p + 0xc));
+									u32 cnt = 0;
+									for (u32 e = head - 4; e >= 0x590000u && cnt < 40; e -= 4)
+									{
+										const u32 ent = rd(e);
+										if (ent == 0xffffffffu) { printf("  [CTORTAB] @0x%x = -1 END after %u ctors\n", e, cnt); break; }
+										printf("  [CTORTAB] #%u @0x%x -> OPD 0x%x -> fn 0x%x\n", cnt, e, ent, rd(ent));
+										cnt++;
+									}
+									printf("  [CTORTAB] walked %u entries\n", cnt);
+									for (u32 p = 0x598940; p < 0x598980; p += 0x10)
+										printf("  [REGVT] @0x%x: %08x %08x %08x %08x\n", p, rd(p), rd(p + 4), rd(p + 8), rd(p + 0xc));
+								}
+								// === REGISTRATION DRIVER hunt (stackwalk40) ===
+								// Registration (0x4300b0) never runs anywhere. Find the driver by tracing
+								// UP: (a) bl callers of 0x40d188 (a direct 0x4300b0 caller not in REGVT);
+								// (b) data refs to REGVT base 0x598940 / 0x40d188 / its OPD 0x59b888;
+								// (c) code forming 0x598940 (lis r,0x59 ; addi r,r,0x8940). The fn that
+								// references REGVT and bctrl-iterates it IS the registration driver.
+								{
+									u32 c1 = 0;
+									for (u32 a = 0x10000; a < 0x588ce8 && c1 < 24; a += 4)
+									{
+										const u32 w = rd(a);
+										if ((w >> 26) != 18 || (w & 1u) != 1u || (w & 2u) != 0u) continue;
+										s32 li = static_cast<s32>(w & 0x03fffffcu); if (li & 0x02000000) li -= 0x04000000;
+										const u32 tgt = a + static_cast<u32>(li);
+										if (tgt != 0x40d188u && tgt != 0x3bfc70u && tgt != 0x3bfca0u) continue;
+										printf("  [REGDRV] bl 0x%x @0x%x\n", tgt, a);
+										c1++;
+									}
+									printf("  [REGDRV] %u bl callers of 0x40d188/thunks\n", c1);
+									u32 c2 = 0;
+									for (u32 a = 0x10000; a < 0x600000 && c2 < 30; a += 4)
+									{
+										const u32 w = rd(a);
+										if (w == 0x598940u || w == 0x59b888u || w == 0x40d188u)
+											{ printf("  [REGDRV] word 0x%x @0x%x [prev=0x%x next=0x%x]\n", w, a, rd(a - 4), rd(a + 4)); c2++; }
+									}
+									printf("  [REGDRV] %u data refs (REGVT/0x40d188)\n", c2);
+									u32 c3 = 0;
+									for (u32 a = 0x10000; a < 0x588ce8 && c3 < 20; a += 4)
+									{
+										const u32 w = rd(a);
+										if ((w >> 26) != 15 || ((w >> 16) & 0x1f) != 0 || (w & 0xffffu) != 0x0059u) continue;
+										const u32 rA = (w >> 21) & 0x1f;
+										for (u32 j = 1; j <= 8; j++)
+										{
+											const u32 w2 = rd(a + j * 4); const u32 op2 = w2 >> 26;
+											if ((op2 == 14 || op2 == 24) && ((w2 >> 21) & 0x1f) == rA && ((w2 >> 16) & 0x1f) == rA && (w2 & 0xffffu) == 0x8940u)
+												{ printf("  [REGDRV] lis 0x59@0x%x +0x8940@0x%x r%u -> REGVT base\n", a, a + j * 4, rA); c3++; break; }
+										}
+									}
+									printf("  [REGDRV] %u lis/addi forming 0x598940\n", c3);
+								}
+								// === re-disasm fn7f (0x7f8e4) the actual crash consumer (stackwalk41) ===
+								// Re-ground: my whole 'G[0]=registry head' model rests on a stale reading
+								// of fn7f. Disasm 0x7f8e4..+0x150 to verify EXACTLY what it loads from G
+								// (=*(TOC-0x7780)=0x9714f0), which field it derefs, and the null bclrl at
+								// 0x7f9c8 - so I know precisely what state G[0] must be in.
+								{
+									for (u32 p = 0x7f8e4; p < 0x7f8e4 + 0x150; p += 0x10)
+										printf("  [FN7F-DIS] @0x%x: %08x %08x %08x %08x\n", p, rd(p), rd(p + 4), rd(p + 8), rd(p + 0xc));
+									// current G geometry at crash time
+									const u32 Gp = rd(eboot_toc - 0x7780);
+									printf("  [FN7F-DIS] &G slot=*(TOC-0x7780)=0x%x  G[0]=*0x9714f0=0x%x\n", Gp, rd(0x9714f0));
+								}
+								// === refined G[0]-setter scan (stackwalk43) ===
+								// The manager ctor loads &G into a CALLEE-SAVED reg (r25-r31, survives the
+								// new()+ctor bl chain) then stores the manager ptr: stw/std rZ,0(rA) with
+								// rA in r25..r31 and `lwz rA,-0x7780(r2)` within 300 instrs before. Prior
+								// G-SET (64-instr, any rA) found only volatile-r3 false positives.
+								{
+									u32 hits = 0;
+									for (u32 x = 0x10000; x < 0x588ce8 && hits < 40; x += 4)
+									{
+										const u32 w = rd(x); const u32 op = w >> 26;
+										u32 rZ = 0, rA = 0; bool st = false; const char* kn = "stw";
+										if (op == 36 && (w & 0xffffu) == 0) { st = true; rZ = (w >> 21) & 0x1f; rA = (w >> 16) & 0x1f; kn = "stw"; }
+										else if (op == 62 && (w & 0x3u) == 0 && (w & 0xfffcu) == 0) { st = true; rZ = (w >> 21) & 0x1f; rA = (w >> 16) & 0x1f; kn = "std"; }
+										if (!st || rA < 25 || rA > 31) continue;
+										for (u32 j = 1; j <= 300; j++)
+										{
+											const u32 wb = rd(x - j * 4);
+											if ((wb & 0xFC1FFFFFu) == 0x80028880u && ((wb >> 21) & 0x1f) == rA)
+											{
+												printf("  [GSET2] %s r%u,0(r%u) @0x%x <- &G-load@0x%x gap=%u\n", kn, rZ, rA, x, x - j * 4, j);
+												hits++; break;
+											}
+											const u32 ob = wb >> 26;
+											if ((ob == 32 || ob == 14 || ob == 15) && ((wb >> 21) & 0x1f) == rA) break; // rA redefined (not the G-load) -> chain broken
+										}
+									}
+									printf("  [GSET2] %u callee-saved G[0] setters\n", hits);
+								}
+								// === REGVT-driver hunt: references to the registrar objects (stackwalk46) ===
+								// REGVT base 0x598940 is stored as data in static objects at 0x59105c and
+								// 0x591e2c (no code forms it). The driver loads REGVT from there and bctrl-
+								// iterates it. Find who reaches those objects: data ptrs to 0x591058/0x591e28
+								// region (the array/list of registrars) + code forming 0x5910xx/0x591exx.
+								{
+									u32 c1 = 0;
+									for (u32 x = 0x10000; x < 0x600000 && c1 < 40; x += 4)
+									{
+										const u32 w = rd(x);
+										if ((w >= 0x591040u && w < 0x591070u) || (w >= 0x591e10u && w < 0x591e40u))
+											{ printf("  [REGREF] ptr 0x%x @0x%x [prev=0x%x next=0x%x]\n", w, x, rd(x - 4), rd(x + 4)); c1++; }
+									}
+									printf("  [REGREF] %u data ptrs to registrar region\n", c1);
+									u32 c2 = 0;
+									for (u32 x = 0x10000; x < 0x588ce8 && c2 < 24; x += 4)
+									{
+										const u32 w = rd(x);
+										if ((w >> 26) != 15 || ((w >> 16) & 0x1f) != 0 || (w & 0xffffu) != 0x0059u) continue;
+										const u32 rA = (w >> 21) & 0x1f;
+										for (u32 j = 1; j <= 8; j++)
+										{
+											const u32 w2 = rd(x + j * 4); const u32 op2 = w2 >> 26;
+											if ((op2 == 14 || op2 == 24) && ((w2 >> 21) & 0x1f) == rA && ((w2 >> 16) & 0x1f) == rA)
+											{
+												const u32 lo = w2 & 0xffffu;
+												if ((lo >= 0x1040u && lo < 0x1070u) || (lo >= 0x1e10u && lo < 0x1e40u))
+													printf("  [REGREF] lis0x59@0x%x +0x%x@0x%x r%u -> registrar\n", x, lo, x + j * 4, rA);
+												break;
+											}
+										}
+									}
+									printf("  [REGREF] done lis/addi scan\n");
+								}
+								// === REGVT driver = loader of registrar TOC slots (stackwalk47) ===
+								// Registrar 0x591040 is in TOC+0x51b0; 0x591e10 in TOC+0x55f4. The driver
+								// does `lwz rX,0x51b0(r2)` (or 0x55f4) then reads REGVT at +0x1c and bctrl-
+								// iterates. lwz rX,0x51b0(r2) == (w & 0xFC1FFFFF)==0x800251b0. Find every
+								// such loader + its fn entry (back-scan to stdu/stwu r1) = the driver fns.
+								{
+									u32 c = 0;
+									for (u32 x = 0x10000; x < 0x588ce8 && c < 30; x += 4)
+									{
+										const u32 w = rd(x);
+										const u32 m = w & 0xFC1FFFFFu;
+										if (m != 0x800251b0u && m != 0x800255f4u) continue;
+										u32 fent = 0;
+										for (u32 b = x; b > 0x10000 && x - b < 0x1000 && !fent; b -= 4)
+										{
+											const u32 wb = rd(b); const u32 ob = wb >> 26;
+											const bool p62 = (ob == 62) && (((wb >> 21) & 0x1f) == 1) && (((wb >> 16) & 0x1f) == 1) && ((wb & 3u) == 1);
+											const bool p37 = (ob == 37) && (((wb >> 21) & 0x1f) == 1) && (((wb >> 16) & 0x1f) == 1);
+											if (p62 || p37) fent = b;
+										}
+										printf("  [REGDRV2] lwz r%u,0x%x(r2)@0x%x fnEntry=0x%x\n", (w >> 21) & 0x1f, w & 0xffffu, x, fent);
+										c++;
+									}
+									printf("  [REGDRV2] %u TOC-registrar loaders (driver candidates)\n", c);
+								}
+							}
+						}
+					}
+					// The faulting sites at 0x7f9cc / 0x7fa84 both load a single
+					// game global G via `lwz rX,-0x7780(r2)` (r2 = EBOOT TOC). The
+					// on-stack saved_toc is unreliable here (mid-block indirect
+					// calls zero r2 before std r2 saves it), so compute the slot
+					// from the KNOWN EBOOT TOC instead. This answers the decisive
+					// question: is the global pointer slot itself null (G never
+					// got its pointer → init/ctor never ran), or is G valid but
+					// its manager field G[0x10] null (sub-object init skipped)?
+					if ((base == 0x7f9cc || base == 0x7fa84) && eboot_toc)
+					{
+						const u32 slot = eboot_toc - 0x7780; // expected 0x59fcc8
+						const u32 G    = rd(slot);            // the game global ptr
+						const u32 mgr  = rd(G + 0x10);        // G[0x10] = manager
+						printf("  CHAIN etoc=0x%x slot=0x%x G=*slot=0x%x G[0]=0x%x G[0x10]=mgr=0x%x\n",
+							eboot_toc, slot, G, rd(G), mgr);
+						printf("  G[0x00..0x20]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+							rd(G), rd(G + 4), rd(G + 8), rd(G + 0xc),
+							rd(G + 0x10), rd(G + 0x14), rd(G + 0x18), rd(G + 0x1c));
+						if (mgr)
+						{
+							printf("  mgr[0x00..0x20]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+								rd(mgr), rd(mgr + 4), rd(mgr + 8), rd(mgr + 0xc),
+								rd(mgr + 0x10), rd(mgr + 0x14), rd(mgr + 0x18), rd(mgr + 0x1c));
+						}
+					}
+				}
+				// Emulate PowerPC `blr` (branch to link register) on null
+				// dispatch so the thread keeps processing PPC code instead of
+				// getting stranded. (Band-aid — the skipped function's side
+				// effects are lost, which is why a cascade of nulls can end in
+				// an OOB. The real fix is making the pointer non-null.)
+				const u32 new_cia = static_cast<u32>(lr) & ~3u;
+				printf("[exec_task] thread null-fn at cia=0x%x → blr-emulate to lr=0x%x\n", cia, new_cia);
+				cia = new_cia;
+				continue;
 			}
 		}
 #endif

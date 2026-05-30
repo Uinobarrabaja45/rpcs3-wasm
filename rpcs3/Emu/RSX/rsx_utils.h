@@ -65,7 +65,19 @@ namespace rsx
 		};
 
 		// Local RSX memory base (known as constant)
+#ifdef __EMSCRIPTEN__
+		// wasm32: the 1.5 GiB guest-address cap (see vm.cpp) can't host RSX local
+		// memory at the real PS3 base (0xC0000000 = 3 GiB). It is relocated to
+		// 0x40000000, matching the relocated vm::video block. Crucially it must sit
+		// ABOVE the (auto-placed) user-memory pool and RSX device/context region:
+		// sys_rsx_context_iomap requires the mapped EA (in those regions) to satisfy
+		// `ea + size <= local_mem_base`. Layout: main 0x00010000.., user+rsx_context
+		// auto-placed in 0x10000000-0x40000000, local mem (video) 0x40000000-0x50000000,
+		// stack/SPU above. All RSX local/main logic uses this constant (28 sites).
+		constexpr u32 local_mem_base = 0x40000000;
+#else
 		constexpr u32 local_mem_base = 0xC0000000;
+#endif
 	}
 
 	// Base for resources with reference counting

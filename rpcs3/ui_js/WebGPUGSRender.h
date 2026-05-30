@@ -42,3 +42,13 @@ private:
 // Visible to GSH_WebGPUJs / Main.cpp — read-only from the browser side.
 // Bumped by the RSX thread on every flip(); never reset (monotonic).
 extern std::atomic<u64> g_webgpu_flip_count;
+
+// Front display-buffer descriptor, published by flip() each frame. The
+// browser main thread reads the pixels straight out of guest VRAM via
+// vm::base(g_webgpu_fb_addr) (shared wasm linear memory) and blits them to
+// the WebGPU surface. addr==0 means "no real frame yet" → present black.
+extern std::atomic<u32> g_webgpu_fb_addr;
+extern std::atomic<u32> g_webgpu_fb_width;
+extern std::atomic<u32> g_webgpu_fb_height;
+extern std::atomic<u32> g_webgpu_fb_pitch;
+extern std::atomic<u64> g_webgpu_fb_host; // host ptr of front buffer (wasm shared mem)

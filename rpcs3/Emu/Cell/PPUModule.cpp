@@ -2835,6 +2835,34 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	}
 	}
 
+#if defined(__EMSCRIPTEN__)
+	// Capture the EBOOT's TOC + code range for the null-TOC cascade fix in
+	// ppu_thread::exec_task. With LLE liblv2 the process `entry` is liblv2's
+	// bootstrap (not the game), so the game's TOC is NOT entry.rtoc — it is
+	// the rtoc of the OPD at the ELF's own e_entry (the EBOOT's _start
+	// descriptor). The code range is the EBOOT's first executable LOAD seg.
+	{
+		extern atomic_t<u32> g_eboot_toc;
+		extern atomic_t<u32> g_eboot_code_beg;
+		extern atomic_t<u32> g_eboot_code_end;
+		const u32 e_entry = static_cast<u32>(elf.header.e_entry);
+		const auto eopd   = vm::_ref<ppu_func_opd_t>(e_entry);
+		g_eboot_toc.store(static_cast<u32>(eopd.rtoc));
+		for (const auto& prog : elf.progs)
+		{
+			if (prog.p_type == 0x1u /* LOAD */ && prog.p_memsz && (prog.p_flags & 0x1u) /* PF_X */)
+			{
+				g_eboot_code_beg.store(static_cast<u32>(prog.p_vaddr));
+				g_eboot_code_end.store(static_cast<u32>(prog.p_vaddr + prog.p_memsz));
+				break;
+			}
+		}
+		printf("[ppu_load_exec] EBOOT e_entry=0x%x opd={addr=0x%x rtoc=0x%x} code=[0x%x,0x%x) (null-TOC fix armed)\n",
+			e_entry, static_cast<u32>(eopd.addr), static_cast<u32>(eopd.rtoc),
+			g_eboot_code_beg.load(), g_eboot_code_end.load());
+	}
+#endif
+
 	// Initialize main thread
 #if defined(__EMSCRIPTEN__)
 	printf("[ppu_load_exec] preparing main_thread: primary_stacksize=0x%x entry=0x%x prio=%d\n",

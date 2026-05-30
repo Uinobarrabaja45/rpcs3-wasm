@@ -88,7 +88,17 @@ struct cfg_root : cfg::node
 		cfg::uint64 spu_llvm_lower_bound{ this, "SPU LLVM Lower Bound" };
 		cfg::uint64 spu_llvm_upper_bound{ this, "SPU LLVM Upper Bound", 0xffffffffffffffff };
 
+#ifdef __EMSCRIPTEN__
+		// wasm32: run the emulated clock at 10% so the (slow, interpreter-only) SPU
+		// gets ~10x more real time per emulated decrementer/timebase tick. The audio
+		// SPURS kernel uses decrementer-based deadlines (event_helper / handler
+		// wait_ready); at 100% the slow SPU misses them and libspurs asserts. Lower
+		// emulated clock lets the SPU reach its ready/idle state within those
+		// deadlines. (Slows overall game speed in real time — fine for bring-up.)
+		cfg::_int<1, 3000> clocks_scale{ this, "Clocks scale", 1 };
+#else
 		cfg::_int<10, 3000> clocks_scale{ this, "Clocks scale", 100 }; // Changing this from 100 (percentage) may affect game speed in unexpected ways
+#endif
 		cfg::uint<0, 3000> spu_wakeup_delay{ this, "SPU Wake-Up Delay", 0, true };
 		cfg::uint<0, (1 << 6) - 1> spu_wakeup_delay_mask{ this, "SPU Wake-Up Delay Thread Mask", (1 << 6) - 1, true };
 		cfg::uint<0, 400> max_cpu_preempt_count_per_frame{ this, "Max CPU Preempt Count", 0, true };
@@ -131,12 +141,17 @@ struct cfg_root : cfg::node
 #ifdef __EMSCRIPTEN__
 		// wasm32 POC: potato-level defaults. The interpreter-only shader
 		// path skips JIT compilation (a major heap and instantiation cost),
-		// 480p + 25 % scale keeps texture/RT memory minuscule, MSAA off
+		// 25 % scale keeps texture/RT memory minuscule, MSAA off
 		// avoids multisample resolve overhead, low shader precision picks
 		// the cheapest WGSL math, frame limit 30 caps the work pipeline
 		// can do per second. Everything here can be flipped back to native
 		// defaults later once perf headroom appears.
-		cfg::_enum<video_resolution> resolution{ this, "Resolution", video_resolution::_480p };
+		// NOTE: keep this at 720p to match native. 480p makes Terraria's RESC
+		// setup compute bufferMode=0 (cellRescVideoOutResolutionId2RescBufferMode
+		// for resolutionId 480p) -> cellRescSetDisplayMode returns BAD_ARGUMENT,
+		// which leaves cellResc misconfigured and stalls the EE RenderLoop before
+		// it ever flips. Native uses 720p (resolutionId 0x2) and renders fine.
+		cfg::_enum<video_resolution> resolution{ this, "Resolution", video_resolution::_720p };
 		cfg::_enum<video_aspect> aspect_ratio{ this, "Aspect ratio", video_aspect::_16_9 };
 		cfg::_enum<frame_limit_type> frame_limit{ this, "Frame limit", frame_limit_type::_30, true };
 		cfg::_float<0, 1000> second_frame_limit{ this, "Second Frame Limit", 0, true };

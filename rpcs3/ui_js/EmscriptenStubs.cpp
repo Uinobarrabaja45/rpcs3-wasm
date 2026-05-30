@@ -40,6 +40,53 @@ namespace pad {
     atomic_t<bool> g_home_menu_requested = false;
 }
 
+// pad_thread minimal stub for wasm32.
+//
+// Input/pad_thread.cpp + the handler implementations pull in SDL/hidapi/
+// evdev — none of which we cross-compile to emcc. cellPadInit calls
+// pad::get_pad_thread() → ensure(g_pad_thread.load()), so without an
+// instance, main_thread crashes on the ensure verify_error. This stub
+// gives us a non-null pad_thread with all 7 pads stub-allocated and
+// marked disconnected (port_status=0) so cellPadInit's connect-event
+// loop becomes a no-op and returns CELL_OK.
+//
+// Real input handling is Phase 6+ work; for now Terraria can't read pads
+// but that's fine — boot just needs to progress past cellPadInit.
+#include "Emu/Io/pad_types.h"
+
+pad_thread::pad_thread(void* curthread, void* curwindow, std::string_view title_id)
+    : m_curthread(curthread)
+    , m_curwindow(curwindow)
+{
+    pad::g_title_id = std::string(title_id);
+    for (auto& pad_ptr : m_pads)
+    {
+        // pad_handler::null, player_id=0, port_status=0 (disconnected),
+        // device_capability=0, device_type=0
+        pad_ptr = std::make_shared<Pad>(pad_handler::null, 0u, 0u, 0u, 0u);
+    }
+    pad::g_pad_thread = this;
+    pad::g_started = true;
+}
+
+pad_thread::~pad_thread()
+{
+    pad::g_pad_thread = nullptr;
+    pad::g_started = false;
+}
+
+void pad_thread::operator()()
+{
+    // Stub thread body — idle until the named_thread wrapper signals abort.
+    // Real implementation polls SDL/hidapi/evdev for input events. In the
+    // browser, future input will arrive via the InputProviderEmscripten
+    // bridge (Main.cpp's keyboardCallback) writing directly to m_pads.
+    while (thread_ctrl::state() != thread_state::aborting)
+    {
+        thread_ctrl::wait_for(100'000); // 100 ms
+    }
+}
+
 // spu_thread and utilize_spu_data_segment stubs
 void utilize_spu_data_segment(u32 vaddr, const void* ls_data_vaddr, u32 size) {}
 std::vector<u32> spu_thread::discover_functions(u32 base_addr, std::span<const u8> ls, bool is_known_addr, u32 entry)

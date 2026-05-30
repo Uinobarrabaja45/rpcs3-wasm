@@ -348,14 +348,36 @@ void _sys_process_exit(ppu_thread& ppu, s32 status, u32 arg2, u32 arg3)
 
 	sys_process.warning("_sys_process_exit(status=%d, arg2=0x%x, arg3=0x%x)", status, arg2, arg3);
 
-	Emu.CallFromMainThread([]()
+	bool wasm_swallow = false;
+#if defined(__EMSCRIPTEN__)
+	// wasm32 bring-up workaround: the audio SPURS kernel faults under the SPU
+	// interpreter (a wasm-specific SPU correctness issue native does NOT hit),
+	// and its PPU-side handler thread ("audiSpursHdlr*") responds by calling
+	// _sys_process_exit with a SPURS abort status. That would Emu.Kill() the
+	// whole emulator before the EE RenderLoop can present the boot splash. The
+	// splash path (EE RenderLoop -> RSX FIFO -> WebGPU) does not depend on the
+	// audio SPURS, so skip the kill for this specific abort and just park the
+	// handler thread (in the wait loop below) so rendering keeps running.
+	// Genuine process exits pass status == 0 (CELL_OK) and are NOT affected.
+	if (status != 0 && thread_ctrl::get_name().find("SpursHdlr") != std::string::npos)
 	{
-		sys_process.success("Process finished");
-		signal_system_cache_can_stay();
-		Emu.Kill();
-	});
+		sys_process.error("[wasm] swallowing SPURS-abort _sys_process_exit(status=0x%x) — parking handler thread to keep rendering alive", status);
+		wasm_swallow = true;
+	}
+#endif
 
-	// Wait for GUI thread
+	if (!wasm_swallow)
+	{
+		Emu.CallFromMainThread([]()
+		{
+			sys_process.success("Process finished");
+			signal_system_cache_can_stay();
+			Emu.Kill();
+		});
+	}
+
+	// Wait for GUI thread (in the wasm-swallow case this simply parks the SPURS
+	// handler thread indefinitely without tearing down the emulation)
 	while (auto state = +ppu.state)
 	{
 		if (is_stopped(state))

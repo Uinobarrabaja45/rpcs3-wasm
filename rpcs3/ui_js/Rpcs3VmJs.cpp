@@ -30,12 +30,14 @@
 #include "Emu/System.h"
 #include "Emu/system_config.h"
 #include "Emu/system_config_types.h"
+#include "Emu/vfs_config.h"
 #include "Utilities/File.h"
 #include "JsDiscFile.h"
 #include "Emu/RSX/GSFrameBase.h"
 #include "Emu/RSX/Null/NullGSRender.h"
 #include "Emu/RSX/RSXThread.h"
 #include "Emu/Audio/Null/NullAudioBackend.h"
+#include "Input/pad_thread.h"
 #include "WebGPUGSRender.h"
 #include "util/fixed_typemap.hpp"
 #include "Emu/Cell/Modules/cellSaveData.h"
@@ -53,6 +55,14 @@ struct JseConsoleLogListener final : logs::listener
 {
 	void log(u64 /*stamp*/, const logs::message& msg, std::string_view prefix, std::string_view text) override
 	{
+		// Drop low-severity spam (notice/trace) on wasm. The early-boot
+		// ppu_loader import/export flood is THOUSANDS of notice logs, each
+		// costing a slow emscripten->console->CDP round-trip that throttles
+		// the boot AND bloats the headless renderer (a prime suspect for the
+		// flaky ~3.5-8min "Debugger connection closed" before the slow but
+		// finite boot reaches its first flip). Keep warning/error/fatal/always.
+		if (static_cast<logs::level>(msg) > logs::level::warning)
+			return;
 		std::string ch_name = msg->name ? msg->name : "";
 		printf("[%s] %.*s: %.*s\n", ch_name.c_str(), (int)prefix.size(), prefix.data(), (int)text.size(), text.data());
 	}
@@ -88,8 +98,26 @@ void CRpcs3VmJs::CreateVM()
 	printf("[Rpcs3VmJs] CreateVM — registering JIT runtime helpers\n");
 
 #ifdef HAS_EMUCORE
-	g_cfg.core.ppu_decoder.set(ppu_decoder_type::_static);
-	g_cfg.core.spu_decoder.set(spu_decoder_type::_static);
+	// Point dev_flash at the MEMFS path where Rpcs3Module.ts preloads
+	// firmware .sprx files. Default is "$(EmulatorDir)dev_flash/" which
+	// resolves to a config-dir-relative path on host (/home/web_user/
+	// .config/rpcs3/dev_flash/ under Emscripten); our preload writes to
+	// /dev_flash/ directly to keep the JS-side code simple.
+	g_cfg_vfs.dev_flash.from_string("/dev_flash/");
+
+	// "Potato" config — minimize memory + work for the wasm32 POC. The
+	// wasm linear-memory hard cap is 4 GiB (MAXIMUM_MEMORY in
+	// rpcs3/ui_js/CMakeLists.txt). The vm::g_base_addr reservation
+	// already eats 1.5 GiB at static-init; everything else has to fit in
+	// the remaining ~2.5 GiB. Trim every knob that costs RAM or CPU.
+	g_cfg.core.ppu_decoder.set(ppu_decoder_type::_static);   // No LLVM JIT (doesn't compile under emcc anyway)
+	g_cfg.core.spu_decoder.set(spu_decoder_type::_static);   // Same for SPU
+	g_cfg.core.llvm_precompilation.set(false);               // Skip per-game LLVM precompile cache
+	g_cfg.core.max_spurs_threads.set(1);                     // Fewer SPU worker threads — each eats a pthread + stack
+	g_cfg.video.resolution.set(video_resolution::_480p);     // 480p framebuffer (vs 720p default) → smaller textures
+	g_cfg.video.frame_limit.set(frame_limit_type::_30);      // 30fps cap — half the work
+	g_cfg.video.disable_vertex_cache.set(true);              // Skip vertex cache → smaller GPU buffers
+	g_cfg.audio.renderer.set(audio_renderer::null);          // Already null'd via callback; make it explicit
 #endif
 	// In the full build this is where Emu.SetCallbacks(...) lives,
 	// mirroring headless_application::InitializeCallbacks() but with
@@ -123,16 +151,14 @@ void CRpcs3VmJs::CreateVM()
 	callbacks.handle_taskbar_progress = [](s32, s32) {};
 	callbacks.init_kb_handler = []() {};
 	callbacks.init_mouse_handler = []() {};
-	callbacks.init_pad_handler = [](std::string_view)
+	callbacks.init_pad_handler = [](std::string_view title_id)
 	{
-		// No-op. Constructing a real named_thread<pad_thread> on wasm32 is
-		// blocked: Input/pad_thread.cpp + the handler implementations pull
-		// in SDL/hidapi/evdev which we don't cross-compile. cellPadInit()
-		// will hit `ensure(g_pad_thread.load())` → raw_verify_error →
-		// emergency_exit; with the dump_regs wasm32 stub (PPUThread.cpp)
-		// emergency_exit logs cleanly instead of trapping `unreachable`.
-		// Real fix lives in #52 follow-up: stub pad_thread minimally in
-		// ui_js/ so cellPadInit returns CELL_OK.
+		// Construct the stub pad_thread defined in EmscriptenStubs.cpp.
+		// Its ctor publishes itself into pad::g_pad_thread + fills m_pads
+		// with disconnected stub Pads so cellPadInit's connect-event loop
+		// becomes a no-op. nullptr curthread/curwindow — no Qt main loop
+		// in the browser; input goes through InputProviderEmscripten.
+		g_fxo->init<named_thread<pad_thread>>(nullptr, nullptr, title_id);
 	};
 	callbacks.update_emu_settings = []() {};
 	callbacks.save_emu_settings = []() {};

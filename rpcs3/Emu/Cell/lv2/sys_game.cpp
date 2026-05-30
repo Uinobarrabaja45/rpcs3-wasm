@@ -21,8 +21,15 @@ struct system_sw_version
 	{
 		f64 version_f = 0;
 		if (!try_to_float(&version_f, utils::get_firmware_version(), 0.0f, 99.9999f))
+		{
 			sys_game.error("Error parsing firmware version");
+			// wasm: firmware not installed (no dev_flash/vsh/etc/version.txt) → empty
+			// string → version 0. A real PS3 always has a firmware version; default to
+			// 4.41 so version-gated game init (sceNp / online managers) doesn't bail.
+			version_f = 4.41;
+		}
 		version = static_cast<usz>(version_f * 10000);
+		printf("[sys_game] system_sw_version ctor -> version=0x%llx\n", static_cast<unsigned long long>(version.load()));
 	}
 
 	system_sw_version(const system_sw_version&) = delete;
@@ -247,7 +254,9 @@ u64 _sys_game_get_system_sw_version()
 {
 	sys_game.trace("sys_game_get_system_sw_version()");
 
-	return g_fxo->get<system_sw_version>().version;
+	const u64 v = g_fxo->get<system_sw_version>().version;
+	printf("[sys_game] _sys_game_get_system_sw_version() [syscall 376] called -> 0x%llx\n", static_cast<unsigned long long>(v));
+	return v;
 }
 
 error_code _sys_game_board_storage_read(vm::ptr<u8> buffer, vm::ptr<u8> status)

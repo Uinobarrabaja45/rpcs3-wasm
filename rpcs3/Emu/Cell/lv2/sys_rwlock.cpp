@@ -37,10 +37,18 @@ error_code sys_rwlock_create(ppu_thread& ppu, vm::ptr<u32> rw_lock_id, vm::ptr<s
 
 	if (!rw_lock_id || !attr)
 	{
+		// MATCH NATIVE (stackwalk52 native-trace diff): native rpcs3 returns
+		// CELL_EFAULT here when attr is null, and Terraria HANDLES that and boots
+		// fine (it calls sys_rwlock_create with attr=NULL on purpose, then takes
+		// its no-rwlock path). A prior wasm "fix" synthesized a default attr so the
+		// call SUCCEEDED — that flipped the game onto a divergent control-flow path
+		// that skipped engine-thread creation (EE AudioLoop/RenderLoop/ResourceLoop,
+		// _gcm_intr_thread, SPURS) and crashed at fn7f before cellGcmInit. Failing
+		// on null attr (as native does) realigns the boot with native.
 		return CELL_EFAULT;
 	}
 
-	const auto _attr = *attr;
+	const sys_rwlock_attribute_t _attr = *attr;
 
 	const u32 protocol = _attr.protocol;
 

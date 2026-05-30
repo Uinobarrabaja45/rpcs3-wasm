@@ -1961,9 +1961,20 @@ namespace vm
 
 	static std::shared_ptr<block_t> _find_map(u32 size, u32 align, u64 flags)
 	{
-		const u32 max = (0xC0000000 - size) & (0 - align);
+#ifdef __EMSCRIPTEN__
+		// wasm32: the guest address space is capped at 0x60000000 (the 1.5 GiB
+		// g_base_addr allocation), NOT 0xC0000000. Searching up to 0xC0000000 placed
+		// deferred regions (notably vm::rsx_context, 256 MiB) at/just below 0x60000000,
+		// i.e. AT the cap = OOB, which stalled the RSX boot. Cap the search at the wasm
+		// limit so deferred maps land in the valid low/mid free space (below the
+		// local-memory/video block at local_mem_base=0x40000000).
+		constexpr u32 vm_top = 0x60000000;
+#else
+		constexpr u32 vm_top = 0xC0000000;
+#endif
+		const u32 max = (vm_top - size) & (0 - align);
 
-		if (size > 0xC0000000 - 0x10000000 || max < 0x10000000)
+		if (size > vm_top - 0x10000000 || max < 0x10000000)
 		{
 			return nullptr;
 		}
@@ -2159,7 +2170,17 @@ namespace vm
 			if (!loc)
 			{
 				// Deferred allocation
+#ifdef __EMSCRIPTEN__
+				// wasm32: under the 1.5 GiB cap the few 256 MiB-aligned slots are all
+				// taken by main + user memory + video, so a 256 MiB-aligned rsx_context
+				// can't fit. Align SMALL deferred regions (rsx_context, which only uses
+				// ~4 MiB) to 1 MiB so they pack into a gap; keep large regions (user
+				// memory) 256 MiB-aligned as before.
+				const u32 defer_align = area_size <= 0x10000000 ? 0x100000 : 0x10000000;
+				loc = _find_map(area_size, defer_align, flags);
+#else
 				loc = _find_map(area_size, 0x10000000, flags);
+#endif
 			}
 
 			return loc;
@@ -2326,12 +2347,18 @@ namespace vm
 				std::make_shared<block_t>(0x00010000, 0x0FFF0000, page_size_64k | preallocated), // main: 256 MiB at 0x00010000
 				nullptr,                                                                         // user 64k pages
 				nullptr,                                                                         // user 1m pages
-				nullptr,                                                                         // rsx context
-				std::make_shared<block_t>(0x10000000, 0x04000000, page_size_64k | preallocated), // video:  64 MiB at 0x10000000 (was 256 MiB at 0xC0000000)
-				std::make_shared<block_t>(0x14000000, 0x04000000, page_size_4k  | preallocated | stack_guarded | bf0_0x1), // stack:  64 MiB at 0x14000000 (was 256 MiB at 0xD0000000)
-				std::make_shared<block_t>(0x18000000, 0x08000000, page_size_64k),                // SPU:   128 MiB at 0x18000000 (was 512 MiB at 0xE0000000)
-				// Highest used address = 0x20000000 (512 MiB). Well under
-				// the 0x60000000 (1.5 GiB) g_base_addr cap.
+				nullptr,                                                                         // rsx context (deferred _find_map; capped below 0x60000000 — see _find_map)
+				// local memory (video) placed HIGH at 0x40000000 (== local_mem_base) so it
+				// sits ABOVE the auto-placed user-memory pool and RSX device/context region
+				// (which land in the free 0x10000000-0x40000000 gap). sys_rsx_context_iomap
+				// requires the mapped EA (in those regions) < local_mem_base, so local mem
+				// must be the highest of {user, rsx_context, local}. Terraria allocs ~249 MiB
+				// RSX local mem via cellGcm/sys_rsx — needs the full 256 MiB block.
+				std::make_shared<block_t>(0x40000000, 0x10000000, page_size_64k | preallocated), // video (local mem): 256 MiB at 0x40000000
+				std::make_shared<block_t>(0x50000000, 0x04000000, page_size_4k  | preallocated | stack_guarded | bf0_0x1), // stack:  64 MiB at 0x50000000
+				std::make_shared<block_t>(0x54000000, 0x08000000, page_size_64k),                // SPU:   128 MiB at 0x54000000
+				// Highest used address = 0x5C000000 (1.44 GiB). Under the
+				// 0x60000000 (1.5 GiB) g_base_addr cap.
 			};
 #else
 			g_locations =

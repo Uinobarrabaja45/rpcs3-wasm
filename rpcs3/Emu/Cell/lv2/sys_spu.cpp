@@ -668,6 +668,12 @@ error_code sys_spu_thread_initialize(ppu_thread& ppu, vm::ptr<u32> thread, u32 g
 
 	const sys_spu_thread_attribute attr_data = *attr;
 
+#if defined(__EMSCRIPTEN__)
+	printf("[SPUINIT] sys_spu_thread_initialize: spu_num=%u name_len=0x%x option=0x%x img=0x%x img.type=%u img.entry=0x%x\n",
+		spu_num, +attr_data.name_len, +attr_data.option, img.addr(),
+		img ? +img->type : 0xffffffffu, img ? +img->entry_point : 0xffffffffu);
+#endif
+
 	if (attr_data.name_len > 0x80)
 	{
 		return CELL_EINVAL;
@@ -1667,8 +1673,23 @@ error_code sys_spu_thread_group_join(ppu_thread& ppu, u32 id, vm::ptr<u32> cause
 		}
 		else
 		{
+#if defined(__EMSCRIPTEN__)
+			// wasm32 bring-up: a SPURS SPU group can fault under the SPU
+			// interpreter (a wasm-specific SPU correctness issue) and never reach
+			// a clean INITIALIZED + join_state, so this join would block the
+			// caller — and the game's boot — forever. Don't wait: report the
+			// group as TERMINATED so the game proceeds to render. Audio ends up
+			// non-functional, but the splash path (RenderLoop->RSX->WebGPU) is
+			// unaffected. (Native joins normally; this only triggers when the
+			// group is not yet cleanly joinable.)
+			sys_spu.error("[wasm] sys_spu_thread_group_join(id=0x%x): group not cleanly joinable (run_state=%d) — returning TERMINATED to avoid boot stall", id, +group->run_state);
+			ppu.gpr[4] = SYS_SPU_THREAD_GROUP_JOIN_TERMINATED;
+			ppu.gpr[5] = group->exit_status;
+			break;
+#else
 			// Subscribe to receive status in r4-r5
 			group->waiter = &ppu;
+#endif
 		}
 
 		{

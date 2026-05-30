@@ -176,7 +176,19 @@ enum : u32
 	RAW_SPU_LS_OFFSET   = 0x00000000,
 	RAW_SPU_PROB_OFFSET = 0x00040000,
 
+#ifdef __EMSCRIPTEN__
+	// wasm32: SPU local-store lives in the relocated vm::spu block at
+	// 0x54000000 (128 MiB; see vm.cpp). vm_offset() computes LS addresses as
+	// SPU_FAKE_BASE_ADDR + SPU_LS_SIZE*(id & 0xffffff), so the fake base MUST
+	// be the start of that block (native's 0xE8000000 is far above our
+	// 0x60000000 / 1.5 GiB cap, so falloc would fail — that crash is exactly
+	// what stalled the SPURS audiCellSpursKernel group at boot). Terraria uses
+	// SPURS (group SPU threads); raw SPUs are unused, so RAW_SPU_BASE_ADDR is
+	// left at its native value.
+	SPU_FAKE_BASE_ADDR  = 0x54000000,
+#else
 	SPU_FAKE_BASE_ADDR  = 0xE8000000,
+#endif
 };
 
 struct spu_channel_op_state
@@ -649,7 +661,15 @@ public:
 
 	static const u32 id_base = 0x02000000; // TODO (used to determine thread type)
 	static const u32 id_step = 1;
-	static const u32 id_count = (0xFFFC0000 - SPU_FAKE_BASE_ADDR) / SPU_LS_SIZE;
+	// id_count is the idm capacity for SPU threads. It must equal 1535 to satisfy
+	// the static_assert in sys_spu.h (spu_thread::id_count == lv2_spu_group::
+	// id_count*6+5 == 255*6+5). It is computed from the *native* fake base
+	// (0xE8000000), NOT the possibly-relocated SPU_FAKE_BASE_ADDR, so the value is
+	// identical on native and wasm. On wasm the vm::spu block is only 128 MiB
+	// (512 LS slots) but idm hands out the lowest free index first, so vm_offset()
+	// stays inside the block for the <20 concurrent SPU threads Terraria uses (the
+	// full idm capacity is never reached).
+	static const u32 id_count = (0xFFFC0000 - 0xE8000000) / SPU_LS_SIZE; // 1535
 
 	spu_thread(lv2_spu_group* group, u32 index, std::string_view name, u32 lv2_id, bool is_isolated = false, u32 option = 0);
 

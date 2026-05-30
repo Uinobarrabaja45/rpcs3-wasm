@@ -889,7 +889,7 @@ inline v128 gv_shl16(const v128& a, u32 count)
 {
 	if (count >= 16)
 		return v128{};
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_slli_epi16(a, count);
 #elif defined(ARCH_ARM64)
 	return vshlq_s16(a, vdupq_n_s16(count));
@@ -906,7 +906,7 @@ inline v128 gv_shl32(const v128& a, u32 count)
 {
 	if (count >= 32)
 		return v128{};
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_slli_epi32(a, count);
 #elif defined(ARCH_ARM64)
 	return vshlq_s32(a, vdupq_n_s32(count));
@@ -923,7 +923,7 @@ inline v128 gv_shl64(const v128& a, u32 count)
 {
 	if (count >= 64)
 		return v128{};
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_slli_epi64(a, count);
 #elif defined(ARCH_ARM64)
 	return vshlq_s64(a, vdupq_n_s64(count));
@@ -940,7 +940,7 @@ inline v128 gv_shr16(const v128& a, u32 count)
 {
 	if (count >= 16)
 		return v128{};
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_srli_epi16(a, count);
 #elif defined(ARCH_ARM64)
 	return vshlq_u16(a, vdupq_n_s16(0 - count));
@@ -957,7 +957,7 @@ inline v128 gv_shr32(const v128& a, u32 count)
 {
 	if (count >= 32)
 		return v128{};
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_srli_epi32(a, count);
 #elif defined(ARCH_ARM64)
 	return vshlq_u32(a, vdupq_n_s32(0 - count));
@@ -974,7 +974,7 @@ inline v128 gv_shr64(const v128& a, u32 count)
 {
 	if (count >= 64)
 		return v128{};
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_srli_epi64(a, count);
 #elif defined(ARCH_ARM64)
 	return vshlq_u64(a, vdupq_n_s64(0 - count));
@@ -2629,7 +2629,7 @@ inline bool v128::operator==(const v128& b) const
 
 inline v128 v128::operator|(const v128& rhs) const
 {
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_or_si128(*this, rhs);
 #elif defined(ARCH_ARM64)
 	return vorrq_s32(*this, rhs);
@@ -2638,7 +2638,7 @@ inline v128 v128::operator|(const v128& rhs) const
 
 inline v128 v128::operator&(const v128& rhs) const
 {
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_and_si128(*this, rhs);
 #elif defined(ARCH_ARM64)
 	return vandq_s32(*this, rhs);
@@ -2647,7 +2647,7 @@ inline v128 v128::operator&(const v128& rhs) const
 
 inline v128 v128::operator^(const v128& rhs) const
 {
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_xor_si128(*this, rhs);
 #elif defined(ARCH_ARM64)
 	return veorq_s32(*this, rhs);
@@ -2656,7 +2656,7 @@ inline v128 v128::operator^(const v128& rhs) const
 
 inline v128 v128::operator~() const
 {
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_xor_si128(*this, _mm_set1_epi32(-1));
 #elif defined(ARCH_ARM64)
 	return vmvnq_u32(*this);
@@ -2980,7 +2980,7 @@ inline v128 gv_shuffle_left(const v128& a)
 {
 	if (Count > 15)
 		return {};
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_slli_si128(a, Count);
 #elif defined(ARCH_ARM64)
 	v128 idx;
@@ -3002,7 +3002,7 @@ inline v128 gv_shuffle_right(const v128& a)
 {
 	if (Count > 15)
 		return {};
-#if defined(ARCH_X64)
+#if defined(ARCH_X64) || defined(__EMSCRIPTEN__)
 	return _mm_srli_si128(a, Count);
 #elif defined(ARCH_ARM64)
 	v128 idx;

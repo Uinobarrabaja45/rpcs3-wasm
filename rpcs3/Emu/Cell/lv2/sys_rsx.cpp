@@ -70,7 +70,12 @@ static void set_rsx_dmactl(rsx::thread* render, u64 get_put)
 	if (auto cpu = cpu_thread::get_current())
 	{
 		// Wait for the first store to complete (or be aborted)
-		while (render->new_get_put != usz{umax})
+		// NOTE: must compare against u64{umax}, NOT usz{umax}: on wasm32 size_t
+		// is 32-bit, so usz{umax} truncates to 0xFFFFFFFF while new_get_put is
+		// stored as the full 64-bit u64{umax} (0xFFFF'FFFF'FFFF'FFFF) — the
+		// mismatched compare never succeeds and this wait spins forever,
+		// hanging the EE RenderLoop at the first sys_rsx_context_attribute(0x1).
+		while (render->new_get_put != u64{umax})
 		{
 			if (cpu->state & cpu_flag::exit)
 			{
@@ -251,7 +256,15 @@ error_code sys_rsx_context_allocate(cpu_thread& cpu, vm::ptr<u32> context_id, vm
 		fmt::throw_exception("sys_rsx_context_allocate was called twice");
 	}
 
+#ifdef __EMSCRIPTEN__
+	// wasm32: the rsx_context region only USES ~4 MiB (dma control/driver info/reports
+	// + device), but reserving the native 256 MiB can't fit the fragmented space under
+	// the 1.5 GiB cap (ENOMEM). Reserve 16 MiB; with 1 MiB defer-align it slots into the
+	// gap between the user-memory regions, below local_mem_base (iomap invariant holds).
+	const auto area = vm::reserve_map(vm::rsx_context, 0, 0x1000000, 0x403);
+#else
 	const auto area = vm::reserve_map(vm::rsx_context, 0, 0x10000000, 0x403);
+#endif
 	const u32 dma_address = area ? area->alloc(0x300000) : 0;
 
 	if (!dma_address)
@@ -945,7 +958,11 @@ error_code sys_rsx_device_map(cpu_thread& cpu, vm::ptr<u64> dev_addr, vm::ptr<u6
 
 	if (!render->device_addr)
 	{
+#ifdef __EMSCRIPTEN__
+		const auto area = vm::reserve_map(vm::rsx_context, 0, 0x1000000, 0x403); // wasm: 16 MiB reserve (see context_allocate) — 256 MiB won't fit under the 1.5 GiB cap
+#else
 		const auto area = vm::reserve_map(vm::rsx_context, 0, 0x10000000, 0x403);
+#endif
 		const u32 addr = area ? area->alloc(0x100000) : 0;
 
 		if (!addr)

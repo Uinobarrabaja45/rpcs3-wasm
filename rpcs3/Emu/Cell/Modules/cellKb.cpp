@@ -84,7 +84,19 @@ error_code cellKbInit(ppu_thread& ppu, u32 max_connect)
 	auto init = handler.init.init();
 
 	if (!init)
-		return CELL_KB_ERROR_ALREADY_INITIALIZED;
+	{
+		// MATCH NATIVE (native-trace diff): native rpcs3's first cellKbInit SUCCEEDS,
+		// but on wasm the keyboard handler is spuriously already initialized. Terraria
+		// BRANCHES on the result — success runs sys_config_start and spawns its EE
+		// AudioLoop/RenderLoop/ResourceLoop engine threads (reaching cellGcmInit);
+		// failure bails onto the path that crashes at fn7f. The kb IS initialized here,
+		// so return success (and perform the sys_config_start side effect native does)
+		// instead of CELL_KB_ERROR_ALREADY_INITIALIZED. (Resetting init_mutex aborts on
+		// wasm, so we do NOT reset — just proceed as native's success would.)
+		printf("[KBFIX] cellKbInit already-init -> treat as success (match native)\n");
+		sys_config_start(ppu);
+		return CELL_OK;
+	}
 
 	if (max_connect == 0 || max_connect > CELL_KB_MAX_KEYBOARDS)
 	{
@@ -92,6 +104,7 @@ error_code cellKbInit(ppu_thread& ppu, u32 max_connect)
 		return CELL_KB_ERROR_INVALID_PARAMETER;
 	}
 
+	printf("[KBFIX] cellKbInit fresh-init success -> sys_config_start\n");
 	sys_config_start(ppu);
 
 	std::lock_guard<std::mutex> lock(handler.m_mutex);

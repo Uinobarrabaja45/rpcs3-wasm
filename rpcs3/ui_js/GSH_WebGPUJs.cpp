@@ -2,6 +2,25 @@
 
 #include <cstdio>
 #include <cmath>
+#include <atomic>
+#include <cstdint>
+#include <vector>
+
+#ifdef HAS_WEBGPU
+#include <emscripten/heap.h>
+// Front display-buffer descriptor published by WebGPUGSRender::flip() on the
+// RSX worker. Declared here (rather than including WebGPUGSRender.h, which
+// drags in the whole RSX GSRender base + rpcs3 vm/types headers) since we only
+// need the scalars. g_webgpu_fb_host is already a host pointer (resolved via
+// vm::base on the RSX side), valid on this thread because wasm pthreads share
+// one linear address space.
+extern std::atomic<uint64_t> g_webgpu_flip_count;
+extern std::atomic<uint32_t> g_webgpu_fb_addr;
+extern std::atomic<uint32_t> g_webgpu_fb_width;
+extern std::atomic<uint32_t> g_webgpu_fb_height;
+extern std::atomic<uint32_t> g_webgpu_fb_pitch;
+extern std::atomic<uint64_t> g_webgpu_fb_host;
+#endif
 
 // Minimal WebGPU render path — see GSH_WebGPUJs.h for the integration
 // plan. The real RSX-equivalent backend lives under Emu/RSX/WebGPU/ once
@@ -90,6 +109,27 @@ bool CGSH_WebGPUJs::Render()
 	if (!m_surface || !m_device || !m_queue) return false;
 
 	// Acquire next swap-chain texture. emdawnwebgpu doesn't expose the
+	// Idle-frame throttle: the canvas only changes when the guest flips a new
+	// front buffer. Re-submitting the same image at requestAnimationFrame rate
+	// (~120fps) is pure waste — and empirically the headless WebGPU renderer
+	// destabilizes after a few minutes of that idle churn (the flaky ~3.5-7.5min
+	// "Debugger connection closed", which is NOT OOM — the wasm heap stays flat).
+	// Skip the WebGPU work unless: the first frame, a new flip arrived, or a slow
+	// keep-alive tick. This ~100x fewer submissions lets the slow (finite) boot
+	// run long enough to reach its first real flip → the 505 splash.
+	{
+		const uint64_t flipNow = g_webgpu_flip_count.load(std::memory_order_acquire);
+		const bool firstFrame  = (m_framesRendered == 0);
+		const bool flipped     = (flipNow != m_lastDrawnFlip);
+		const bool keepAlive   = (m_framesRendered % 120) == 0;
+		if (!firstFrame && !flipped && !keepAlive)
+		{
+			m_framesRendered++;
+			return true;
+		}
+		m_lastDrawnFlip = flipNow;
+	}
+
 	// older swap-chain API; surface.GetCurrentTexture() is the path.
 	wgpu::SurfaceTexture surfaceTex = {};
 	m_surface.GetCurrentTexture(&surfaceTex);
@@ -100,64 +140,132 @@ bool CGSH_WebGPUJs::Render()
 		return false;
 	}
 
-	wgpu::TextureView view = surfaceTex.texture.CreateView();
-	if (!view) return false;
+	// Latest PS3 front-buffer descriptor published by WebGPUGSRender::flip().
+	// acquire-load the count first, then the addr, mirroring flip()'s release
+	// stores so a non-zero addr is always paired with valid w/h/pitch.
+	const uint64_t flip     = g_webgpu_flip_count.load(std::memory_order_acquire);
+	const uint32_t fb_addr  = g_webgpu_fb_addr.load(std::memory_order_acquire);
+	const uint32_t fb_w     = g_webgpu_fb_width.load(std::memory_order_relaxed);
+	const uint32_t fb_h     = g_webgpu_fb_height.load(std::memory_order_relaxed);
+	const uint32_t fb_pitch = g_webgpu_fb_pitch.load(std::memory_order_relaxed);
 
-	// Animated clear color — the smallest thing that proves the render
-	// loop is alive. RSX-derived geometry replaces this once the
-	// translator under Emu/RSX/WebGPU/ lands.
-	const float t = static_cast<float>(m_framesRendered) * 0.01f;
-	wgpu::Color clearColor;
-	if (m_booted)
-	{
-		// Warm gradient — orange/red cycling — game is "running".
-		clearColor.r = 0.55 + 0.25 * std::sin(t * 1.3);
-		clearColor.g = 0.20 + 0.10 * std::sin(t * 0.7 + 1.0);
-		clearColor.b = 0.05 + 0.05 * std::sin(t * 0.5 + 2.0);
-		clearColor.a = 1.0;
-	}
-	else
-	{
-		// Cool slate — pre-boot splash.
-		clearColor.r = 0.05 + 0.05 * std::sin(t);
-		clearColor.g = 0.10 + 0.05 * std::sin(t + 1.0);
-		clearColor.b = 0.20 + 0.10 * std::sin(t + 2.0);
-		clearColor.a = 1.0;
-	}
+	const uint32_t surfW = static_cast<uint32_t>(m_windowWidth);
+	const uint32_t surfH = static_cast<uint32_t>(m_windowHeight);
 
-	wgpu::RenderPassColorAttachment colorAttachment = {};
-	colorAttachment.view       = view;
-	colorAttachment.loadOp     = wgpu::LoadOp::Clear;
-	colorAttachment.storeOp    = wgpu::StoreOp::Store;
-	colorAttachment.clearValue = clearColor;
-	colorAttachment.depthSlice = wgpu::kDepthSliceUndefined;
-
-	wgpu::RenderPassDescriptor passDesc = {};
-	passDesc.colorAttachmentCount = 1;
-	passDesc.colorAttachments     = &colorAttachment;
+	// We can present honest pixels once the game flips a buffer whose size
+	// matches the surface. RESC outputs 1280x720 for Terraria == our surface,
+	// so a 1:1 texture-to-texture copy works (no scaler pipeline needed yet).
+	const bool haveFrame = fb_addr && fb_w == surfW && fb_h == surfH && fb_pitch >= fb_w * 4;
 
 	wgpu::CommandEncoderDescriptor encDesc = {};
 	wgpu::CommandEncoder encoder = m_device.CreateCommandEncoder(&encDesc);
 	if (!encoder) return false;
 
-	wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDesc);
-	// Phase 4+ will record RSX-derived geometry here.
-	pass.End();
+	bool blitted = false;
+	if (haveFrame)
+	{
+		if (!m_fbTexture || m_fbTexW != fb_w || m_fbTexH != fb_h)
+		{
+			wgpu::TextureDescriptor td = {};
+			td.usage         = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc;
+			td.dimension     = wgpu::TextureDimension::e2D;
+			td.size          = { fb_w, fb_h, 1 };
+			td.format        = wgpu::TextureFormat::BGRA8Unorm;
+			td.mipLevelCount = 1;
+			td.sampleCount   = 1;
+			m_fbTexture = m_device.CreateTexture(&td);
+			m_fbTexW = fb_w;
+			m_fbTexH = fb_h;
+			m_lastFlip = 0; // force a re-upload into the new texture
+		}
+
+		// Re-read VRAM only when a new frame was flipped (the splash is static,
+		// so this is one upload, not one per browser frame).
+		if (m_fbTexture && flip != m_lastFlip)
+		{
+			const uint8_t* base = reinterpret_cast<const uint8_t*>(
+				static_cast<uintptr_t>(g_webgpu_fb_host.load(std::memory_order_relaxed)));
+			if (base)
+			{
+				m_fbStaging.resize(static_cast<size_t>(fb_w) * fb_h);
+				// PS3 display buffers are A8R8G8B8 big-endian: memory bytes are
+				// [A][R][G][B]. Packing them as a host little-endian u32 lays the
+				// bytes out [B][G][R][A] == BGRA8Unorm, which is the surface
+				// format — so the swizzle is just this byte repack.
+				for (uint32_t y = 0; y < fb_h; y++)
+				{
+					const uint8_t* srcRow = base + static_cast<size_t>(y) * fb_pitch;
+					uint32_t* dstRow = m_fbStaging.data() + static_cast<size_t>(y) * fb_w;
+					for (uint32_t x = 0; x < fb_w; x++)
+					{
+						const uint8_t* p = srcRow + static_cast<size_t>(x) * 4;
+						dstRow[x] = (static_cast<uint32_t>(p[0]) << 24) |
+						            (static_cast<uint32_t>(p[1]) << 16) |
+						            (static_cast<uint32_t>(p[2]) << 8)  |
+						             static_cast<uint32_t>(p[3]);
+					}
+				}
+
+				wgpu::TexelCopyTextureInfo dst = {};
+				dst.texture = m_fbTexture;
+				dst.aspect  = wgpu::TextureAspect::All;
+				wgpu::TexelCopyBufferLayout layout = {};
+				layout.bytesPerRow  = fb_w * 4;
+				layout.rowsPerImage = fb_h;
+				wgpu::Extent3D ext = { fb_w, fb_h, 1 };
+				m_queue.WriteTexture(&dst, m_fbStaging.data(),
+					static_cast<size_t>(fb_w) * fb_h * 4, &layout, &ext);
+				m_lastFlip = flip;
+			}
+		}
+
+		if (m_fbTexture)
+		{
+			wgpu::TexelCopyTextureInfo src = {};
+			src.texture = m_fbTexture;
+			src.aspect  = wgpu::TextureAspect::All;
+			wgpu::TexelCopyTextureInfo dstC = {};
+			dstC.texture = surfaceTex.texture;
+			dstC.aspect  = wgpu::TextureAspect::All;
+			wgpu::Extent3D copyExt = { fb_w, fb_h, 1 };
+			encoder.CopyTextureToTexture(&src, &dstC, &copyExt);
+			blitted = true;
+		}
+	}
+
+	if (!blitted)
+	{
+		// No real frame yet — present solid black (honest "nothing rendered").
+		// This deliberately replaces the old animated placeholder clear.
+		wgpu::TextureView view = surfaceTex.texture.CreateView();
+		if (!view) return false;
+		wgpu::RenderPassColorAttachment ca = {};
+		ca.view       = view;
+		ca.loadOp     = wgpu::LoadOp::Clear;
+		ca.storeOp    = wgpu::StoreOp::Store;
+		ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
+		ca.depthSlice = wgpu::kDepthSliceUndefined;
+		wgpu::RenderPassDescriptor pd = {};
+		pd.colorAttachmentCount = 1;
+		pd.colorAttachments     = &ca;
+		wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&pd);
+		pass.End();
+	}
 
 	wgpu::CommandBuffer cmd = encoder.Finish();
 	m_queue.Submit(1, &cmd);
 
-	// Note: in emdawnwebgpu the swap-chain is auto-presented when the
-	// JS event loop returns — no explicit Surface.Present() needed.
-
 	m_framesRendered++;
-	if ((m_framesRendered % 60) == 1)
+	if ((m_framesRendered % 120) == 1)
 	{
-		printf("[GSH_WebGPUJs] Render frame=%d booted=%d clear=(%.2f,%.2f,%.2f)\n",
-		       m_framesRendered, m_booted ? 1 : 0,
-		       static_cast<float>(clearColor.r),
-		       static_cast<float>(clearColor.g),
-		       static_cast<float>(clearColor.b));
+		// Log the wasm heap size to diagnose the ~3.5-7.5min Chrome death:
+		// if this climbs toward the ~4 GiB wasm32 ceiling near the death it's
+		// an OOM wall (game accumulates decompressed assets); if it's stable
+		// the death is something else (flaky CDP / renderer).
+		const double heapMiB = static_cast<double>(emscripten_get_heap_size()) / (1024.0 * 1024.0);
+		printf("[GSH_WebGPUJs] Render frame=%d booted=%d blit=%d fb=0x%x %ux%u flip=%llu heap=%.0fMiB\n",
+		       m_framesRendered, m_booted ? 1 : 0, blitted ? 1 : 0,
+		       fb_addr, fb_w, fb_h, static_cast<unsigned long long>(flip), heapMiB);
 	}
 	return true;
 #else

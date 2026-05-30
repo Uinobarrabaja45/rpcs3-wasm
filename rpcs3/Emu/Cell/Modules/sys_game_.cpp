@@ -172,6 +172,7 @@ error_code sys_game_get_rtc_status()
 error_code sys_game_get_system_sw_version()
 {
 	sysPrxForUser.todo("sys_game_get_system_sw_version()");
+	printf("[sys_game_HLE] sys_game_get_system_sw_version() [sysPrxForUser] called (stub returns CELL_OK=0)\n");
 	return CELL_OK;
 }
 
