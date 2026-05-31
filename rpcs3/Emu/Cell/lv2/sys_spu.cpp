@@ -719,6 +719,18 @@ error_code sys_spu_thread_initialize(ppu_thread& ppu, vm::ptr<u32> thread, u32 g
 	}
 	case SYS_SPU_IMAGE_TYPE_USER:
 	{
+#if defined(__EMSCRIPTEN__)
+		// wasm/HLE-SPURS boot-unblock: the SPURS kernel image is intentionally empty
+		// (nsegs=0, entry=CELL_SPURS_KERNEL1_ENTRY_ADDR=0x818) because RPCS3 expected
+		// to run it as an HLE SPU function — a mechanism this build has removed. The
+		// nsegs<=0 / COPY-segment checks reject it with EINVAL, failing
+		// cellSpursInitializeWithAttribute and deadlocking the game task system at
+		// boot. Accept the empty kernel image so SPURS init can complete.
+		if (image.nsegs == 0 && image.entry_point <= 0x3fffc)
+		{
+			break;
+		}
+#endif
 		if (image.entry_point > 0x3fffc || image.nsegs <= 0 || image.nsegs > 0x20)
 		{
 			return CELL_EINVAL;
@@ -793,7 +805,11 @@ error_code sys_spu_thread_initialize(ppu_thread& ppu, vm::ptr<u32> thread, u32 g
 	}
 
 	// There must be at least one COPY segment
-	if (!found_copy_segment)
+	if (!found_copy_segment
+#if defined(__EMSCRIPTEN__)
+		&& image.nsegs != 0  // allow the empty HLE-SPURS kernel image (see above)
+#endif
+		)
 	{
 		return CELL_EINVAL;
 	}

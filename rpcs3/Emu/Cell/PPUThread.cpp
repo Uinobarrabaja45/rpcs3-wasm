@@ -2487,8 +2487,89 @@ void ppu_thread::exec_task()
 
 #if defined(__EMSCRIPTEN__)
 		++s_hb;
-		// [exec_task hb] heartbeat silenced — spin location identified
-		// (0x41c294, EE ResourceLoop); SPIN-WATCH below tracks it.
+		// (heartbeat removed — s_hb resets on every block/preempt, so it rarely
+		// reached the threshold; using the lv2 sync-channel trace logs instead.)
+
+		// MAINCIA: the vblank gate is fixed (RenderLoop loops ready), but the
+		// game loop (main_thread, id 0x1000000) went silent after MAIN-RET and
+		// produces no frame -> no flip. A thread_local counter (persists across
+		// blocks, unlike s_hb) samples main_thread's cia: if it fires with a
+		// varying cia main is grinding game logic (slow); if it clusters at one
+		// cia main is busy-spinning there (find the poll); if it never fires
+		// main is blocked in a wait. ~1 line/sec while main executes.
+		// WORKERCIA: sample the EE loader threads (ResourceLoop/WorkerThread/etc.,
+		// ids 0x1000002..0x100000c) to see where they block/spin after their
+		// trophy/savedata/userinfo init — the asset loader never reads data.vfs,
+		// so resources stay unregistered and main's poll never matches.
+		if (this->id >= 0x1000002u && this->id <= 0x100000cu)
+		{
+			static thread_local u32 s_wtc = 0;
+			if ((++s_wtc & 0xFFF) == 0)
+			{
+				const u32 wr3 = static_cast<u32>(gpr[3]);
+				printf("[WORKERCIA] id=0x%x cia=0x%x lr=0x%x r3=0x%x\n", this->id, cia, static_cast<u32>(lr), wr3);
+			}
+		}
+				if (this->id == 0x1000000u)
+		{
+			// One-shot: dump main's block region so we can decode what it waits on
+			// (SPURS wait? thread join? poll loop?). cia clusters ~0x27788 (lr 0x27638)
+			// just before main goes silent.
+			static thread_local int s_blkd = 0;
+			if (s_blkd == 0 && cia >= 0x27600u && cia < 0x277c0u)
+			{
+				s_blkd = 1;
+				const auto rdb = [mem_](u32 a){ return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+				printf("[BLKDUMP] main cia=0x%x lr=0x%x r3=0x%x:", cia, static_cast<u32>(lr), static_cast<u32>(gpr[3]));
+				for (u32 a = 0x27600; a <= 0x277c0; a += 4) printf(" %08x", rdb(a));
+				printf("\n");
+			}
+			static thread_local u32 s_mtc = 0;
+			if ((++s_mtc & 0xFFFFF) == 0)
+			{
+				const u32 r3v = static_cast<u32>(gpr[3]);
+				const u32 v = r3v < 0x60000000 ? reinterpret_cast<be_t<u32>*>(mem_ + u64{r3v})->value() : 0xbadbad;
+				// poll target: the search at 0x27700 compares an array halfword (+0x60)
+				// against extsh([r31+0x6c]). Dump it + [r31+0] so we can tell whether the
+				// value main waits for is producible (PPU thread) or SPURS-task-only.
+				const u32 r31v = static_cast<u32>(gpr[31]);
+				const auto rdm = [mem_](u32 a){ return a < 0x5fff0000 ? reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value() : 0xbadbadu; };
+				const u32 r29v = static_cast<u32>(gpr[29]);
+				printf("[MAINCIA] cia=0x%x lr=0x%x r3=0x%x [r3]=0x%x r29=0x%x [r29+60]=0x%x r31=0x%x [r31+6c]=0x%x\n",
+					cia, static_cast<u32>(lr), r3v, v,
+					r29v, rdm(r29v + 0x60), r31v, rdm(r31v + 0x6c));
+				// LDUMP: cross-thread peek at the loader threads' sticky last_function
+				// (the HLE function they're blocked in — survives the block). The
+				// WorkerThread runs almost no PPU code so this is the only way to see
+				// what HLE call its boot stalls in (data.vfs is never read).
+				for (u32 ldid = 0x1000006u; ldid <= 0x100000cu; ldid++)
+				{
+					if (auto th = idm::get_unlocked<named_thread<ppu_thread>>(ldid))
+					{
+						printf("[LDUMP] id=0x%x cia=0x%x last_fn=%s\n", ldid,
+							static_cast<u32>(th->cia), th->last_function ? th->last_function : "(null)");
+					}
+				}
+				// One-shot: dump the resource-object header (r29..+0x60) so we can
+				// see if it's a loaded texture descriptor (real data ptr/size) or
+				// an empty/zeroed slot — decides honest-mark vs needs-loading.
+				static thread_local int s_objd = 0;
+				const u32 ob = static_cast<u32>(gpr[29]);
+				if (s_objd++ == 0 && ob >= 0x10000 && ob < 0x60000000)
+				{
+					const auto rd = [mem_](u32 a){ return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+					printf("[OBJDUMP] r29=0x%x:", ob);
+					for (u32 o = 0; o <= 0x60; o += 4) printf(" +%02x=%08x", o, rd(ob + o));
+					printf("\n");
+					const auto rdi = [mem_](u32 a){ return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+					printf("[ASMDUMP] poll@0x33f00:");
+					for (u32 a = 0x33f00; a <= 0x33f90; a += 4) printf(" %08x", rdi(a));
+					printf("\n[ASMDUMP] iter@0x1a5730:");
+					for (u32 a = 0x1a5730; a <= 0x1a57c0; a += 4) printf(" %08x", rdi(a));
+					printf("\n");
+				}
+			}
+		}
 
 		// HLE the inflate match-copy loop — the decompression hot path that
 		// throttles EE ResourceLoop to ~2.5KB/s (~400 instr/byte) and stops the

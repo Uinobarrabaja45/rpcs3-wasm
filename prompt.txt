@@ -1,0 +1,4 @@
+let's revise a bit
+
+where are we now?
+are how close / how many iter / phase until first/playable framerate of Terraria on WebGPU emu on browser ?

@@ -900,6 +900,23 @@ namespace rsx
 	{
 		vblank_count++;
 
+#if defined(__EMSCRIPTEN__)
+		// VBLANK-GATE probe: EE RenderLoop blocks forever on
+		// sys_event_queue_receive(0x8d005d00) waiting for the GCM vblank event.
+		// If this never prints, the VBlank thread loop isn't running (no events
+		// at all). If it prints with isHLE=1, the HLE path only fires the
+		// vblank_handler (never the queue) → RenderLoop never wakes. If isHLE=0
+		// it should post to the queue via sys_rsx_context_attribute(0xFED).
+		{
+			static atomic_t<u32> s_pv{0};
+			const u32 c = s_pv++;
+			if (c < 4 || (c & 0x7F) == 0)
+				printf("[VBLANK] post #%u isHLE=%d handler=%d vbcount=%llu\n",
+					c, isHLE ? 1 : 0, vblank_handler ? 1 : 0,
+					static_cast<unsigned long long>(vblank_count.load()));
+		}
+#endif
+
 		if (isHLE)
 		{
 			if (auto ptr = vblank_handler)

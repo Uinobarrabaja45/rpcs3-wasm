@@ -218,12 +218,13 @@ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<s
 #if defined(__EMSCRIPTEN__)
 		else if (name == "libsre.sprx")
 		{
-			// wasm32: force the SPURS PRX (libsre.sprx) to HLE. The guest LLE SPURS
-			// kernel runs on the slow SPU interpreter and its PPU-side init asserts
-			// (libspurs event_helper.c:151 / handler.c) because the SPU misses
-			// SPURS deadlines / handshakes. RPCS3's HLE cellSpurs implements the
-			// handler + event-helper in PPU C++ (cellSpurs.cpp), bypassing the
-			// guest assert. Trade-off: relies on RPCS3's (partial) SPURS HLE.
+			// wasm32: force libsre.sprx (SPURS) to HLE. The LLE experiment CONFIRMED
+			// the SPU-speed wall: the real SPURS kernel self-aborts ("The SPURS is
+			// aborted" → _sys_process_exit ESTAT) because the ~1000x-slow SPU misses
+			// SPURS deadlines — and the abort cascade stalls the asset loader EARLIER
+			// than HLE-stub does. For the static-splash goal (PPU/RSX-driven), HLE-stub
+			// lets the loader progress furthest (trophy→savedata→userinfo). Functional
+			// SPURS needs the wasm SPU JIT/AOT track (PLAN-wasm-jit.md, Phase 3).
 			ignore = true;
 		}
 #endif

@@ -582,6 +582,40 @@ error_code sceNpTrophyRegisterContext(ppu_thread& ppu, u32 context, u32 handle, 
 		return SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
 	}
 
+#ifdef __EMSCRIPTEN__
+	// wasm: skip the trophy file-open + TRPLoader::Install + TROPUSR load below.
+	// Once the boot reaches cellSaveData first (after SPURS init now succeeds),
+	// one of those MEMFS file ops hangs the WorkerThread here for minutes — it
+	// never reaches the post-install short-circuit, which blocks main_thread.
+	// The status callback itself is fine (delivered 39x before), so deliver the
+	// registration status callbacks synchronously and return CELL_OK. Trophies
+	// do not affect rendering; this just unblocks the boot.
+	{
+		lock.unlock();
+		const std::pair<SceNpTrophyStatus, s32> statuses[] =
+		{
+			{ SCE_NP_TROPHY_STATUS_PROCESSING_SETUP, 3 },
+			{ SCE_NP_TROPHY_STATUS_PROCESSING_PROGRESS, 38 },
+			{ SCE_NP_TROPHY_STATUS_PROCESSING_FINALIZE, 4 },
+			{ SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE, 0 }
+		};
+		printf("[TROPHY] wasm early short-circuit (skip install): delivering status cbs\n");
+		for (auto status : statuses)
+		{
+			for (s32 completed = 0; completed <= status.second; completed++)
+			{
+				statusCb(ppu, context, status.first, completed, status.second, arg);
+				if (thread_ctrl::state() == thread_state::aborting)
+				{
+					return {};
+				}
+			}
+		}
+		printf("[TROPHY] wasm early short-circuit: done, returning CELL_OK\n");
+	}
+	return CELL_OK;
+#endif
+
 	const auto on_error = [options]()
 	{
 		if (!!(options & SCE_NP_TROPHY_OPTIONS_REGISTER_CONTEXT_SHOW_ERROR_EXIT))
@@ -716,6 +750,42 @@ error_code sceNpTrophyRegisterContext(ppu_thread& ppu, u32 context, u32 handle, 
 
 	lock2.unlock();
 
+#ifdef __EMSCRIPTEN__
+	// wasm/emscripten: the upstream path below registers the trophy status
+	// callbacks via sysutil_register_cb and then blocks this thread in a timed
+	// wait-loop until cellSysutilCheckCallback drains them. Here no thread pumps
+	// cellSysutilCheckCallback (the game main thread is itself blocked waiting on
+	// this worker) and the wait-loop futex timeout does not fire reliably under
+	// emscripten pthreads, so the worker hangs forever and never proceeds to load
+	// data.vfs — stalling the whole boot. Deliver the status callbacks
+	// synchronously on this ppu thread (line ~625 already calls statusCb on `ppu`
+	// directly) so the game observes PROCESSING_COMPLETE and proceeds. Trophies do
+	// not affect rendering.
+	{
+		const s32 progress_cb_count = ::narrow<s32>(tropusr->GetTrophiesCount()) - 1;
+		const std::pair<SceNpTrophyStatus, s32> statuses[] =
+		{
+			{ SCE_NP_TROPHY_STATUS_PROCESSING_SETUP, 3 },
+			{ SCE_NP_TROPHY_STATUS_PROCESSING_PROGRESS, progress_cb_count },
+			{ SCE_NP_TROPHY_STATUS_PROCESSING_FINALIZE, std::max<s32>(progress_cb_count, 9) - 5 },
+			{ SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE, 0 }
+		};
+		printf("[TROPHY] wasm short-circuit: delivering status cbs synchronously (trophies=%d)\n", progress_cb_count + 1);
+		for (auto status : statuses)
+		{
+			for (s32 completed = 0; completed <= status.second; completed++)
+			{
+				statusCb(ppu, context, status.first, completed, status.second, arg);
+				if (thread_ctrl::state() == thread_state::aborting)
+				{
+					return {};
+				}
+			}
+		}
+		printf("[TROPHY] wasm short-circuit: done, returning CELL_OK\n");
+	}
+	return CELL_OK;
+#else
 	lv2_obj::sleep(ppu);
 	{
 		const s32 progress_cb_count = ::narrow<s32>(tropusr->GetTrophiesCount()) - 1;
@@ -789,6 +859,7 @@ error_code sceNpTrophyRegisterContext(ppu_thread& ppu, u32 context, u32 handle, 
 	}
 
 	return CELL_OK;
+#endif
 }
 
 error_code sceNpTrophyGetRequiredDiskSpace(u32 context, u32 handle, vm::ptr<u64> reqspace, u64 options)

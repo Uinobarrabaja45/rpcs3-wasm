@@ -477,8 +477,11 @@ error_code sys_event_queue_receive(ppu_thread& ppu, u32 equeue_id, vm::ptr<sys_e
 				static_cast<unsigned long long>(cnt), equeue_id,
 				static_cast<unsigned long long>(timeout));
 		}
-		// wasm32 POC: cap indefinite waits at 10 ms.
-		if (timeout == 0) timeout = 10000;
+		// wasm32 POC: cap indefinite waits. MUST exceed the vblank period
+		// (60Hz = 16.7ms) or EE RenderLoop's infinite vblank-wait always times
+		// out BEFORE the vblank event arrives — so it never cleanly receives a
+		// vblank, never renders, never flips. 100ms gives ~6 vblanks of margin.
+		if (timeout == 0) timeout = 100000;
 	}
 #endif
 	sys_event.trace("sys_event_queue_receive(equeue_id=0x%x, *0x%x, timeout=0x%llx)", equeue_id, dummy_event, timeout);

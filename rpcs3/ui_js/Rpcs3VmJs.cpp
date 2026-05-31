@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <thread>
+#include <set>
+#include <string>
 
 #include "JsDiscBridge.h"
 
@@ -62,7 +64,29 @@ struct JseConsoleLogListener final : logs::listener
 		// flaky ~3.5-8min "Debugger connection closed" before the slow but
 		// finite boot reaches its first flip). Keep warning/error/fatal/always.
 		if (static_cast<logs::level>(msg) > logs::level::warning)
-			return;
+		{
+			// Let the lv2 SYNC channels through (even at trace) to expose the
+			// first-flip gate: which object EE RenderLoop / main_thread block on
+			// in the post-RESC quiet state. These are low-volume (~hundreds/run).
+			const std::string_view ch = msg->name ? msg->name : "";
+			if (ch != "sys_semaphore" && ch != "sys_cond" && ch != "sys_lwcond" &&
+			    ch != "sys_lwmutex" && ch != "sys_event" && ch != "sys_event_flag" &&
+			    ch != "sys_mutex" && ch != "sys_rwlock" &&
+			    // DIAG: trace the WorkerThread's HLE block after userinfo (it doesn't
+			    // exit, doesn't read data.vfs). Add NP/sysutil/savedata/sysmodule —
+			    // suspect an offline NP-manager/sysutil state wait at notice level.
+			    ch != "sys_ppu_thread" && ch != "sys_timer" && ch != "sys_fs" &&
+			    ch != "cellFs" && ch != "sceNp" && ch != "sceNpManager" &&
+			    ch != "cellSysutil" && ch != "cellSaveData" && ch != "cellGame" &&
+			    ch != "sys_prx" && ch != "cellSysmodule" &&
+			    // prime suspect for the WorkerThread's invisible block: a SPURS task
+			    // wait (SPU wall on the loader). Plus cellSync/cellFiber HLE waits.
+			    ch != "cellSpurs" && ch != "cellSync" && ch != "cellFiber" &&
+			    ch != "cellSpursJq" && ch != "cellSpursTask")
+			{
+				return;
+			}
+		}
 		std::string ch_name = msg->name ? msg->name : "";
 		printf("[%s] %.*s: %.*s\n", ch_name.c_str(), (int)prefix.size(), prefix.data(), (int)text.size(), text.data());
 	}
@@ -114,6 +138,24 @@ void CRpcs3VmJs::CreateVM()
 	g_cfg.core.spu_decoder.set(spu_decoder_type::_static);   // Same for SPU
 	g_cfg.core.llvm_precompilation.set(false);               // Skip per-game LLVM precompile cache
 	g_cfg.core.max_spurs_threads.set(1);                     // Fewer SPU worker threads — each eats a pthread + stack
+	// Force libsre.sprx (the SPURS runtime) to LLE. RPCS3's HLE SPURS is removed
+	// from this build (no RegisterHleFunction), so the empty stub SPU-kernel image
+	// can't actually run — the game's SPURS tasks (cellSpursCreateTask/...) never
+	// execute, and main_thread's boot poll waits forever on a task result. Running
+	// the real libsre.sprx on the SPU interpreter is the only way to execute them.
+	g_cfg.core.libraries_control.set_set([]()
+	{
+		std::set<std::string> libs;
+		libs.emplace("libsre.sprx:lle");
+		return libs;
+	}());
+	// clocks_scale balances two opposing LLE-SPURS failure modes: too HIGH and the
+	// slow SPU interpreter misses SPURS init deadlines (PPU-side libspurs assert);
+	// too LOW (e.g. the wasm default 1) and the boot is ~100x slower in real time
+	// (never reaches a flip before the host memory cap) AND the SPURS kernel's idle
+	// timeout fires a premature GROUP_EXIT. 10 = 10x deadline relief + 10x faster
+	// boot than scale=1. (Overrides the wasm default of 1 in system_config.h.)
+	g_cfg.core.clocks_scale.set(10);
 	g_cfg.video.resolution.set(video_resolution::_480p);     // 480p framebuffer (vs 720p default) → smaller textures
 	g_cfg.video.frame_limit.set(frame_limit_type::_30);      // 30fps cap — half the work
 	g_cfg.video.disable_vertex_cache.set(true);              // Skip vertex cache → smaller GPU buffers

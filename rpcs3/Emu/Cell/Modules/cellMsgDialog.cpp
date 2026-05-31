@@ -173,6 +173,35 @@ error_code open_msg_dialog(bool is_blocking, u32 type, vm::cptr<char> msgString,
 		*return_code = CELL_MSGDIALOG_BUTTON_NONE;
 	}
 
+#ifdef __EMSCRIPTEN__
+	// Headless wasm: there is NO UI to dismiss a system dialog, and the auto-close
+	// path doesn't fire — so the real path below blocks the caller forever. This is
+	// exactly what stalls the WorkerThread inside cellSaveDataAutoLoad2 (its
+	// confirm/info dialog) → assets never load → boot hangs at main's resource poll.
+	// Auto-confirm the default affirmative button (YES==OK==1) immediately, fire any
+	// callback, and return so the caller proceeds. Trades away interactive dialogs
+	// (fine for headless bring-up; they'd be undismissable anyway).
+	{
+		const s32 status = (+_type.button_type == 0 /*NONE*/)
+			? CELL_MSGDIALOG_BUTTON_NONE
+			: CELL_MSGDIALOG_BUTTON_OK; // == CELL_MSGDIALOG_BUTTON_YES (1)
+		if (return_code)
+		{
+			*return_code = status;
+		}
+		if (callback)
+		{
+			sysutil_register_cb([callback, status, userData](ppu_thread& cb_ppu) -> s32
+			{
+				callback(cb_ppu, status, userData);
+				return CELL_OK;
+			});
+		}
+		cellSysutil.warning("open_msg_dialog: wasm auto-confirm status=%d (type=0x%x source=%s)", status, type, source);
+		return CELL_OK;
+	}
+#endif
+
 	if (auto manager = g_fxo->try_get<rsx::overlays::display_manager>())
 	{
 		if (manager->get<rsx::overlays::message_dialog>())

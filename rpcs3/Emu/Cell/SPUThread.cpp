@@ -1571,6 +1571,12 @@ void spu_thread::cpu_task()
 			if (prog_spurs)
 			{
 				printf("[SPUENTRY] SpursKernel reached interpreter loop, initial pc=0x%05x state=0x%x\n", +pc, +state.load());
+				// NOTE: an SF1_EXIT_IF_NO_WORK clear here (keep kernel alive) was tried
+				// and REVERTED — it made the idle kernel spin forever, pegging a worker
+				// core and starving main_thread's PPU interpreter (main couldn't even
+				// finish its 88MB arena-init). And keeping the kernel alive did NOT
+				// unblock main anyway: SPURS is not main's direct boot-poll producer.
+				// Let the kernel exit cleanly (no spin) so main gets full CPU.
 			}
 #endif
 
@@ -6503,11 +6509,21 @@ extern void resume_spu_thread_group_from_waiting(spu_thread& spu, std::array<sha
 bool spu_thread::stop_and_signal(u32 code)
 {
 #if defined(__EMSCRIPTEN__)
-	// [SPUSTOP] minimal (only on the SPURS assert STOP 0x101): locate the SPU pc
-	// where libspurs reports its assertion, to track the remaining wasm SPURS fault.
+	// [SPURS-PERSIST] wasm: STOP 0x101 = SYS_SPU_THREAD_STOP_GROUP_EXIT. The LLE
+	// SPURS kernel exits the group when it finds no work (exitIfNoWork), but on the
+	// ~1000x-slow SPU interpreter that fires BEFORE the game's just-submitted tasks
+	// become visible, and nothing restarts the group afterward — so the tasks never
+	// run and the game's main_thread boot-poll waits forever. Instead of exiting,
+	// re-run THIS kernel thread from its image entry (mirrors group_start: cpu_init
+	// + reload arg gprs + npc=entry) after a short sleep, so it slow-polls for work
+	// rather than terminating. When the game submits a workload, a re-poll picks it
+	// up. Only affects the SPURS kernel SPU threads.
 	if (code == 0x101 && thread_ctrl::get_name().find("SpursKernel") != std::string::npos)
 	{
-		printf("[SPUSTOP] SpursKernel assert STOP 0x101 at pc=0x%05x srr0=0x%x\n", +pc, +srr0);
+		// If this fires, the SF1_EXIT_IF_NO_WORK clear at SPUENTRY did not prevent
+		// the kernel's no-work group-exit. Let it exit cleanly (re-running the
+		// kernel individually breaks group coordination → crash at pc=0).
+		printf("[SPURS-EXIT] SpursKernel GROUP_EXIT despite flag-clear, pc=0x%05x\n", +pc);
 	}
 #endif
 

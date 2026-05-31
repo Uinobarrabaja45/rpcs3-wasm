@@ -1632,6 +1632,21 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 				return CELL_OK;
 			}
 
+#ifdef __EMSCRIPTEN__
+			// Terraria's auto-load funcStat returns an UNDEFINED result=1 (not OK_NEXT/
+			// OK_LAST, nor a defined ERR_* which are all negative). Upstream maps that
+			// to ERROR_PARAM "22" (display_callback_result_error_message default case),
+			// and the game then retry-loops on it forever — stalling the WorkerThread so
+			// it never drives asset loading (data.vfs decompress → resource register),
+			// and main_thread waits at its resource poll. Accept any undefined positive
+			// (non-OK) result as success so the load completes and the boot proceeds.
+			if (res > CELL_SAVEDATA_CBRESULT_OK_NEXT)
+			{
+				cellSaveData.warning("savedata_op(): wasm: accepting undefined funcStat result=%d as CELL_OK", res);
+				return CELL_OK;
+			}
+#endif
+
 			return display_callback_result_error_message(ppu, *result, errDialog);
 		}
 

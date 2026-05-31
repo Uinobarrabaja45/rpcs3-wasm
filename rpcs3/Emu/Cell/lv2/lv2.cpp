@@ -111,6 +111,22 @@ void fmt_class_string<lv2_obj::name_64>::format(std::string& out, u64 arg)
 
 static void null_func_(ppu_thread& ppu, ppu_opcode_t, be_t<u32>* this_op, ppu_intrp_func*)
 {
+#ifdef __EMSCRIPTEN__
+	// wasm: throttle this log. Some titles hammer a null/dbg syscall (e.g. 972,
+	// sys_dbg_*) from an interrupt thread tens of times/sec; logging every call
+	// floods the browser console channel and drops the CDP connection mid-boot.
+	// Log each distinct syscall code only once, then return silently.
+	{
+		const u64 sc = ppu.gpr[11];
+		static std::array<atomic_t<u8>, 1024> s_seen{};
+		if (sc < s_seen.size() && s_seen[sc].exchange(1) != 0)
+		{
+			ppu.gpr[3] = 0;
+			ppu.cia = vm::get_addr(this_op) + 4;
+			return;
+		}
+	}
+#endif
 	ppu_log.todo("Unimplemented syscall %s -> CELL_OK (r3=0x%llx, r4=0x%llx, r5=0x%llx, r6=0x%llx, r7=0x%llx, r8=0x%llx, r9=0x%llx, r10=0x%llx)", ppu_syscall_code(ppu.gpr[11]),
 		ppu.gpr[3], ppu.gpr[4], ppu.gpr[5], ppu.gpr[6], ppu.gpr[7], ppu.gpr[8], ppu.gpr[9], ppu.gpr[10]);
 

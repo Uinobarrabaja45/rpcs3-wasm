@@ -96,15 +96,65 @@ bool rsx::thread::send_event(u64 data1, u64 event_flags, u64 data3)
 {
 	// Filter event bits, send them only if they are masked by gcm
 	// Except the upper 32-bits, they are reserved for unmapped io events and execute unconditionally
+#if defined(__EMSCRIPTEN__)
+	const u64 se_orig = event_flags;
+	const u32 se_handlers = vm::_ref<RsxDriverInfo>(driver_info).handlers;
+	// Terraria's guest libgcm (LLE) leaves driverInfo.handlers=0x4 (bit 2 — not
+	// a modeled RSX event), so the VBLANK event (0x2) is always masked out and
+	// EE RenderLoop hangs forever on sys_event_queue_receive(0x8d005d00) — the
+	// first-flip gate. Force VBLANK (and its second-vblank variants) through so
+	// RenderLoop gets its pacing event and can issue cellRescConvertAndFlip.
+	event_flags &= se_handlers | SYS_RSX_EVENT_VBLANK | (SYS_RSX_EVENT_SECOND_VBLANK_BASE * 3) | (0xffff'ffffull << 32);
+	// Terraria's guest libgcm registered its vblank handler under handlers=0x4
+	// (bit 2), but RPCS3 posts vblank as bit 1 (0x2). The guest dispatcher then
+	// receives the event but matches no handler and re-sleeps. OR the guest's
+	// handler bits into the vblank event so its dispatcher actually fires →
+	// RenderLoop processes the vblank and can issue the first flip.
+	if ((event_flags & SYS_RSX_EVENT_VBLANK) && se_handlers)
+	{
+		event_flags |= se_handlers;
+	}
+#else
 	event_flags &= vm::_ref<RsxDriverInfo>(driver_info).handlers | 0xffff'ffffull << 32;
+#endif
 
 	if (!event_flags)
 	{
 		// Nothing to do
+#if defined(__EMSCRIPTEN__)
+		{
+			static atomic_t<u32> s_se0{0};
+			const u32 c = s_se0++;
+			if (c < 6 || (c & 0xFF) == 0)
+				printf("[SEND_EVENT] FILTERED-OUT #%u orig=0x%llx handlers=0x%x port=0x%x driver_info=0x%x\n",
+					c, static_cast<unsigned long long>(se_orig), se_handlers, rsx_event_port, +driver_info);
+		}
+#endif
 		return true;
 	}
 
+#if defined(__EMSCRIPTEN__)
+	{
+		static atomic_t<u32> s_se1{0};
+		const u32 c = s_se1++;
+		if (c < 6 || (c & 0x7F) == 0)
+			printf("[SEND_EVENT] SEND #%u masked=0x%llx (orig=0x%llx handlers=0x%x) port=0x%x\n",
+				c, static_cast<unsigned long long>(event_flags),
+				static_cast<unsigned long long>(se_orig), se_handlers, rsx_event_port);
+	}
+#endif
+
 	auto error = sys_event_port_send(rsx_event_port, data1, event_flags, data3);
+
+#if defined(__EMSCRIPTEN__)
+	{
+		static atomic_t<u32> s_ser{0};
+		const u32 c = s_ser++;
+		if (c < 8 || (c & 0x7F) == 0)
+			printf("[SEND_EVENT] RESULT #%u error=0x%x flags=0x%llx port=0x%x\n",
+				c, +error, static_cast<unsigned long long>(event_flags), rsx_event_port);
+	}
+#endif
 
 	while (error + 0u == CELL_EBUSY)
 	{

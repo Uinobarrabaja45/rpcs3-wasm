@@ -947,6 +947,7 @@ s32 _spurs::create_event_helper(ppu_thread& ppu, vm::ptr<CellSpurs> spurs, u32 /
 
 	//auto eht = idm::make_ptr<ppu_thread, event_helper_thread>(std::string(spurs->prefix, spurs->prefixSize) + "SpursHdlr1", ppuPriority, 0x8000);
 
+#ifndef __EMSCRIPTEN__
 	//if (!eht)
 	{
 		sys_event_port_disconnect(ppu, spurs->eventPort);
@@ -960,6 +961,13 @@ s32 _spurs::create_event_helper(ppu_thread& ppu, vm::ptr<CellSpurs> spurs, u32 /
 		sys_event_queue_destroy(ppu, spurs->eventQueue, SYS_EVENT_QUEUE_DESTROY_FORCE);
 		return CELL_SPURS_CORE_ERROR_STAT;
 	}
+#else
+	// wasm: RPCS3 leaves the HLE event-helper-thread creation above disabled, so
+	// this teardown block (originally guarded by `if (!eht)`) ran unconditionally
+	// and made create_event_helper / cellSpursInitializeWithAttribute ALWAYS fail
+	// with EINVAL, deadlocking the game task system at boot. Keep the event queue
+	// and port we just created and fall through to CELL_OK, like create_handler.
+#endif
 
 	// eht->gpr[3] = spurs.addr();
 	// eht->run();
@@ -3586,7 +3594,28 @@ s32 _spurs::event_flag_wait(ppu_thread& ppu, vm::ptr<CellSpursEventFlag> eventFl
 	if (recv)
 	{
 		// Block till something happens
+#ifdef __EMSCRIPTEN__
+		// wasm/stub-SPURS: the event flag's lv2 event queue is often not attached
+		// (cellSpursAttachLv2EventQueue fails ESRCH without functional SPU threads),
+		// so sys_event_queue_receive returns an error. ensure()-ing == 0 fatally
+		// terminates the calling thread (e.g. audio mstream-update), which STOPS the
+		// whole emulation and kills the boot. Return an error instead so the caller
+		// can cope. SPURS-driven audio won't function, but the boot continues.
+		if (sys_event_queue_receive(ppu, eventFlag->eventQueueId, vm::null, 0) != 0)
+		{
+			// Park ~500ms so the caller (e.g. audio mstream-update) polls slowly
+			// instead of busy-spinning — which otherwise floods the console (one
+			// cellSpursEventFlagWait warning per call) AND pegs a worker core,
+			// starving main_thread's interpreter and bloating the renderer to an
+			// early OS SIGKILL. SPURS-driven audio is non-functional regardless.
+			lv2_obj::sleep(ppu);
+			thread_ctrl::wait_for(500000);
+			static_cast<void>(ppu.test_stopped());
+			return CELL_SPURS_CORE_ERROR_STAT;
+		}
+#else
 		ensure(sys_event_queue_receive(ppu, eventFlag->eventQueueId, vm::null, 0) == 0);
+#endif
 		static_cast<void>(ppu.test_stopped());
 
 		s32 i = 0;
