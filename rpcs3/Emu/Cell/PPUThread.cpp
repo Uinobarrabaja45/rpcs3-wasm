@@ -2501,7 +2501,7 @@ void ppu_thread::exec_task()
 		// ids 0x1000002..0x100000c) to see where they block/spin after their
 		// trophy/savedata/userinfo init — the asset loader never reads data.vfs,
 		// so resources stay unregistered and main's poll never matches.
-		if (this->id >= 0x1000002u && this->id <= 0x100000cu)
+		if (false && this->id >= 0x1000002u && this->id <= 0x100000cu) // DISABLED: CDP-flooding probe shortened runs; job done (ResourceLoop confirmed in zlib inflate)
 		{
 			static thread_local u32 s_wtc = 0;
 			if ((++s_wtc & 0xFFF) == 0)
@@ -2515,6 +2515,32 @@ void ppu_thread::exec_task()
 			// One-shot: dump main's block region so we can decode what it waits on
 			// (SPURS wait? thread join? poll loop?). cia clusters ~0x27788 (lr 0x27638)
 			// just before main goes silent.
+			// RESSCAN: definitive test of the resource-registration wall. When main
+			// busy-polls at 0x27700, scan the handle table (+/-200 entries of 0x68c
+			// stride around main's cursor r29) and count entries whose +0x60 halfword
+			// is REGISTERED (!= 0xffff), throttled. If `registered` stays 0 for the
+			// whole boot, NO PPU thread ever registers a resource (-> SPU/SPURS-gated,
+			// the fundamental wall). If it rises, main waits for a specific id (target
+			// = halfword @[r31+0x6c]) we can identify and hand-register as a fallback.
+			if (cia == 0x27700u)
+			{
+				static thread_local u32 s_rsc = 0;
+				if ((++s_rsc & 0x1FFFF) == 0)
+				{
+					const u32 cur = static_cast<u32>(gpr[29]);
+					const auto rdh = [mem_](u32 a){ return reinterpret_cast<be_t<u16>*>(mem_ + u64{a})->value(); };
+					u32 reg = 0; s32 firstk = 0; u32 firstv = 0;
+					for (s32 k = -200; k <= 200; k++)
+					{
+						const s64 e = static_cast<s64>(cur) + static_cast<s64>(k) * 0x68c;
+						if (e < 0x10000 || e + 0x62 >= 0x5ff00000) continue;
+						const u16 h = rdh(static_cast<u32>(e) + 0x60);
+						if (h != 0xffff) { if (!reg) { firstk = k; firstv = h; } reg++; }
+					}
+					printf("[RESSCAN] cur=0x%x registered=%u/401 firstk=%d firstv=0x%x target=0x%x\n",
+						cur, reg, static_cast<int>(firstk), firstv, rdh(static_cast<u32>(gpr[31]) + 0x6c));
+				}
+			}
 			static thread_local int s_blkd = 0;
 			if (s_blkd == 0 && cia >= 0x27600u && cia < 0x277c0u)
 			{
@@ -2535,9 +2561,16 @@ void ppu_thread::exec_task()
 				const u32 r31v = static_cast<u32>(gpr[31]);
 				const auto rdm = [mem_](u32 a){ return a < 0x5fff0000 ? reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value() : 0xbadbadu; };
 				const u32 r29v = static_cast<u32>(gpr[29]);
-				printf("[MAINCIA] cia=0x%x lr=0x%x r3=0x%x [r3]=0x%x r29=0x%x [r29+60]=0x%x r31=0x%x [r31+6c]=0x%x\n",
+				// r27 is the init-loop END bound (cmpw r27,r29 @0x1a5748/0x1a5798); r25/r28
+				// are the loop's base/cursor. Dump them to gauge whether main's big object-
+				// init loop (0x1a5730 calling 0x33f24) is FINITE-and-near-done or effectively
+				// unbounded — decides "give it more wall-clock" vs "HLE the init loop".
+				const u32 r25v = static_cast<u32>(gpr[25]);
+				const u32 r27v = static_cast<u32>(gpr[27]);
+				const u32 r28v = static_cast<u32>(gpr[28]);
+				printf("[MAINCIA] cia=0x%x lr=0x%x r3=0x%x [r3]=0x%x r29=0x%x [r29+60]=0x%x r31=0x%x [r31+6c]=0x%x r25=0x%x r27=0x%x r28=0x%x\n",
 					cia, static_cast<u32>(lr), r3v, v,
-					r29v, rdm(r29v + 0x60), r31v, rdm(r31v + 0x6c));
+					r29v, rdm(r29v + 0x60), r31v, rdm(r31v + 0x6c), r25v, r27v, r28v);
 				// LDUMP: cross-thread peek at the loader threads' sticky last_function
 				// (the HLE function they're blocked in — survives the block). The
 				// WorkerThread runs almost no PPU code so this is the only way to see
@@ -2566,10 +2599,107 @@ void ppu_thread::exec_task()
 					for (u32 a = 0x33f00; a <= 0x33f90; a += 4) printf(" %08x", rdi(a));
 					printf("\n[ASMDUMP] iter@0x1a5730:");
 					for (u32 a = 0x1a5730; a <= 0x1a57c0; a += 4) printf(" %08x", rdi(a));
+					// The inflate HOT inner loop: ResourceLoop spends ~all its time at
+					// 0x41bf78/0x41bfa8 (Huffman/bit decode). Dump it so we can HLE it
+					// like the match-copy (0x41c294) and unblock asset decompression.
+					printf("\n[ASMDUMP] inflate@0x41be00:");
+					for (u32 a = 0x41be00; a <= 0x41c900; a += 4) printf(" %08x", rdi(a));
 					printf("\n");
 				}
 			}
 		}
+
+#ifdef __EMSCRIPTEN__
+// ILMAP: ground-truth map of main's init loop. For each distinct cia main executes
+// in [0x1a5730,0x1a57c0], log the LIVE instruction word + r25/r27/r29 once. This
+// resolves the hook-anchor confusion (hand-decoded dump offsets were unreliable).
+if (false && cia >= 0x1a5730u && cia <= 0x1a57c0u) [[unlikely]] // ILMAP done; disabled
+{
+	static thread_local u8 s_ilm[40] = {0};
+	const u32 idx = (cia - 0x1a5730u) >> 2;
+	if (idx < 40 && !s_ilm[idx])
+	{
+		s_ilm[idx] = 1;
+		const auto rdi = [mem_](u32 a){ return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+		printf("[ILMAP] cia=0x%x instr=0x%08x r25=0x%x r27=0x%x r29=0x%x\n", cia, rdi(cia), static_cast<u32>(gpr[25]), static_cast<u32>(gpr[27]), static_cast<u32>(gpr[29]));
+	}
+}
+#endif
+#ifdef __EMSCRIPTEN__
+// HLE main_thread's giant object-init loop (outer loop @0x1a57a4 (cmpw r27,r29) -> per-element header
+// zero routine 0x33f24): it zeroes the 8-byte header of ~7M objects spaced 0xc
+// apart, from cursor r29 up to bound r27. main spends ~90% of the pre-flip boot
+// HERE at interpreter speed - the dominant bottleneck. Zero the BULK natively and
+// leave a margin of objects for the interpreter to finish the exact loop exit.
+// NO control-flow change: idempotent zeroing + an updated (stride-aligned) cursor;
+// the interpreter's own cmpw(r27,r29) handles termination. 0x33f24 zeroes bytes
+// [obj+0..7]; [obj+8..0xb] are untouched (object stride is 0xc).
+if (cia == 0x1a57acu) [[unlikely]]
+{
+			static thread_local u32 s_ilg = 0;
+			if ((s_ilg++ & 0xFF) == 0) printf("[INITLOOP] hit#%u cur=0x%x end=0x%x\n", s_ilg, static_cast<u32>(gpr[29]), static_cast<u32>(gpr[27]));
+	const u32 cur = static_cast<u32>(gpr[29]);
+	const u32 end = static_cast<u32>(gpr[27]);
+	if (end > cur + 0x60u && (end - cur) > 0x800u && cur >= 0x20000000u && end < 0x40000000u)
+	{
+		const u32 k    = (end - cur - 0x600u) / 0x60u; // leave ~128 objs; align to the loop's 0x60 (8-obj) iteration stride
+		const u32 stop = cur + k * 0x60u;             // 0x60-aligned so interpreter resumes the loop cleanly
+		const u64 wasm_sz  = static_cast<u64>(__builtin_wasm_memory_size(0)) * 65536ull;
+		const u64 base_off = reinterpret_cast<u64>(mem_);
+		if (stop > cur + 0x60u && base_off + stop + 8 < wasm_sz)
+		{
+			u8* const g = reinterpret_cast<u8*>(mem_);
+			for (u32 a = cur + 0x60u; a < stop; a += 0xcu) // [cur,cur+0x60) already zeroed this iteration
+			{
+				g[a+0]=0; g[a+1]=0; g[a+2]=0; g[a+3]=0;
+				g[a+4]=0; g[a+5]=0; g[a+6]=0; g[a+7]=0;
+			}
+			gpr[29] = stop - 0x60u; // 0x1a57ac's addi +0x60 makes r29=stop; interpreter does [stop,end)
+		}
+	}
+}
+#endif
+
+#ifdef __EMSCRIPTEN__
+		// HLE the zlib inflate BIT-REFILL loop (body 0x41bf78-0x41bfa4) — the single
+		// hottest spot on EE ResourceLoop (zlib NEEDBITS: read input bytes into the bit
+		// accumulator until > 14 bits). Hook the loop's CHECK at 0x41bfa8 and refill
+		// natively in one shot; the interpreter then re-reads the (now > 14) bit count,
+		// its `ble` falls through, and the loop body is skipped. NO control-flow change,
+		// zero desync risk — the resulting state is exactly what the loop would produce.
+		// State is a standard zlib inflate_state: +0x18 next_in, +0x1c in_end (one past
+		// last input byte), +0x20 hold (bit accumulator), +0x24 bits. Shift amount rises
+		// by 8 each iter (matches the interpreter, which reloads r8 only at 0x41bfa8).
+		if (cia == 0x41bfa8u) [[unlikely]]
+		{
+			const u32 r3v = static_cast<u32>(gpr[3]);
+			if (r3v >= 0x10000 && r3v < 0x5fff0000)
+			{
+				const auto rd = [mem_](u32 a){ return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+				u32 cnt = rd(r3v + 0x24);
+				if (cnt <= 14)
+				{
+					u32 inp = rd(r3v + 0x18);
+					const u32 in_end = rd(r3v + 0x1c);
+					const u64 wasm_sz  = static_cast<u64>(__builtin_wasm_memory_size(0)) * 65536ull;
+					const u64 base_off = reinterpret_cast<u64>(mem_);
+					u32 acc = rd(r3v + 0x20);
+					u8* const g = reinterpret_cast<u8*>(mem_);
+					while (cnt <= 14 && inp < in_end && base_off + inp < wasm_sz)
+					{
+						acc += static_cast<u32>(g[inp]) << cnt;
+						inp++; cnt += 8;
+					}
+					if (cnt > 14) // fully refilled within bounds → commit; else leave for interpreter (EOF path)
+					{
+						*reinterpret_cast<be_t<u32>*>(mem_ + (u64{r3v} + 0x20)) = acc;
+						*reinterpret_cast<be_t<u32>*>(mem_ + (u64{r3v} + 0x18)) = inp;
+						*reinterpret_cast<be_t<u32>*>(mem_ + (u64{r3v} + 0x24)) = cnt;
+					}
+				}
+			}
+		}
+#endif
 
 		// HLE the inflate match-copy loop — the decompression hot path that
 		// throttles EE ResourceLoop to ~2.5KB/s (~400 instr/byte) and stops the
@@ -2583,6 +2713,17 @@ void ppu_thread::exec_task()
 		{
 			const u32 n   = static_cast<u32>(ctr);
 			const u32 r3v = static_cast<u32>(gpr[3]);
+			#ifdef __EMSCRIPTEN__
+			// INFSTATE: one-shot dump of the zlib inflate state struct (r3) so we can
+			// locate input start/end + output start/end + bit buffer/count, to HLE the
+			// whole inflate with native zlib (the real decompression-speed fix).
+			{ static thread_local int s_std = 0;
+			  if (s_std++ == 0 && r3v >= 0x10000 && r3v < 0x5fff0000) {
+			    const auto rds = [mem_](u32 a){ return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+			    printf("[INFSTATE] r3=0x%x:", r3v);
+			    for (u32 o = 0; o <= 0x40; o += 4) printf(" +%02x=%08x", o, rds(r3v + o));
+			    printf("\n"); } }
+			#endif
 			// Guard r3v before dereferencing [r3+0x28]; the guest vm region is
 			// 0..0x60000000 (1.5 GiB), so anything outside is wild — skip to the
 			// interpreter (which masks each access + page-faults safely).
@@ -2595,8 +2736,26 @@ void ppu_thread::exec_task()
 				// wild address; the byte-loop interpreter tolerates that via
 				// 32-bit masking + vm fault handling, but our raw host copy must
 				// not run off the wasm heap. Out-of-range → fall back.
-				if (dst >= 0x10000 && src >= 0x10000 &&
-				    u64{dst} + n <= 0x60000000 && u64{src} + n <= 0x60000000)
+				bool can_hle = (dst >= 0x10000 && src >= 0x10000 &&
+				    u64{dst} + n <= 0x60000000 && u64{src} + n <= 0x60000000);
+#ifdef __EMSCRIPTEN__
+				// Growable (Dyna) wasm heap: 0x60000000 above is the RESERVED guest-vm
+				// size, but the wasm linear memory may not have GROWN that far yet this
+				// early in boot. A raw host copy to an un-grown high address traps
+				// ("memory access out of bounds") and kills EE ResourceLoop — whereas the
+				// interpreter's vm:: access page-faults + grows on demand. So also require
+				// the WHOLE copy to lie within the CURRENT wasm memory; else fall back to
+				// the (safe, self-growing) interpreter. Fixes the flaky early-boot OOB
+				// that killed ResourceLoop mid-decompression (stackwalk155).
+				if (can_hle)
+				{
+					const u64 base_off  = reinterpret_cast<u64>(mem_);
+					const u64 wasm_size = static_cast<u64>(__builtin_wasm_memory_size(0)) * 65536ull;
+					if (base_off + u64{dst} + n > wasm_size || base_off + u64{src} + n > wasm_size)
+						can_hle = false;
+				}
+#endif
+				if (can_hle)
 				{
 					const u32 bulk = n - 1;
 					u8* const gmem = reinterpret_cast<u8*>(mem_);
@@ -2605,6 +2764,13 @@ void ppu_thread::exec_task()
 					*reinterpret_cast<be_t<u32>*>(mem_ + (u64{r3v} + 0x28)) = dst + bulk;
 					gpr[8] = src + bulk;
 					ctr = 1; // interpreter copies the final byte, then bdz exits cleanly
+					// INFLATE progress proxy: accumulate match-copy bytes + log throttled,
+					// to gauge whether asset data is a few MB (incremental-HLE/patience ok)
+					// or 10s of MB (need native zlib). Under-counts (literals excluded).
+					static thread_local u64 s_infl = 0; static thread_local u32 s_infn = 0;
+					s_infl += bulk;
+					if ((++s_infn & 0x3FFF) == 0)
+						printf("[INFLATE] matchcopies=%u matchbytes=%lluKiB\n", s_infn, s_infl >> 10);
 				}
 			}
 		}

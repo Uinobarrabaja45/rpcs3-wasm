@@ -223,20 +223,20 @@ function connectToDebugger(wsUrl) {
     setTimeout(() => {
         if (!captured) {
             captured = true;
-            console.log('No trigger seen in 1440s (24 min) — capturing whatever is on screen.');
+            console.log('No trigger seen in 2400s (40 min) — capturing whatever is on screen.');
             captureNow(ws);
         }
-    }, 1440000);
+    }, 2400000);
 
     // Hard timeout: 25 minutes max, then bail. Extended for the slow JIT-less
     // PPU interpreter: Terraria streams large zlib assets on EE ResourceLoop at
     // ~1.8 KB/s, so reaching the first GCM flip (the 505 splash) takes many
     // minutes. The flip-trigger still fires + captures the moment it happens.
     setTimeout(() => {
-        console.error('Timeout of 1500 seconds exceeded! Crashing...');
+        console.error('Timeout of 2520 seconds exceeded! Crashing...');
         chromeProcess.kill('SIGKILL');
         process.exit(1);
-    }, 1500000);
+    }, 2520000);
 }
 
 setTimeout(() => getWsUrl(), 1000);
