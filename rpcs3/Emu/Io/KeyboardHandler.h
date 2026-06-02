@@ -4,6 +4,16 @@
 
 #include <mutex>
 #include <vector>
+
+struct kb_locker
+{
+#ifdef __EMSCRIPTEN__
+	kb_locker(std::mutex&) {}
+#else
+	std::lock_guard<std::mutex> lock;
+	kb_locker(std::mutex& mtx) : lock(mtx) {}
+#endif
+};
 #include <set>
 #include <unordered_map>
 

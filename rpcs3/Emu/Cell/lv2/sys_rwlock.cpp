@@ -230,6 +230,9 @@ error_code sys_rwlock_rlock(ppu_thread& ppu, u32 rw_lock_id, u64 timeout)
 		}
 		else
 		{
+			#if defined(__EMSCRIPTEN__)
+			{ static thread_local bool s_mp_rwlock = false; if (ppu.id == 0x1000000u && !s_mp_rwlock) { s_mp_rwlock = true; printf("[MAINPARK] rwlock cia=0x%x lr=0x%x\n", static_cast<unsigned>(ppu.cia), static_cast<unsigned>(ppu.lr)); } }
+			#endif
 			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}
@@ -501,6 +504,9 @@ error_code sys_rwlock_wlock(ppu_thread& ppu, u32 rw_lock_id, u64 timeout)
 		}
 		else
 		{
+			#if defined(__EMSCRIPTEN__)
+			{ static thread_local bool s_mp_rwlock = false; if (ppu.id == 0x1000000u && !s_mp_rwlock) { s_mp_rwlock = true; printf("[MAINPARK] rwlock cia=0x%x lr=0x%x\n", static_cast<unsigned>(ppu.cia), static_cast<unsigned>(ppu.lr)); } }
+			#endif
 			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}

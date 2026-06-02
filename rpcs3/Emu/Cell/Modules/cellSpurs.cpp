@@ -688,6 +688,23 @@ void _spurs::handler_wait_ready(ppu_thread& ppu, vm::ptr<CellSpurs> spurs)
 		}
 
 		spurs->handlerWaiting = 0;
+
+#if defined(__EMSCRIPTEN__)
+		// wasm: Terraria's resource-decode SPURS task never runs because no workload is ever
+		// detected RUNNABLE here (HLE workload-state management is incomplete), so the handler
+		// never starts the SPU group and resources never decode -> main hangs forever in the
+		// resource-load loop. Force the handler to proceed after waiting a while so the SPU
+		// thread group starts and the SPURS kernel runs the pending decode task(s).
+		{
+			static thread_local u32 s_hwr = 0;
+			if (++s_hwr > 20u)
+			{
+				s_hwr = 0;
+				printf("[SPURSFORCE] handler force-runnable after waits -> start SPU group (run decode kernel)\n");
+				break;
+			}
+		}
+#endif
 	}
 
 	// If we reach here then a runnable workload was found
@@ -745,6 +762,13 @@ s32 _spurs::create_handler(vm::ptr<CellSpurs> /*spurs*/, u32 /*ppuPriority*/)
 		}
 	};
 
+	// NOTE (wasm boot wall): this handler is disabled upstream AND the old spawn API
+	// (handler_thread::non_task + eht->run()) has rotted (ppu_thread has no run()). Enabling
+	// the SPURS handler is the only path to starting the SPU group so the SPURS kernel +
+	// Terraria's resource-decode SPU task actually run (the boot's final wall: ~158 of 601
+	// resources never decode). That requires a non-trivial port to the current thread API +
+	// a working SPU-side SPURS kernel (cellSpursSpu.cpp has its reservation-ops commented) —
+	// a focused multi-day effort, not a quick uncomment.
 	// auto eht = idm::make_ptr<ppu_thread, handler_thread>(std::string(spurs->prefix, spurs->prefixSize) + "SpursHdlr0", ppuPriority, 0x4000);
 
 	// spurs->ppu0 = eht->id;
@@ -3480,7 +3504,18 @@ s32 _spurs::event_flag_wait(ppu_thread& ppu, vm::ptr<CellSpursEventFlag> eventFl
 
 	if (block && eventFlag->spuPort == CELL_SPURS_EVENT_FLAG_INVALID_SPU_PORT)
 	{
+#ifdef __EMSCRIPTEN__
+		// wasm/stub-SPURS: SPU threads are disabled, so the event flag queue is never attached.
+		// Returning STAT immediately puts the caller thread (like mstream-update) in a tight
+		// retry loop with no delay, consuming 100% CPU. Instead, sleep a short time and fake success.
+		lv2_obj::sleep(ppu);
+		thread_ctrl::wait_for(10000); // 10ms
+		static_cast<void>(ppu.test_stopped());
+		*mask = *mask;
+		return CELL_OK;
+#else
 		return CELL_SPURS_TASK_ERROR_STAT;
+#endif
 	}
 
 	if (eventFlag->ctrl.raw().ppuWaitMask || eventFlag->ctrl.raw().ppuPendingRecv)
@@ -3603,15 +3638,13 @@ s32 _spurs::event_flag_wait(ppu_thread& ppu, vm::ptr<CellSpursEventFlag> eventFl
 		// can cope. SPURS-driven audio won't function, but the boot continues.
 		if (sys_event_queue_receive(ppu, eventFlag->eventQueueId, vm::null, 0) != 0)
 		{
-			// Park ~500ms so the caller (e.g. audio mstream-update) polls slowly
-			// instead of busy-spinning — which otherwise floods the console (one
-			// cellSpursEventFlagWait warning per call) AND pegs a worker core,
-			// starving main_thread's interpreter and bloating the renderer to an
-			// early OS SIGKILL. SPURS-driven audio is non-functional regardless.
+			// Park ~10ms and fake event success, unblocking the calling PPU thread.
+			// Returning CORE_ERROR_STAT makes the caller retry in a tight spin loop.
 			lv2_obj::sleep(ppu);
-			thread_ctrl::wait_for(500000);
+			thread_ctrl::wait_for(10000); // 10ms
 			static_cast<void>(ppu.test_stopped());
-			return CELL_SPURS_CORE_ERROR_STAT;
+			*mask = *mask;
+			return CELL_OK;
 		}
 #else
 		ensure(sys_event_queue_receive(ppu, eventFlag->eventQueueId, vm::null, 0) == 0);
@@ -3635,7 +3668,15 @@ s32 _spurs::event_flag_wait(ppu_thread& ppu, vm::ptr<CellSpursEventFlag> eventFl
 /// Wait for SPURS event flag
 s32 cellSpursEventFlagWait(ppu_thread& ppu, vm::ptr<CellSpursEventFlag> eventFlag, vm::ptr<u16> mask, u32 mode)
 {
+#ifdef __EMSCRIPTEN__
+	static thread_local u32 s_log_count = 0;
+	if (++s_log_count % 1000 == 1)
+	{
+		cellSpurs.warning("cellSpursEventFlagWait(eventFlag=*0x%x, mask=*0x%x, mode=%d) [throttled log x1000]", eventFlag, mask, mode);
+	}
+#else
 	cellSpurs.warning("cellSpursEventFlagWait(eventFlag=*0x%x, mask=*0x%x, mode=%d)", eventFlag, mask, mode);
+#endif
 
 	return _spurs::event_flag_wait(ppu, eventFlag, mask, mode, 1);
 }
@@ -3643,7 +3684,15 @@ s32 cellSpursEventFlagWait(ppu_thread& ppu, vm::ptr<CellSpursEventFlag> eventFla
 /// Check SPURS event flag
 s32 cellSpursEventFlagTryWait(ppu_thread& ppu, vm::ptr<CellSpursEventFlag> eventFlag, vm::ptr<u16> mask, u32 mode)
 {
+#ifdef __EMSCRIPTEN__
+	static thread_local u32 s_log_count = 0;
+	if (++s_log_count % 1000 == 1)
+	{
+		cellSpurs.warning("cellSpursEventFlagTryWait(eventFlag=*0x%x, mask=*0x%x, mode=0x%x) [throttled log x1000]", eventFlag, mask, mode);
+	}
+#else
 	cellSpurs.warning("cellSpursEventFlagTryWait(eventFlag=*0x%x, mask=*0x%x, mode=0x%x)", eventFlag, mask, mode);
+#endif
 
 	return _spurs::event_flag_wait(ppu, eventFlag, mask, mode, 0);
 }

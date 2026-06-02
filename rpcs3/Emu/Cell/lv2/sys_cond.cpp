@@ -576,6 +576,9 @@ error_code sys_cond_wait(ppu_thread& ppu, u32 cond_id, u64 timeout)
 		}
 		else
 		{
+			#if defined(__EMSCRIPTEN__)
+			{ static thread_local bool s_mp_cond = false; if (ppu.id == 0x1000000u && !s_mp_cond) { s_mp_cond = true; printf("[MAINPARK] cond cia=0x%x lr=0x%x\n", static_cast<unsigned>(ppu.cia), static_cast<unsigned>(ppu.lr)); } }
+			#endif
 			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}

@@ -842,6 +842,17 @@ static const bool s_tsc_freq_evaluated = []() -> bool
 {
 	static const ullong cal_tsc = []() -> ullong
 	{
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+		// utils::get_tsc() is defined as emscripten_get_now()*3e6 → a nominal
+		// 3 GHz counter derived from performance.now(). The timed-sleep
+		// calibration below is unreliable in wasm (no real blocking sleep on
+		// the main thread during init), and miscalibrating the freq makes
+		// get_system_time() run ~100x too fast — which floods the vblank
+		// thread and makes every lv2 timeout (event_queue_receive, etc.)
+		// expire almost instantly. Pin the freq to match get_tsc()'s
+		// definition so get_system_time() reports true real microseconds.
+		return 3'000'000'000ull;
+#endif
 #ifdef ARCH_ARM64
 		u64 r = 0;
 		__asm__ volatile("mrs %0, cntfrq_el0" : "=r" (r));

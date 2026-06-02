@@ -149,12 +149,18 @@ bool CGSH_WebGPUJs::Render()
 	const uint32_t fb_h     = g_webgpu_fb_height.load(std::memory_order_relaxed);
 	const uint32_t fb_pitch = g_webgpu_fb_pitch.load(std::memory_order_relaxed);
 
+	if (fb_w > 0 && fb_h > 0 && (static_cast<int>(fb_w) != m_windowWidth || static_cast<int>(fb_h) != m_windowHeight))
+	{
+		m_windowWidth = fb_w;
+		m_windowHeight = fb_h;
+		ConfigureSurface();
+	}
+
 	const uint32_t surfW = static_cast<uint32_t>(m_windowWidth);
 	const uint32_t surfH = static_cast<uint32_t>(m_windowHeight);
 
-	// We can present honest pixels once the game flips a buffer whose size
-	// matches the surface. RESC outputs 1280x720 for Terraria == our surface,
-	// so a 1:1 texture-to-texture copy works (no scaler pipeline needed yet).
+	// We can present honest pixels once the game flips a buffer.
+	// Since we update the surface resolution on size changes, a 1:1 copy is valid.
 	const bool haveFrame = fb_addr && fb_w == surfW && fb_h == surfH && fb_pitch >= fb_w * 4;
 
 	wgpu::CommandEncoderDescriptor encDesc = {};

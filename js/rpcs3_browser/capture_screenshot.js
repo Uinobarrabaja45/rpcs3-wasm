@@ -73,6 +73,8 @@ const profileDir = `/tmp/chrome-headless-profile-rpcs3-${Date.now()}`;
 const chromeCmd = [
     '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"',
     (process.env.HEADLESS === '0' ? '' : '--headless=new'),   // HEADLESS=0 => NON-headless: run in YOUR GUI session for a STABLE hours-long capture (real Metal GPU). Default (unset) = headless (background runs), but headless WebGPU is flaky (random 2-20min crash).
+    '--no-first-run',
+    '--no-default-browser-check',
     '--disable-backgrounding-occluded-windows',
     '--disable-renderer-backgrounding',
     '--disable-background-timer-throttling',
@@ -108,6 +110,7 @@ function getWsUrl(retries = 30) {
         res.on('end', () => {
             try {
                 const list = JSON.parse(data);
+                console.log('CHROME TARGETS:', list);
                 // Match on the URL substring — the param we care about
                 // depends on URL mode: compare=<game> for the split-screen
                 // view, game=<game> for the single-pane autoboot. Either

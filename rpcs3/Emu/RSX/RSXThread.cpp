@@ -3521,6 +3521,31 @@ namespace rsx
 				intr_thread->cmd_notify.notify_one();
 			}
 		}
+
+#ifdef __EMSCRIPTEN__
+		// wasm/cellResc flip path: the game presents through cellRescSetConvertAndFlip,
+		// which (in this port) injects a GCM_FLIP_COMMAND into the FIFO directly, WITHOUT
+		// the cellGcmSetFlip vblank bookkeeping that increments flip_notification_count.
+		// So the loop above never runs and the flip-complete notification never reaches
+		// the game. Terraria registered a flip handler via cellRescSetFlipHandler (stored
+		// in flip_handler); that handler signals the per-frame semaphore main_thread blocks
+		// on (sys_semaphore_wait at 0x411150). The handler is only dispatched in the isHLE
+		// branch above, but this game runs isHLE=0 — so invoke it here, once per emu-flip,
+		// via the gcm interrupt thread (exactly as the isHLE path would). Without this,
+		// main deadlocks waiting for a frame-complete signal that never comes.
+		if (auto ptr = flip_handler)
+		{
+			intr_thread->cmd_list
+			({
+				{ ppu_cmd::set_args, 1 }, u64{1},
+				{ ppu_cmd::lle_call, ptr },
+				{ ppu_cmd::sleep, 0 }
+			});
+
+			intr_thread->cmd_notify.store(1);
+			intr_thread->cmd_notify.notify_one();
+		}
+#endif
 	}
 
 	void thread::evaluate_cpu_usage_reduction_limits()

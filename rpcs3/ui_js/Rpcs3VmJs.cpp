@@ -42,6 +42,8 @@
 #include "Input/pad_thread.h"
 #include "WebGPUGSRender.h"
 #include "util/fixed_typemap.hpp"
+#include "Emu/Io/Null/NullKeyboardHandler.h"
+#include "Emu/Io/Null/NullMouseHandler.h"
 #include "Emu/Cell/Modules/cellSaveData.h"
 #include "Emu/Cell/Modules/sceNpTrophy.h"
 #include "util/video_source.h"
@@ -191,8 +193,14 @@ void CRpcs3VmJs::CreateVM()
 	callbacks.enable_disc_insert = [](bool) {};
 	callbacks.try_to_quit = [](bool, std::function<void()>) { return false; };
 	callbacks.handle_taskbar_progress = [](s32, s32) {};
-	callbacks.init_kb_handler = []() {};
-	callbacks.init_mouse_handler = []() {};
+	callbacks.init_kb_handler = []()
+	{
+		ensure(g_fxo->init<KeyboardHandlerBase, NullKeyboardHandler>(Emu.DeserialManager()));
+	};
+	callbacks.init_mouse_handler = []()
+	{
+		ensure(g_fxo->init<MouseHandlerBase, NullMouseHandler>(Emu.DeserialManager()));
+	};
 	callbacks.init_pad_handler = [](std::string_view title_id)
 	{
 		// Construct the stub pad_thread defined in EmscriptenStubs.cpp.

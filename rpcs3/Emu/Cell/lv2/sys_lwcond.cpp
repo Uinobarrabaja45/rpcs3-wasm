@@ -628,6 +628,9 @@ error_code _sys_lwcond_queue_wait(ppu_thread& ppu, u32 lwcond_id, u32 lwmutex_id
 		}
 		else
 		{
+			#if defined(__EMSCRIPTEN__)
+			{ static thread_local bool s_mp_lwcond = false; if (ppu.id == 0x1000000u && !s_mp_lwcond) { s_mp_lwcond = true; printf("[MAINPARK] lwcond cia=0x%x lr=0x%x\n", static_cast<unsigned>(ppu.cia), static_cast<unsigned>(ppu.lr)); } }
+			#endif
 			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}

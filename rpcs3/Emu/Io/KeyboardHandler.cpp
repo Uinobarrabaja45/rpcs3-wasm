@@ -59,6 +59,7 @@ void fmt_class_string<keyboard_consumer::identifier>::format(std::string& out, u
 
 keyboard_consumer& KeyboardHandlerBase::AddConsumer(keyboard_consumer::identifier id, u32 max_connect)
 {
+	printf("[AddConsumer] this=%p, id=%d, max_connect=%u, m_consumers.size=%zu\n", this, static_cast<int>(id), max_connect, m_consumers.size());
 	auto it = m_consumers.find(id);
 	if (it == m_consumers.end())
 	{
@@ -74,10 +75,21 @@ keyboard_consumer& KeyboardHandlerBase::AddConsumer(keyboard_consumer::identifie
 
 keyboard_consumer& KeyboardHandlerBase::GetConsumer(keyboard_consumer::identifier id)
 {
+	printf("[GetConsumer] this=%p, id=%d, m_consumers.size=%zu\n", this, static_cast<int>(id), m_consumers.size());
 	auto it = m_consumers.find(id);
+	printf("[GetConsumer] find completed, found=%d\n", (it != m_consumers.end()) ? 1 : 0);
 	if (it == m_consumers.end())
 	{
+#ifdef __EMSCRIPTEN__
+		printf("[GetConsumer] Auto-adding missing consumer on Emscripten\n");
+		input_log.notice("Auto-adding missing keyboard consumer with id %s on Emscripten.", id);
+		keyboard_consumer& consumer = m_consumers[id];
+		consumer = keyboard_consumer(id);
+		Init(consumer, 7);
+		return consumer;
+#else
 		fmt::throw_exception("No keyboard consumer with id %s", id);
+#endif
 	}
 
 	return it->second;
@@ -97,7 +109,7 @@ bool KeyboardHandlerBase::HandleKey(u32 qt_code, u32 native_code, bool pressed, 
 {
 	bool consumed = false;
 
-	std::lock_guard<std::mutex> lock(m_mutex);
+	kb_locker lock(m_mutex);
 
 	for (auto& [id, consumer] : m_consumers)
 	{
@@ -276,7 +288,7 @@ u32 keyboard_consumer::get_out_key_code(u32 qt_code, u32 native_code, u32 out_ke
 
 void KeyboardHandlerBase::SetIntercepted(bool intercepted)
 {
-	std::lock_guard<std::mutex> lock(m_mutex);
+	kb_locker lock(m_mutex);
 
 	for (auto& [id, consumer] : m_consumers)
 	{
@@ -305,7 +317,7 @@ void keyboard_consumer::SetIntercepted(bool intercepted)
 
 void KeyboardHandlerBase::ReleaseAllKeys()
 {
-	std::lock_guard<std::mutex> lock(m_mutex);
+	kb_locker lock(m_mutex);
 
 	for (auto& [id, consumer] : m_consumers)
 	{

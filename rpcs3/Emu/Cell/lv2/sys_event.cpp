@@ -8,9 +8,14 @@
 #include "Emu/Cell/ErrorCodes.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/SPUThread.h"
+#include "Emu/Cell/timers.hpp"
 #include "sys_process.h"
 
 #include "util/asm.hpp"
+
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+extern "C" double emscripten_get_now();
+#endif
 
 LOG_CHANNEL(sys_event);
 
@@ -797,7 +802,7 @@ error_code sys_event_port_send(u32 eport_id, u64 data1, u64 data2, u64 data3)
 
 	sys_event.trace("sys_event_port_send(eport_id=0x%x, data1=0x%llx, data2=0x%llx, data3=0x%llx)", eport_id, data1, data2, data3);
 #ifdef __EMSCRIPTEN__
-	if (!(data1 == 0ull && data2 == 0x6ull)) printf("[EPSEND] port=0x%x data1=0x%llx data2=0x%llx tid=0x%x\n", static_cast<unsigned>(eport_id), static_cast<unsigned long long>(data1), static_cast<unsigned long long>(data2), ppu ? static_cast<unsigned>(ppu->id) : 0u);
+	const u32 s_epsend_tid = ppu ? static_cast<unsigned>(ppu->id) : 0u;
 #endif
 
 	bool notified_thread = false;
@@ -814,7 +819,18 @@ error_code sys_event_port_send(u32 eport_id, u64 data1, u64 data2, u64 data3)
 		if (lv2_obj::check(port.queue))
 		{
 			const u64 source = port.name ? port.name : (u64{process_getpid() + 0u} << 32) | u64{eport_id};
-
+#ifdef __EMSCRIPTEN__
+			if (data1 == 0ull && data2 == 0x6ull && s_epsend_tid == 0u)
+			{
+				// vblank flood (RSX thread, non-PPU) — suppress, heartbeat every 4096 (queue id varies per boot)
+				static thread_local u64 s_vbl = 0;
+				if ((++s_vbl & 0xFFFu) == 0u) printf("[EPSEND] vblank-flood ->q=0x%x x4096 (cum=%llu) gst=%llu enow_ms=%.1f\n", static_cast<unsigned>(port.queue->id), static_cast<unsigned long long>(s_vbl), static_cast<unsigned long long>(get_system_time()), emscripten_get_now());
+			}
+			else
+			{
+				printf("[EPSEND] port=0x%x ->q=0x%x data1=0x%llx data2=0x%llx tid=0x%x\n", static_cast<unsigned>(eport_id), static_cast<unsigned>(port.queue->id), static_cast<unsigned long long>(data1), static_cast<unsigned long long>(data2), s_epsend_tid);
+			}
+#endif
 			return port.queue->send(source, data1, data2, data3, &notified_thread, ppu && port.queue->type == SYS_PPU_QUEUE ? &port : nullptr);
 		}
 

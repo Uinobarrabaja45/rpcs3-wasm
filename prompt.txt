@@ -2,3 +2,14 @@ let's revise a bit
 
 where are we now?
 are how close / how many iter / phase until first/playable framerate of Terraria on WebGPU emu on browser ?
+
+
+
+
+./plan-poc-ps3-webgpu.md
+./PLAN-first-frame.md
+
+I've let the other Ai work on this for a big while.
+But still I cant see the first frame (505 splash) on the WebGPU canvas.
+
+You think you can do that ?

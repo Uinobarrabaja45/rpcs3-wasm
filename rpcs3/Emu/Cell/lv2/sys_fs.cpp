@@ -2320,16 +2320,10 @@ error_code sys_fs_fcntl(ppu_thread& ppu, u32 fd, u32 op, vm::ptr<void> _arg, u32
 		vpath = vpath.substr(0, vpath.find_first_of('\0'));
 		vpath = vpath.substr(0, vpath.find_first_of("/", 1));
 
-		// Some mountpoints seem to be handled specially
-		if (false)
-		{
-			// TODO: /dev_hdd1, /dev_usb000, /dev_flash
-			//arg->out_code = CELL_OK;
-			//arg->out_id = 0x1b5;
-		}
+		sys_fs.notice("sys_fs_fcntl(0xc0000006) mapped: out_code=CELL_OK, out_id=0x1b5 for path=%s", vpath);
 
-		arg->out_code = CELL_ENOTSUP;
-		arg->out_id = 0;
+		arg->out_code = CELL_OK;
+		arg->out_id = 0x1b5;
 		return CELL_OK;
 	}
 

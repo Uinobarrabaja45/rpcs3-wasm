@@ -1273,12 +1273,18 @@ extern void ppu_execute_syscall(ppu_thread& ppu, u64 code)
 #endif
 #ifdef __EMSCRIPTEN__
 			static thread_local unsigned long long s_semw = 0; static thread_local unsigned s_er3 = 0; static thread_local unsigned s_elr = 0;
+			// MAINLATCH: store main's syscall code/lr while it is INSIDE the syscall (set on enter, cleared on exit).
+			// While main is parked, other threads' syscalls re-print it as [MAINLAST] -> defeats oldest-first console reads.
+			static std::atomic<unsigned> s_main_code{0xFFFFFFFFu}; static std::atomic<unsigned> s_main_lr{0}; static std::atomic<unsigned> s_main_r3{0};
 			const bool sclog = (((ppu.id & 0xFF000000u) == 0x01000000u) && (code == 44u || code == 47u || code == 85u || code == 102u || (code == 122u && static_cast<unsigned>(ppu.lr) != 0x40d1d0u) || code == 125u || (code == 97u && static_cast<unsigned>(ppu.lr) != 0xbe5bacu) || code == 107u || (code == 130u && static_cast<unsigned>(ppu.lr) != 0xc38600u) || (code == 92u && (++s_semw & 0xFFFu) == 0u))) || (code == 94u && static_cast<unsigned>(ppu.gpr[3]) == 0x96006800u) || (ppu.id == 0x1000000u); // ALL main(0x1000000) syscalls logged -> find main's real block (it never reaches the 0x27700 poll); sem_wait(92) throttled 1/4096; + log EVERY sem_post(94) to the loader's sem 0x96006800 (the producer) from ANY thread -> who feeds it + when it stops
 			if (sclog) { s_er3 = static_cast<unsigned>(ppu.gpr[3]); s_elr = static_cast<unsigned>(ppu.lr); printf("[SCALL] ENTER code=%llu tid=0x%x lr=0x%x r3=0x%x r4=0x%x r5=0x%x\n", static_cast<unsigned long long>(code), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.gpr[3]), static_cast<unsigned>(ppu.gpr[4]), static_cast<unsigned>(ppu.gpr[5])); }
+			if (ppu.id == 0x1000000u) { s_main_code.store(static_cast<unsigned>(code)); s_main_lr.store(static_cast<unsigned>(ppu.lr)); s_main_r3.store(static_cast<unsigned>(ppu.gpr[3])); }
+			else { static thread_local unsigned s_mlc = 0; if ((++s_mlc & 0x1FFu) == 0u) { const unsigned mc = s_main_code.load(); extern atomic_t<u32> g_main_cia_latch; if (mc != 0xFFFFFFFFu) printf("[MAINLAST] main in syscall code=%u lr=0x%x r3=0x%x\n", mc, s_main_lr.load(), s_main_r3.load()); else printf("[MAINLAST] main NOT in syscall; last interp cia=0x%x\n", static_cast<unsigned>(g_main_cia_latch.load())); } }
 #endif
 			func(ppu, {}, vm::_ptr<u32>(ppu.cia), nullptr);
 #ifdef __EMSCRIPTEN__
 			if (sclog) printf("[SCALL] EXIT  code=%llu tid=0x%x q=0x%x lr=0x%x r3=0x%x\n", static_cast<unsigned long long>(code), static_cast<unsigned>(ppu.id), s_er3, s_elr, static_cast<unsigned>(ppu.gpr[3]));
+			if (ppu.id == 0x1000000u) { s_main_code.store(0xFFFFFFFFu); }
 #endif
 			ppu_log.trace("Syscall '%s' (%llu) finished, r3=0x%llx", ppu_syscall_code(code), code, ppu.gpr[3]);
 

@@ -244,14 +244,25 @@ error_code sys_semaphore_wait(ppu_thread& ppu, u32 sem_id, u64 timeout)
 		else
 		{
 #ifdef __EMSCRIPTEN__
-			// wasm pthread model: awake_all() from sys_semaphore_post does not reliably wake
-			// a parked waiter (lost wakeup). This deadlocks the producer-consumer resource
-			// handoff: main (0x1000000) posts the loader's work-sem 0x96006700 repeatedly
-			// (lr=0x4217dc) but the loader, parked here in an infinite ppu.state.wait(), never
-			// resumes — so it stops processing resources and main eventually parks too. Use a
-			// bounded timed park so the waiter re-checks the sem value (the outer while-loop)
-			// every ~15ms and catches the post even when the wake notification was lost.
 			ppu.state.wait(state, atomic_wait_timeout{15'000'000});
+			// Check if we have been unqueued (meaning we were signaled)
+			{
+				std::lock_guard lock(sem->mutex);
+				bool queued = false;
+				for (auto cpu = +sem->sq; cpu; cpu = cpu->next_cpu)
+				{
+					if (cpu == &ppu)
+					{
+						queued = true;
+						break;
+					}
+				}
+				if (!queued)
+				{
+					ppu.gpr[3] = CELL_OK;
+					break;
+				}
+			}
 			{ static thread_local u32 s_smf = 0; if ((ppu.id == 0x1000000u || ppu.id == 0x1000006u) && ++s_smf > 600u) { s_smf = 0; printf("[WAITFORCE] sem force tid=0x%x id=0x%x (re-check queue)\n", static_cast<unsigned>(ppu.id), static_cast<unsigned>(sem_id)); ppu.gpr[3] = CELL_OK; break; } }
 #else
 			ppu.state.wait(state);
@@ -292,7 +303,10 @@ error_code sys_semaphore_post(ppu_thread& ppu, u32 sem_id, s32 count)
 
 	sys_semaphore.trace("sys_semaphore_post(sem_id=0x%x, count=%d)", sem_id, count);
 #ifdef __EMSCRIPTEN__
-	if (sem_id == 0x96006800u || sem_id == 0x96004400u || sem_id == 0x96006700u) printf("[SEMPOST] sem=0x%x cnt=%d tid=0x%x lr=0x%x cia=0x%x\n", static_cast<unsigned>(sem_id), static_cast<int>(count), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.cia));
+	// Log every post to the game's semaphore pool (0x9600xxxx) EXCEPT the noisy
+	// work-queue 0x96006800, so we can see who (if anyone) posts main's completion
+	// sem 0x96004600 and the audio sem 0x96004100 — the two ends of the boot wall.
+	if (sem_id != 0x96006800u && (sem_id & 0xFFFF0000u) == 0x96000000u) printf("[SEMPOST] sem=0x%x cnt=%d tid=0x%x lr=0x%x cia=0x%x\n", static_cast<unsigned>(sem_id), static_cast<int>(count), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.cia));
 #endif
 
 	const auto sem = idm::get<lv2_obj, lv2_sema>(sem_id, [&](lv2_sema& sema)

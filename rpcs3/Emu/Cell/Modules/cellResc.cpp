@@ -1,6 +1,9 @@
 #include "stdafx.h"
 #include "Emu/IdManager.h"
 #include "Emu/Cell/PPUModule.h"
+#include "Emu/Cell/PPUThread.h"
+#include "Emu/RSX/RSXThread.h"
+#include "cellGcmSys.h"
 
 #include "Emu/RSX/GCM.h"
 #include "Emu/RSX/gcm_enums.h"
@@ -113,6 +116,20 @@ error_code cellRescSetDisplayMode(u32 bufferMode)
 	{
 		return CELL_RESC_ERROR_NOT_INITIALIZED;
 	}
+
+#ifdef __EMSCRIPTEN__
+	// wasm: Terraria reaches resc setup with an incomplete config during the
+	// (still-stalling) boot, so bufferMode arrives 0/unsupported -> BAD_ARGUMENT.
+	// That breaks the display-buffer chain and leaves the WebGPU blitter with no
+	// framebuffer (fb=0x0, flip=0). Coerce an invalid mode to a sane default
+	// (1280x720) and make the support mask cover it so ConvertAndFlip can proceed.
+	if (!bufferMode || bufferMode > CELL_RESC_1920x1080)
+	{
+		printf("[RESC] SetDisplayMode coerce bufferMode %u -> 1280x720 (wasm)\n", static_cast<unsigned>(bufferMode));
+		bufferMode = CELL_RESC_1280x720;
+	}
+	resc_manager.config.support_modes |= bufferMode;
+#endif
 
 	if (!bufferMode || bufferMode > CELL_RESC_1920x1080 || !(resc_manager.config.support_modes & bufferMode)) // TODO: is the bufferMode check correct?
 	{
@@ -245,7 +262,7 @@ s32 cellRescGetNumColorBuffers(u32 dstMode, u32 palTemporalMode, s32 reserved)
 	return 2;
 }
 
-error_code cellRescGcmSurface2RescSrc(vm::cptr<CellGcmSurface> gcmSurface, vm::cptr<CellRescSrc> rescSrc)
+error_code cellRescGcmSurface2RescSrc(vm::cptr<CellGcmSurface> gcmSurface, vm::ptr<CellRescSrc> rescSrc)
 {
 	cellResc.todo("cellRescGcmSurface2RescSrc(gcmSurface=*0x%x, rescSrc=*0x%x)", gcmSurface, rescSrc);
 
@@ -253,6 +270,44 @@ error_code cellRescGcmSurface2RescSrc(vm::cptr<CellGcmSurface> gcmSurface, vm::c
 	{
 		return CELL_RESC_ERROR_BAD_ARGUMENT;
 	}
+
+	// Real libresc converts the GCM color-surface descriptor into a RESC source
+	// descriptor. The old stub returned CELL_OK WITHOUT writing rescSrc, so the
+	// caller's rescSrc stayed zero-filled and the following cellRescSetSrc rejected
+	// it (width/height == 0 -> CELL_RESC_ERROR_BAD_ARGUMENT). That broke the entire
+	// present path: no display buffer was ever published to WebGPUGSRender::flip(),
+	// so the canvas never showed a real frame. Map color-buffer A (index 0) -> src.
+	u32 bytes_per_pixel;
+	u32 resc_format;
+	switch (gcmSurface->colorFormat)
+	{
+	case CELL_GCM_SURFACE_F_W16Z16Y16X16:
+		resc_format = CELL_RESC_SURFACE_F_W16Z16Y16X16;
+		bytes_per_pixel = 8;
+		break;
+	case CELL_GCM_SURFACE_A8R8G8B8:
+	default:
+		resc_format = CELL_RESC_SURFACE_A8R8G8B8;
+		bytes_per_pixel = 4;
+		break;
+	}
+
+	const u16 w = gcmSurface->width;
+	const u16 h = gcmSurface->height;
+	const u32 pitch = gcmSurface->colorPitch[0] ? +gcmSurface->colorPitch[0] : u32{w} * bytes_per_pixel;
+
+	rescSrc->format = resc_format;
+	rescSrc->pitch  = pitch;
+	rescSrc->width  = w;
+	rescSrc->height = h;
+	rescSrc->offset = gcmSurface->colorOffset[0];
+
+#ifdef __EMSCRIPTEN__
+	printf("[RESC] GcmSurface2RescSrc colorFormat=%u %ux%u pitch=%u offset=0x%x loc=%u -> rescSrc fmt=%u\n",
+		static_cast<unsigned>(gcmSurface->colorFormat), static_cast<unsigned>(w), static_cast<unsigned>(h),
+		static_cast<unsigned>(pitch), static_cast<unsigned>(+gcmSurface->colorOffset[0]),
+		static_cast<unsigned>(gcmSurface->colorLocation[0]), static_cast<unsigned>(resc_format));
+#endif
 
 	return CELL_OK;
 }
@@ -270,13 +325,44 @@ error_code cellRescSetSrc(s32 idx, vm::cptr<CellRescSrc> src)
 
 	if (idx >= SRC_BUFFER_NUM || !src || !src->width || !src->height || src->height > 4096) // TODO: is this correct?
 	{
+#ifdef __EMSCRIPTEN__
+		printf("[RESC] cellRescSetSrc REJECT idx=%d src=0x%x w=%u h=%u pitch=%u off=0x%x\n",
+			idx, src.addr(),
+			src ? static_cast<unsigned>(src->width) : 0u, src ? static_cast<unsigned>(src->height) : 0u,
+			src ? static_cast<unsigned>(src->pitch) : 0u, src ? static_cast<unsigned>(src->offset) : 0u);
+#endif
 		return CELL_RESC_ERROR_BAD_ARGUMENT;
 	}
+
+	const auto render = rsx::get_current_renderer();
+	auto& gcm_cfg = g_fxo->get<gcm_config>();
+	
+	render->display_buffers[idx].offset = src->offset;
+	render->display_buffers[idx].pitch = src->pitch;
+	render->display_buffers[idx].width = src->width;
+	render->display_buffers[idx].height = src->height;
+
+	gcm_cfg.gcm_buffers[idx].offset = src->offset;
+	gcm_cfg.gcm_buffers[idx].pitch = src->pitch;
+	gcm_cfg.gcm_buffers[idx].width = src->width;
+	gcm_cfg.gcm_buffers[idx].height = src->height;
+
+	if (idx + 1u > render->display_buffers_count)
+	{
+		render->display_buffers_count = idx + 1;
+	}
+
+#ifdef __EMSCRIPTEN__
+	printf("[RESC] cellRescSetSrc idx=%d offset=0x%x pitch=%u %ux%u count=%u\n",
+		idx, static_cast<unsigned>(src->offset), static_cast<unsigned>(src->pitch),
+		static_cast<unsigned>(src->width), static_cast<unsigned>(src->height),
+		render->display_buffers_count);
+#endif
 
 	return CELL_OK;
 }
 
-error_code cellRescSetConvertAndFlip(vm::ptr<CellGcmContextData> con, s32 idx)
+error_code cellRescSetConvertAndFlip(ppu_thread& ppu, vm::ptr<CellGcmContextData> con, s32 idx)
 {
 	cellResc.todo("cellRescSetConvertAndFlip(con=*0x%x, idx=0x%x)", con, idx);
 
@@ -290,6 +376,29 @@ error_code cellRescSetConvertAndFlip(vm::ptr<CellGcmContextData> con, s32 idx)
 	if (idx >= SRC_BUFFER_NUM)
 	{
 		return CELL_RESC_ERROR_BAD_ARGUMENT;
+	}
+
+#ifdef __EMSCRIPTEN__
+	printf("[RESC] cellRescSetConvertAndFlip idx=%d\n", idx);
+#endif
+
+	if (con->current + 2 >= con->end)
+	{
+		if (s32 res = con->callback(ppu, con, 8))
+		{
+			cellResc.error("cellRescSetConvertAndFlip: callback failed (0x%08x)", res);
+			return not_an_error(res);
+		}
+	}
+
+	const u32 cmd_size = 8;
+	*con->current++ = GCM_FLIP_COMMAND << 2 | 1u << 18;
+	*con->current++ = static_cast<u32>(idx);
+
+	auto& gcm_cfg = g_fxo->get<gcm_config>();
+	if (con.addr() == gcm_cfg.gcm_info.context_addr)
+	{
+		vm::_ptr<CellGcmControl>(gcm_cfg.gcm_info.control_addr)->put += cmd_size;
 	}
 
 	return CELL_OK;
@@ -329,18 +438,25 @@ error_code cellRescSetBufferAddress(vm::cptr<u32> colorBuffers, vm::cptr<u32> ve
 void cellRescSetFlipHandler(vm::ptr<void(u32)> handler)
 {
 	cellResc.todo("cellRescSetFlipHandler(handler=*0x%x)", handler);
+	if (const auto rsx = rsx::get_current_renderer(); rsx->is_initialized)
+	{
+		rsx->flip_handler = handler;
+	}
 }
 
 void cellRescResetFlipStatus()
 {
 	cellResc.todo("cellRescResetFlipStatus()");
+	if (const auto rsx = rsx::get_current_renderer(); rsx->is_initialized)
+	{
+		rsx->flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_WAITING;
+	}
 }
 
 s32 cellRescGetFlipStatus()
 {
 	cellResc.todo("cellRescGetFlipStatus()");
-
-	return 0;
+	return rsx::get_current_renderer()->flip_status;
 }
 
 s32 cellRescGetRegisterCount()
@@ -352,8 +468,7 @@ s32 cellRescGetRegisterCount()
 u64 cellRescGetLastFlipTime()
 {
 	cellResc.todo("cellRescGetLastFlipTime()");
-
-	return 0;
+	return rsx::get_current_renderer()->last_guest_flip_timestamp;
 }
 
 void cellRescSetRegisterCount(s32 regCount)
@@ -364,6 +479,10 @@ void cellRescSetRegisterCount(s32 regCount)
 void cellRescSetVBlankHandler(vm::ptr<void(u32)> handler)
 {
 	cellResc.todo("cellRescSetVBlankHandler(handler=*0x%x)", handler);
+	if (const auto rsx = rsx::get_current_renderer(); rsx->is_initialized)
+	{
+		rsx->vblank_handler = handler;
+	}
 }
 
 error_code cellRescCreateInterlaceTable(vm::ptr<void> ea_addr, f32 srcH, CellRescTableElement depth, s32 length)

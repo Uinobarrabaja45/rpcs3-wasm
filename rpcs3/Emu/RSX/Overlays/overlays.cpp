@@ -182,7 +182,7 @@ namespace rsx
 				if (m_keyboard_input_enabled && !m_keyboard_pad_handler_active && input::g_keyboards_intercepted)
 				{
 					auto& kb_handler = g_fxo->get<KeyboardHandlerBase>();
-					std::lock_guard<std::mutex> lock(kb_handler.m_mutex);
+					kb_locker lock(kb_handler.m_mutex);
 
 					// Add and get consumer
 					keyboard_consumer& kb_consumer = kb_handler.AddConsumer(keyboard_consumer::identifier::overlays, 1);
@@ -465,7 +465,7 @@ namespace rsx
 			// Remove keyboard consumer. We don't need it anymore.
 			{
 				auto& kb_handler = g_fxo->get<KeyboardHandlerBase>();
-				std::lock_guard<std::mutex> lock(kb_handler.m_mutex);
+				kb_locker lock(kb_handler.m_mutex);
 				kb_handler.RemoveConsumer(keyboard_consumer::identifier::overlays);
 			}
 

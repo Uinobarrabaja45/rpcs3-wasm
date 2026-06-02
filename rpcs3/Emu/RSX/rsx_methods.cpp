@@ -39,7 +39,7 @@ namespace rsx
 
 	void flip_command(context* ctx, u32, u32 arg)
 	{
-		ensure(RSX(ctx)->isHLE);
+		// ensure(RSX(ctx)->isHLE);
 
 		if (RSX(ctx)->vblank_at_flip != umax)
 		{

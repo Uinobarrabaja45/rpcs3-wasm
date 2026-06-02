@@ -165,6 +165,7 @@ extern const ppu_decoder<ppu_iname> g_ppu_iname{};
 atomic_t<u32> g_eboot_toc = 0;
 atomic_t<u32> g_eboot_code_beg = 0;
 atomic_t<u32> g_eboot_code_end = 0;
+atomic_t<u32> g_main_cia_latch = 0; // last interpreter cia executed by main(0x1000000); frozen value = where main's interpreter is parked (e.g. an HLE call site)
 #endif
 
 template <>
@@ -2530,6 +2531,63 @@ void ppu_thread::exec_task()
 				}
 				if (this->id == 0x1000000u)   // DIAG ON: RESSCAN +/-8000 scan + BLKDUMP + MAINCIA (resource-registration wall test)
 		{
+			g_main_cia_latch = static_cast<u32>(cia); // latch main's live interpreter PC; frozen => where main is parked (read via [MAINLAST] from another thread)
+			// MAINFREEZE: main's interpreter parks at 0x9c6f74. Dump the instruction + regs + lr + ctr
+			// to decode whether it's a branch-to-self spin, an HLE call (bl), or a load-test loop.
+			// MAINFREEZE (dump-only, NO unblock): main bctrl's through an UNRESOLVED import
+			// descriptor (entry=desc+4, toc=0) at 0x9c6f74. blr-emulating it just cascades
+			// into more null-fn calls (the whole import table of the 0x9c0000 module is
+			// unpopulated) — so leave main frozen here and fix the missing library instead.
+			// Log EVERY distinct HLE code-addr main calls in the wedge region (0x9c6800-0x9c7000),
+			// with its function name+ptr. main enters the wedged HLE fn once and blocks inside it
+			// (no re-loop), so fire on first hit per distinct addr. The wedge = the last one before silence.
+			if (cia >= 0x9c6f40u && cia <= 0x9c6fffu && (cia & 7u) == 4u)
+			{
+				static thread_local u32 s_seen[8] = {0,0,0,0,0,0,0,0}; static thread_local u32 s_n = 0;
+				bool dup = false; for (u32 i = 0; i < s_n && i < 8; i++) if (s_seen[i] == static_cast<u32>(cia)) dup = true;
+				if (!dup && s_n < 8)
+				{
+					s_seen[s_n++] = static_cast<u32>(cia);
+					extern std::vector<std::string> g_ppu_function_names;
+					const u32 hb = g_fxo->get<ppu_function_manager>().addr;
+					const u32 idx = (static_cast<u32>(cia) - hb) / 8;
+					const auto& fns = ppu_function_manager::get();
+					const void* fp = (idx < fns.size()) ? reinterpret_cast<const void*>(fns[idx]) : nullptr;
+					const char* nm = (idx < g_ppu_function_names.size() && !g_ppu_function_names[idx].empty()) ? g_ppu_function_names[idx].c_str() : "<noname>";
+					printf("[MAINFREEZE] HLE-call cia=0x%x lr=0x%x idx=%u name='%s' fnptr=%p fncount=%u\n",
+						static_cast<u32>(cia), static_cast<u32>(lr), idx, nm, fp, static_cast<unsigned>(fns.size()));
+					if (lr >= 0x10000 && lr < 0x588ce8)
+					{
+						const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+						u32 start_p = (static_cast<u32>(lr) - 0x50u) & ~3u;
+						printf("[MAINFREEZE-LR] code around lr=0x%x start=0x%x:\n", static_cast<u32>(lr), start_p);
+						for (u32 i = 0; i < 11; i++)
+						{
+							u32 p = start_p + i * 16;
+							printf("  [LR-DIS] @0x%x: %08x %08x %08x %08x\n", p, rdm(p), rdm(p+4), rdm(p+8), rdm(p+0xc));
+						}
+					}
+				}
+			}
+			// HANDSHAKE-LOOP dump: main loops sem_post(0x96006700)@0x4217dc <-> sem_wait@0x426460
+			// + cellKbGetInfo, never exiting to the flip. Dump the loop body + regs once to find the
+			// exit branch / loop counter so main can be forced to the present phase next.
+			if (cia == 0x4217dcu)
+			{
+				static thread_local bool s_hd = false;
+				if (!s_hd)
+				{
+					s_hd = true;
+					const auto rd = [mem_](u32 a){ return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+					// The post-fn (0x4217bc) saved its caller's return LR at [r1+0x90]; that's main's
+					// top loop. Dump code around it to find the loop's exit branch / poll condition.
+					const u32 caller = rd(static_cast<u32>(gpr[1]) + 0x90u);
+					printf("[HANDSHAKE] @0x4217dc caller=0x%x r1=0x%x r29=0x%x r30=0x%x r31=0x%x | caller code@0x%x:",
+						caller, static_cast<u32>(gpr[1]), static_cast<u32>(gpr[29]), static_cast<u32>(gpr[30]), static_cast<u32>(gpr[31]), caller - 0x60u);
+					for (u32 a = (caller - 0x60u) & ~3u; a <= caller + 0x30u; a += 4) printf(" %08x", rd(a));
+					printf("\n");
+				}
+			}
 			// One-shot: dump main's block region so we can decode what it waits on
 			// (SPURS wait? thread join? poll loop?). cia clusters ~0x27788 (lr 0x27638)
 			// just before main goes silent.
@@ -2542,6 +2600,10 @@ void ppu_thread::exec_task()
 			// = halfword @[r31+0x6c]) we can identify and hand-register as a fallback.
 			if (cia == 0x27700u)   /* POLLBYPASS5 ON: real poll never produces 0x8xxxxx resources; fake-found needed to reach cellResc */
 			{
+				// (HANDREG reverted: forcing [entry+0x60] didn't advance main — the table is a
+				// LIVE/dynamic structure main+loader churn, and main waits for the loader to
+				// genuinely complete each resource, not just for the flag. Over-wide writes also
+				// corrupted adjacent memory. The real gate is the loader's per-resource decode.)
 				{ static thread_local u32 s_rcnt = 0; if ((s_rcnt++ & 0x3Fu) == 0u) { const u32 curx = static_cast<u32>(gpr[29]); const auto rdhx = [mem_](u32 a){ return reinterpret_cast<be_t<u16>*>(mem_ + u64{a})->value(); }; u32 regx = 0; for (s32 k = -300; k <= 300; k++) { const s64 e = static_cast<s64>(curx) + static_cast<s64>(k) * 0x68c; if (e < 0x10000 || e + 0x62 >= 0x5ff00000) continue; if (rdhx(static_cast<u32>(e) + 0x60) != 0xffff) regx++; } printf("[REGCOUNT] cur=0x%x reg=%u/601\n", static_cast<unsigned>(curx), static_cast<unsigned>(regx)); } }
 				// POLLBYPASS5: redirect stuck-id searches to the found-handler 0x2766c. This is
 				// the INNER per-instruction loop — unlike the outer-loop cia=lr bypasses, it
@@ -3442,7 +3504,7 @@ if (cia == 0x1a57acu) [[unlikely]]
 				const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
 				printf("[MAIN-RET] 0x409a90 -> r3=0x%llx ; main disasm 0x142144..0x142284:\n",
 					static_cast<unsigned long long>(gpr[3]));
-				for (u32 p = 0x142144; p < 0x142284; p += 0x10)
+				for (u32 p = 0x142144; p < 0x142400; p += 0x10)
 					printf("  [MAIN-DIS] @0x%x: %08x %08x %08x %08x\n", p, rdm(p), rdm(p + 4), rdm(p + 8), rdm(p + 0xc));
 			}
 			// DRIVE SUCCESS PATH (stackwalk50): main does `if ((r3 & 0xff) != 0) goto

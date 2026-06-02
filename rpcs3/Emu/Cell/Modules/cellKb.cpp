@@ -50,9 +50,14 @@ KeyboardHandlerBase::KeyboardHandlerBase(utils::serial* ar)
 	{
 		Emu.PostponeInitCode([this, max_connect]()
 		{
-			std::lock_guard<std::mutex> lock(m_mutex);
+			printf("[KBFIX] postponed init lambda start\n");
+			printf("[KBFIX] postponed init lambda locking m_mutex\n");
+			kb_locker lock(m_mutex);
+			printf("[KBFIX] postponed init lambda locked m_mutex, adding consumer max_connect=%u\n", max_connect);
 			AddConsumer(keyboard_consumer::identifier::cellKb, max_connect);
+			printf("[KBFIX] postponed init lambda initializing init_mutex\n");
 			auto lk = init.init();
+			printf("[KBFIX] postponed init lambda completed successfully\n");
 		});
 	}
 }
@@ -64,7 +69,7 @@ void KeyboardHandlerBase::save(utils::serial& ar)
 
 	if (inited)
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
+		kb_locker lock(m_mutex);
 
 		if (auto it = m_consumers.find(keyboard_consumer::identifier::cellKb); it != m_consumers.end())
 		{
@@ -94,7 +99,9 @@ error_code cellKbInit(ppu_thread& ppu, u32 max_connect)
 		// instead of CELL_KB_ERROR_ALREADY_INITIALIZED. (Resetting init_mutex aborts on
 		// wasm, so we do NOT reset — just proceed as native's success would.)
 		printf("[KBFIX] cellKbInit already-init -> treat as success (match native)\n");
+		printf("[KBFIX] cellKbInit: calling sys_config_start\n");
 		sys_config_start(ppu);
+		printf("[KBFIX] cellKbInit already-init: returning CELL_OK directly without locking handler.m_mutex\n");
 		return CELL_OK;
 	}
 
@@ -107,7 +114,7 @@ error_code cellKbInit(ppu_thread& ppu, u32 max_connect)
 	printf("[KBFIX] cellKbInit fresh-init success -> sys_config_start\n");
 	sys_config_start(ppu);
 
-	std::lock_guard<std::mutex> lock(handler.m_mutex);
+	kb_locker lock(handler.m_mutex);
 	handler.AddConsumer(keyboard_consumer::identifier::cellKb, std::min(max_connect, 7u));
 
 	return CELL_OK;
@@ -125,7 +132,7 @@ error_code cellKbEnd(ppu_thread& ppu)
 		return CELL_KB_ERROR_UNINITIALIZED;
 
 	{
-		std::lock_guard<std::mutex> lock(handler.m_mutex);
+		kb_locker lock(handler.m_mutex);
 		handler.RemoveConsumer(keyboard_consumer::identifier::cellKb);
 	}
 
@@ -148,7 +155,7 @@ error_code cellKbClearBuf(u32 port_no)
 	if (port_no >= CELL_KB_MAX_KEYBOARDS)
 		return CELL_KB_ERROR_INVALID_PARAMETER;
 
-	std::lock_guard<std::mutex> lock(handler.m_mutex);
+	kb_locker lock(handler.m_mutex);
 
 	keyboard_consumer& consumer = handler.GetConsumer(keyboard_consumer::identifier::cellKb);
 	const KbInfo& current_info = consumer.GetInfo();
@@ -321,23 +328,35 @@ u16 cellKbCnvRawCode(u32 arrange, u32 mkey, u32 led, u16 rawcode)
 
 error_code cellKbGetInfo(vm::ptr<CellKbInfo> info)
 {
+	printf("[cellKbGetInfo] start info=0x%x\n", info.addr());
 	cellKb.trace("cellKbGetInfo(info=*0x%x)", info);
 
 	auto& handler = g_fxo->get<KeyboardHandlerBase>();
 
+	printf("[cellKbGetInfo] accessing handler.init\n");
 	const auto init = handler.init.access();
 
 	if (!init)
+	{
+		printf("[cellKbGetInfo] init is not initialized, returning CELL_KB_ERROR_UNINITIALIZED\n");
 		return CELL_KB_ERROR_UNINITIALIZED;
+	}
 
 	if (!info)
+	{
+		printf("[cellKbGetInfo] info is null, returning CELL_KB_ERROR_INVALID_PARAMETER\n");
 		return CELL_KB_ERROR_INVALID_PARAMETER;
+	}
 
+	printf("[cellKbGetInfo] mem-setting info buffer size=%u\n", info.size());
 	std::memset(info.get_ptr(), 0, info.size());
 
-	std::lock_guard<std::mutex> lock(handler.m_mutex);
+	printf("[cellKbGetInfo] locking handler.m_mutex\n");
+	kb_locker lock(handler.m_mutex);
+	printf("[cellKbGetInfo] locked handler.m_mutex, getting consumer\n");
 	keyboard_consumer& consumer = handler.GetConsumer(keyboard_consumer::identifier::cellKb);
 
+	printf("[cellKbGetInfo] consumer retrieved, copying state\n");
 	const KbInfo& current_info = consumer.GetInfo();
 	info->max_connect = current_info.max_connect;
 	info->now_connect = current_info.now_connect;
@@ -348,6 +367,7 @@ error_code cellKbGetInfo(vm::ptr<CellKbInfo> info)
 		info->status[i] = current_info.status[i];
 	}
 
+	printf("[cellKbGetInfo] returning CELL_OK\n");
 	return CELL_OK;
 }
 
@@ -365,7 +385,7 @@ error_code cellKbRead(u32 port_no, vm::ptr<CellKbData> data)
 	if (port_no >= CELL_KB_MAX_KEYBOARDS || !data)
 		return CELL_KB_ERROR_INVALID_PARAMETER;
 
-	std::lock_guard<std::mutex> lock(handler.m_mutex);
+	kb_locker lock(handler.m_mutex);
 	keyboard_consumer& consumer = handler.GetConsumer(keyboard_consumer::identifier::cellKb);
 	const KbInfo& current_info = consumer.GetInfo();
 
@@ -422,7 +442,7 @@ error_code cellKbSetCodeType(u32 port_no, u32 type)
 	if (port_no >= CELL_KB_MAX_KEYBOARDS || type > CELL_KB_CODETYPE_ASCII)
 		return CELL_KB_ERROR_INVALID_PARAMETER;
 
-	std::lock_guard<std::mutex> lock(handler.m_mutex);
+	kb_locker lock(handler.m_mutex);
 	keyboard_consumer& consumer = handler.GetConsumer(keyboard_consumer::identifier::cellKb);
 
 	if (port_no >= consumer.GetKeyboards().size())
@@ -453,7 +473,7 @@ error_code cellKbSetLEDStatus(u32 port_no, u8 led)
 	if (led > 7)
 		return CELL_KB_ERROR_SYS_SETTING_FAILED;
 
-	std::lock_guard<std::mutex> lock(handler.m_mutex);
+	kb_locker lock(handler.m_mutex);
 	keyboard_consumer& consumer = handler.GetConsumer(keyboard_consumer::identifier::cellKb);
 
 	if (port_no >= consumer.GetKeyboards().size() || consumer.GetInfo().status[port_no] != CELL_KB_STATUS_CONNECTED)
@@ -479,7 +499,7 @@ error_code cellKbSetReadMode(u32 port_no, u32 rmode)
 	if (port_no >= CELL_KB_MAX_KEYBOARDS || rmode > CELL_KB_RMODE_PACKET)
 		return CELL_KB_ERROR_INVALID_PARAMETER;
 
-	std::lock_guard<std::mutex> lock(handler.m_mutex);
+	kb_locker lock(handler.m_mutex);
 	keyboard_consumer& consumer = handler.GetConsumer(keyboard_consumer::identifier::cellKb);
 
 	if (port_no >= consumer.GetKeyboards().size())
@@ -511,7 +531,7 @@ error_code cellKbGetConfiguration(u32 port_no, vm::ptr<CellKbConfig> config)
 	if (port_no >= CELL_KB_MAX_KEYBOARDS)
 		return CELL_KB_ERROR_INVALID_PARAMETER;
 
-	std::lock_guard<std::mutex> lock(handler.m_mutex);
+	kb_locker lock(handler.m_mutex);
 
 	keyboard_consumer& consumer = handler.GetConsumer(keyboard_consumer::identifier::cellKb);
 

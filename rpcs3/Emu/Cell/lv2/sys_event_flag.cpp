@@ -261,6 +261,9 @@ error_code sys_event_flag_wait(ppu_thread& ppu, u32 id, u64 bitptn, u32 mode, vm
 		}
 		else
 		{
+			#if defined(__EMSCRIPTEN__)
+			{ static thread_local bool s_mp_evflag = false; if (ppu.id == 0x1000000u && !s_mp_evflag) { s_mp_evflag = true; printf("[MAINPARK] evflag cia=0x%x lr=0x%x\n", static_cast<unsigned>(ppu.cia), static_cast<unsigned>(ppu.lr)); } }
+			#endif
 			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}

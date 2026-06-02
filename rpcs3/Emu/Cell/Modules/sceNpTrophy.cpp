@@ -894,6 +894,18 @@ error_code sceNpTrophyGetRequiredDiskSpace(u32 context, u32 handle, vm::ptr<u64>
 
 	u64 space = 0;
 
+#ifdef __EMSCRIPTEN__
+	// wasm: sceNpTrophyRegisterContext short-circuits the actual install (skips
+	// TRPLoader::Install + TROPUSR creation), so the trophy dir never exists and
+	// the block below would report a non-zero required space forever. The game
+	// (Terraria) then loops the whole trophy-install sequence endlessly, blocking
+	// main_thread. Report 0 ("already installed / no space needed") to break the
+	// retry loop. Trophies don't affect rendering — this just unblocks the boot.
+	*reqspace = 0;
+	printf("[TROPHY] GetRequiredDiskSpace -> 0 (wasm: report installed, break trophy retry loop)\n");
+	return CELL_OK;
+#endif
+
 	if (!fs::is_dir(vfs::get("/dev_hdd0/home/" + Emu.GetUsr() + "/trophy/" + ctxt->trp_name)))
 	{
 		// open trophy pack file
