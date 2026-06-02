@@ -2,6 +2,7 @@
 #include "WebGPUGSRender.h"
 #include "Emu/Memory/vm.h"
 #include "Emu/RSX/gcm_enums.h"
+#include "Emu/RSX/rsx_methods.h"
 
 #include <atomic>
 #include <cstdio>
@@ -40,10 +41,77 @@ WebGPUGSRender::WebGPUGSRender(utils::serial* ar) noexcept : GSRender(ar)
 
 void WebGPUGSRender::end()
 {
+#ifdef __EMSCRIPTEN__
+	// Wall-B diagnostic (2026-06-02): is the game actually issuing scene draws?
+	// If end() fires with real vertex counts, the scene (incl. the 505 splash) IS being
+	// submitted to RSX and only this nop-draw backend is dropping it — i.e. a real
+	// RSX→WebGPU translator would surface it, and the boot deadlock (Wall A) is NOT what
+	// gates the first frame's pixels. If end() rarely/never fires, the game isn't drawing
+	// yet (gated by the deadlock). Log first draws + periodic, with the surface the draw
+	// targets (color offset A) so we know whether draws hit the displayed buffer.
+	{
+		static thread_local u64 s_draws = 0;
+		const u64 n = ++s_draws;
+		const auto& dc = rsx::method_registers.current_draw_clause;
+		// crash-safe: get_elements_count() asserts when draw_command_ranges is empty and the
+		// command isn't an inlined array — guard with empty().
+		const u32 verts = dc.empty() ? 0u : dc.get_elements_count();
+		// Log EVERY non-empty draw (real geometry — the scene/splash!) + a few empties + periodic.
+		if (verts > 0 || n <= 8 || (n % 2000) == 0)
+		{
+			printf("[WGPU-DRAW] #%llu prim=%u verts=%u empty=%d surfA_off=0x%x surf=%ux%u\n",
+				static_cast<unsigned long long>(n),
+				static_cast<unsigned>(dc.primitive),
+				static_cast<unsigned>(verts),
+				dc.empty() ? 1 : 0,
+				static_cast<unsigned>(rsx::method_registers.surface_offset(0)),
+				static_cast<unsigned>(rsx::method_registers.surface_clip_width()),
+				static_cast<unsigned>(rsx::method_registers.surface_clip_height()));
+		}
+	}
+#endif
 	// Same body as NullGSRender — no actual draw. Phase 7+ will replace
 	// this with WGSL pipeline dispatch translated from RSX FP/VP.
 	execute_nop_draw();
 	rsx::thread::end();
+}
+
+// Renderer step 1: honor color clears by writing the clear color straight into the guest VRAM
+// color surface, so the existing flip→blit presents it. The 3D draw path is still nop, but this
+// surfaces the game's real per-frame background/clear color instead of a permanent black frame —
+// and proves the RSX-state → VRAM → blit → canvas pipeline end-to-end.
+void WebGPUGSRender::clear_surface(u32 arg)
+{
+#ifdef __EMSCRIPTEN__
+	if ((arg & RSX_GCM_CLEAR_COLOR_RGBA_MASK) == 0)
+		return;
+
+	const u32 r = rsx::method_registers.clear_color_r();
+	const u32 g = rsx::method_registers.clear_color_g();
+	const u32 b = rsx::method_registers.clear_color_b();
+	const u32 a = rsx::method_registers.clear_color_a();
+	const u32 argb = (a << 24) | (r << 16) | (g << 8) | b; // A8R8G8B8, stored big-endian below
+
+	const u32 off   = rsx::method_registers.surface_offset(0);
+	const u32 pitch = rsx::method_registers.surface_pitch(0);
+	const u32 w     = rsx::method_registers.surface_clip_width();
+	const u32 h     = rsx::method_registers.surface_clip_height();
+	const u32 addr  = rsx::get_address(off, CELL_GCM_LOCATION_LOCAL);
+	if (!addr || !w || !h || !pitch)
+		return;
+
+	u8* const basep = static_cast<u8*>(vm::base(addr));
+	for (u32 y = 0; y < h; y++)
+	{
+		be_t<u32>* row = reinterpret_cast<be_t<u32>*>(basep + static_cast<u64>(y) * pitch);
+		for (u32 x = 0; x < w; x++)
+			row[x] = argb;
+	}
+
+	static thread_local u32 s_clr = 0;
+	if ((s_clr++ & 0x3Fu) == 0)
+		printf("[WGPU-CLEAR] argb=0x%08x %ux%u off=0x%x pitch=%u addr=0x%x\n", argb, w, h, off, pitch, addr);
+#endif
 }
 
 void WebGPUGSRender::flip(const rsx::display_flip_info_t& info)

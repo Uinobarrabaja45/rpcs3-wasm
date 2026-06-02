@@ -299,6 +299,18 @@ namespace rsx
 		 */
 		const draw_range_t& get_range() const
 		{
+#ifdef __EMSCRIPTEN__
+			// wasm: with main_thread now driving frames, the RESC/flip path occasionally submits a
+			// degenerate begin/end with no draw ranges. Upstream asserts here and kills the RSX
+			// thread (no more flips → render loop dead). Tolerate the empty draw by returning a
+			// zero range so it's treated as 0 vertices (skipped) and FIFO processing — including the
+			// GCM flip command — continues.
+			if (draw_command_ranges.empty() || current_range_index >= draw_command_ranges.size())
+			{
+				static const draw_range_t s_empty_range{};
+				return s_empty_range;
+			}
+#endif
 			ensure(current_range_index < draw_command_ranges.size());
 			return draw_command_ranges[current_range_index];
 		}

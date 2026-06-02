@@ -733,6 +733,56 @@ bool spursKernelEntry(spu_thread& spu)
 	return false;
 }
 
+#ifdef __EMSCRIPTEN__
+// wasm SPU interpreter has no HLE-function dispatch (spu.RegisterHleFunction is a defunct API),
+// so the SPURS kernel — which is pure HLE at magic LS addresses — never runs and the SPU just
+// stops at op=0. The kernel only ever executes at the entry (0x818/0x848) and the workload-exit
+// (0x808/0x838) addresses; everything else (select, dispatch) is reached via direct C++ calls
+// inside those, and the dispatched task runs as real SPU code (loaded at 0xA00). So: when a SPURS
+// kernel SPU thread's pc hits one of these magic addresses, run the C++ kernel function (which
+// sets spu.pc to the task / next exit) and tell the interpreter to continue at the new pc.
+// Returns true if the pc was a kernel HLE entry point and was handled.
+bool spurs_hle_dispatch(spu_thread& spu)
+{
+	switch (+spu.pc)
+	{
+	case CELL_SPURS_KERNEL1_ENTRY_ADDR:
+	case CELL_SPURS_KERNEL2_ENTRY_ADDR:
+		// Kernel boot/idle entry: init context + dispatch the system-service workload.
+		spursKernelEntry(spu);
+		return true;
+	case CELL_SPURS_KERNEL1_EXIT_ADDR:
+	case CELL_SPURS_KERNEL2_EXIT_ADDR:
+		// A workload returned to the kernel: pick + dispatch the next workload.
+		spursKernelWorkloadExit(spu);
+		return true;
+	case CELL_SPURS_TASKSET_PM_ENTRY_ADDR: // 0xA00 — dispatched-workload entry point
+	{
+		// Disambiguate which policy module the kernel just dispatched here. HLE'd modules
+		// (system service, taskset PM) have marker addresses; anything else is real SPU code
+		// the kernel memcpy'd to 0xA00 (run it normally).
+		const auto ctxt = spu._ptr<SpursKernelContext>(0x100);
+		switch (ctxt->wklCurrentAddr.addr())
+		{
+		case SPURS_IMG_ADDR_SYS_SRV_WORKLOAD:
+			spursSysServiceEntry(spu);
+			return true;
+		case SPURS_IMG_ADDR_TASKSET_PM:
+			spursTasksetEntry(spu); // loads + starts the actual task (real SPU code)
+			return true;
+		default:
+			return false;
+		}
+	}
+	case CELL_SPURS_TASKSET_PM_SYSCALL_ADDR: // 0xA70 — a running task issued a SPURS syscall
+		spursTasksetSyscallEntry(spu);
+		return true;
+	default:
+		return false;
+	}
+}
+#endif
+
 //----------------------------------------------------------------------------
 // SPURS system workload functions
 //----------------------------------------------------------------------------

@@ -138,6 +138,36 @@ error_code sys_semaphore_wait(ppu_thread& ppu, u32 sem_id, u64 timeout)
 
 	const auto sem = idm::get<lv2_obj, lv2_sema>(sem_id, [&, notify = lv2_obj::notify_all_t()](lv2_sema& sema)
 	{
+#ifdef __EMSCRIPTEN__
+		// REACHABILITY EXPERIMENT (2026-06-02): main (0x1000000) is stuck in a task-completion
+		// BARRIER loop (game code @0x411168) that calls sys_semaphore_wait(0x96004600) once per
+		// dispatched resource-decode task and exits only after N completions. Those completions
+		// never arrive (the SPU/SPURS decode pipeline doesn't run to completion in this wasm port),
+		// so main crawls forever (each wait relies on the 9s WAITFORCE timeout). Short-circuit
+		// ONLY main's waits on THIS barrier sem so main exits the barrier and runs its render code
+		// — to learn whether the 505 splash is then issued as draws (WGPU-DRAW) or whether main
+		// faults on unloaded resources. This is a probe of reachability, NOT a correctness fix.
+		if (ppu.id == 0x1000000u && sem_id == 0x96004600u)
+		{
+			// One-shot: dump the barrier struct so we know HOW MANY completions main waits for.
+			// game loop @0x411168: limit=*(r31+0x104), counter=*(r31+0x108), sem=*(r31+0x114).
+			static thread_local bool s_bd = false;
+			if (!s_bd)
+			{
+				s_bd = true;
+				const u32 r31 = static_cast<u32>(ppu.gpr[31]);
+				const auto rd = [](u32 a) -> u32 { return (a >= 0x10000u && a < 0x60000000u) ? reinterpret_cast<be_t<u32>*>(static_cast<u8*>(vm::base(a)))->value() : 0xBADBADu; };
+				printf("[BARRIER] r31=0x%x limit(+0x104)=%d counter(+0x108)=%d sem(+0x114)=0x%x r30=0x%x lr=0x%x\n",
+					r31, static_cast<int>(rd(r31 + 0x104)), static_cast<int>(rd(r31 + 0x108)), static_cast<unsigned>(rd(r31 + 0x114)), static_cast<unsigned>(ppu.gpr[30]), static_cast<unsigned>(ppu.lr));
+				// Dump the full barrier/work-descriptor struct so we can identify WHAT async op main
+				// dispatched (its function ptr / args) and therefore which thread should post idx6.
+				for (u32 o = 0; o <= 0x120u; o += 16)
+					printf("  [BARRIER+] @+0x%x: %08x %08x %08x %08x\n", o, rd(r31 + o), rd(r31 + o + 4), rd(r31 + o + 8), rd(r31 + o + 0xc));
+			}
+			// (barrier-skip DISABLED — let main wait on idx6 normally so we can verify the SPU
+			//  group-start fix makes the decode task post idx6 naturally; fall through to real wait.)
+		}
+#endif
 		const s32 val = sema.val;
 
 		if (val > 0)

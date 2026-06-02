@@ -1589,6 +1589,18 @@ void spu_thread::cpu_task()
 						break;
 				}
 
+#if defined(__EMSCRIPTEN__)
+				// SPURS kernel HLE dispatch: RegisterHleFunction is defunct and this static
+				// interpreter has no HLE-function table, so the SPURS kernel (pure HLE at magic
+				// LS addresses) never runs. Intercept the kernel entry/exit addresses and run the
+				// C++ kernel, which sets spu.pc to the dispatched task (real SPU code at 0xA00).
+				if (prog_spurs)
+				{
+					extern bool spurs_hle_dispatch(spu_thread& spu);
+					if (spurs_hle_dispatch(*this))
+						continue;
+				}
+#endif
 				const u32 op = *reinterpret_cast<const be_t<u32>*>(ls_base + pc);
 #if defined(__EMSCRIPTEN__)
 				if (prog_spurs && prog_n < (40u * 4096u) && (prog_n % 4096u) == 0)

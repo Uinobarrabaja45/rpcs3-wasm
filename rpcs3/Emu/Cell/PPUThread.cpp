@@ -2532,6 +2532,48 @@ void ppu_thread::exec_task()
 				if (this->id == 0x1000000u)   // DIAG ON: RESSCAN +/-8000 scan + BLKDUMP + MAINCIA (resource-registration wall test)
 		{
 			g_main_cia_latch = static_cast<u32>(cia); // latch main's live interpreter PC; frozen => where main is parked (read via [MAINLAST] from another thread)
+			// IDX6-DECODE (2026-06-02): one-shot raw disasm of main's frame-sync loop around the
+			// sys_semaphore_wait(0x96004600) at lr=0x411150. idx6 is NEVER posted; main livelocks
+			// (WAITFORCE limps it). Decode what main re-tests after the wait returns (a memory flag?
+			// a counter? the flip count?) + back-chain so we know what subsystem must post idx6.
+			if (cia >= 0x411040u && cia <= 0x4111f0u)
+			{
+				static thread_local bool s_d6 = false;
+				if (!s_d6)
+				{
+					s_d6 = true;
+					const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+					printf("[IDX6D] r1=0x%x r3=0x%x r4=0x%x r5=0x%x r6=0x%x r7=0x%x r24=0x%x r25=0x%x r26=0x%x r27=0x%x r28=0x%x r29=0x%x r30=0x%x r31=0x%x cia=0x%x lr=0x%x\n",
+						static_cast<u32>(gpr[1]),static_cast<u32>(gpr[3]),static_cast<u32>(gpr[4]),static_cast<u32>(gpr[5]),static_cast<u32>(gpr[6]),static_cast<u32>(gpr[7]),static_cast<u32>(gpr[24]),static_cast<u32>(gpr[25]),static_cast<u32>(gpr[26]),static_cast<u32>(gpr[27]),static_cast<u32>(gpr[28]),static_cast<u32>(gpr[29]),static_cast<u32>(gpr[30]),static_cast<u32>(gpr[31]),static_cast<u32>(cia),static_cast<u32>(lr));
+					for (u32 p = 0x410fa0u; p < 0x4111f0u; p += 16)
+						printf("  [IDX6D] @0x%x: %08x %08x %08x %08x\n", p, rdm(p), rdm(p+4), rdm(p+8), rdm(p+0xc));
+					// back-chain stack walk (PPC64 ELFv1: back ptr @[sp+4] low word, saved LR @[sp+20] low word, big-endian 8B slots)
+					u32 sp = static_cast<u32>(gpr[1]);
+					for (u32 f = 0; f < 10 && sp >= 0x10000u && sp < 0x40000000u; f++)
+					{
+						const u32 back = rdm(sp + 4);
+						const u32 slr = rdm(sp + 20);
+						printf("  [IDX6D-FR] #%u sp=0x%x savedLR=0x%x back=0x%x\n", f, sp, slr, back);
+						if (back <= sp) break;
+						sp = back;
+					}
+				}
+			}
+			// WAITLOOP-DECODE (2026-06-03): main is PAST idx6 but idles in a sys_timer_usleep(20ms) loop
+			// @lr=0x63c98, presenting EMPTY frames (scene draws have verts=0). Decode what flag it re-tests.
+			if (cia >= 0x63c40u && cia <= 0x63d00u)
+			{
+				static thread_local bool s_dw = false;
+				if (!s_dw)
+				{
+					s_dw = true;
+					const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+					printf("[WAITLOOP] r3=0x%x r4=0x%x r5=0x%x r6=0x%x r24=0x%x r25=0x%x r26=0x%x r27=0x%x r28=0x%x r29=0x%x r30=0x%x r31=0x%x cia=0x%x lr=0x%x\n",
+						static_cast<u32>(gpr[3]),static_cast<u32>(gpr[4]),static_cast<u32>(gpr[5]),static_cast<u32>(gpr[6]),static_cast<u32>(gpr[24]),static_cast<u32>(gpr[25]),static_cast<u32>(gpr[26]),static_cast<u32>(gpr[27]),static_cast<u32>(gpr[28]),static_cast<u32>(gpr[29]),static_cast<u32>(gpr[30]),static_cast<u32>(gpr[31]),static_cast<u32>(cia),static_cast<u32>(lr));
+					for (u32 p = 0x63bc0u; p < 0x63d00u; p += 16)
+						printf("  [WAITLOOP] @0x%x: %08x %08x %08x %08x\n", p, rdm(p), rdm(p+4), rdm(p+8), rdm(p+0xc));
+				}
+			}
 			// MAINFREEZE: main's interpreter parks at 0x9c6f74. Dump the instruction + regs + lr + ctr
 			// to decode whether it's a branch-to-self spin, an HLE call (bl), or a load-test loop.
 			// MAINFREEZE (dump-only, NO unblock): main bctrl's through an UNRESOLVED import

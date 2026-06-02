@@ -2801,6 +2801,29 @@ s32 cellSpursWakeUp(ppu_thread& ppu, vm::ptr<CellSpurs> spurs)
 		_spurs::signal_to_handler_thread(ppu, spurs);
 	}
 
+#ifdef __EMSCRIPTEN__
+	// ROOT-CAUSE FIX ATTEMPT (2026-06-03): the SPURS PPU handler (_spurs::create_handler) is
+	// commented out, so `_spurs::handler_entry`'s `sys_spu_thread_group_start(spuTG)` never runs
+	// → the SPU thread group is NEVER started → the SPU SPURS kernels never reach the interpreter
+	// (verified: [SPURUN]/[SPUPROG] never fire) → decode/audio SPU tasks never execute → their
+	// completion sems never post → main's boot barriers (sem_wait, limit=1 each) hang forever.
+	// Start the group directly when SPURS is woken (each group once). group_start alone unblocks
+	// the SPU threads (parked waiting for the stop-flag to clear) so the kernel runs the pending
+	// workload — no managing PPU thread needed just to get them executing.
+	{
+		const u32 tg = spurs->spuTG;
+		static thread_local u32 s_tg[8] = {}; static thread_local u32 s_tgn = 0;
+		bool seen = false;
+		for (u32 i = 0; i < s_tgn && i < 8; i++) if (s_tg[i] == tg) seen = true;
+		if (tg && !seen)
+		{
+			if (s_tgn < 8) s_tg[s_tgn++] = tg;
+			const s32 sr = sys_spu_thread_group_start(ppu, tg);
+			printf("[SPURSSTART] cellSpursWakeUp -> sys_spu_thread_group_start(spuTG=0x%x) = %d\n", static_cast<unsigned>(tg), static_cast<int>(sr));
+		}
+	}
+#endif
+
 	return CELL_OK;
 }
 

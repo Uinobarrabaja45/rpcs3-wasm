@@ -3,6 +3,7 @@
 #include "Emu/Cell/PPUModule.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/RSX/RSXThread.h"
+#include "Emu/Cell/lv2/sys_semaphore.h"
 #include "cellGcmSys.h"
 
 #include "Emu/RSX/GCM.h"
@@ -400,6 +401,22 @@ error_code cellRescSetConvertAndFlip(ppu_thread& ppu, vm::ptr<CellGcmContextData
 	{
 		vm::_ptr<CellGcmControl>(gcm_cfg.gcm_info.control_addr)->put += cmd_size;
 	}
+
+#ifdef __EMSCRIPTEN__
+	// FLIP-COMPLETE signalling. Both main_thread (blocks on sem 0x96004600) AND the EE RenderLoop
+	// (busy-polls a flip-done flag right after cellRescSetWaitFlip) wait for the flip to complete.
+	// On real HW the game's RESC flip handler — registered via cellRescSetFlipHandler — does that
+	// signalling when the flip interrupt fires. Here the flip is injected as a raw GCM_FLIP_COMMAND
+	// above, bypassing the flip-notification path, so the handler never runs and the frame loop
+	// stalls one frame in. Invoke the registered handler directly on this (RenderLoop) PPU thread so
+	// it performs its real work (posts main's idx6 sem AND sets the RenderLoop's flip-done flag),
+	// letting the whole frame loop sustain. Also hard-post idx6 as a belt-and-braces fallback.
+	if (const auto render = rsx::get_current_renderer(); render && render->flip_handler)
+	{
+		render->flip_handler(ppu, 0);
+	}
+	sys_semaphore_post(ppu, 0x96004600u, 1);
+#endif
 
 	return CELL_OK;
 }

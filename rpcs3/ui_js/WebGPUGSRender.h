@@ -37,6 +37,7 @@ public:
 private:
 	void end() override;
 	void flip(const rsx::display_flip_info_t& info) override;
+	void clear_surface(u32 arg) override;
 };
 
 // Visible to GSH_WebGPUJs / Main.cpp — read-only from the browser side.
