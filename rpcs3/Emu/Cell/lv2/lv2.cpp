@@ -1271,7 +1271,15 @@ extern void ppu_execute_syscall(ppu_thread& ppu, u64 code)
 #ifdef __APPLE__
 			pthread_jit_write_protect_np(false);
 #endif
+#ifdef __EMSCRIPTEN__
+			static thread_local unsigned long long s_semw = 0; static thread_local unsigned s_er3 = 0; static thread_local unsigned s_elr = 0;
+			const bool sclog = (((ppu.id & 0xFF000000u) == 0x01000000u) && (code == 44u || code == 47u || code == 85u || code == 102u || (code == 122u && static_cast<unsigned>(ppu.lr) != 0x40d1d0u) || code == 125u || (code == 97u && static_cast<unsigned>(ppu.lr) != 0xbe5bacu) || code == 107u || (code == 130u && static_cast<unsigned>(ppu.lr) != 0xc38600u) || (code == 92u && (++s_semw & 0xFFFu) == 0u))) || (code == 94u && static_cast<unsigned>(ppu.gpr[3]) == 0x96006800u) || (ppu.id == 0x1000000u); // ALL main(0x1000000) syscalls logged -> find main's real block (it never reaches the 0x27700 poll); sem_wait(92) throttled 1/4096; + log EVERY sem_post(94) to the loader's sem 0x96006800 (the producer) from ANY thread -> who feeds it + when it stops
+			if (sclog) { s_er3 = static_cast<unsigned>(ppu.gpr[3]); s_elr = static_cast<unsigned>(ppu.lr); printf("[SCALL] ENTER code=%llu tid=0x%x lr=0x%x r3=0x%x r4=0x%x r5=0x%x\n", static_cast<unsigned long long>(code), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.gpr[3]), static_cast<unsigned>(ppu.gpr[4]), static_cast<unsigned>(ppu.gpr[5])); }
+#endif
 			func(ppu, {}, vm::_ptr<u32>(ppu.cia), nullptr);
+#ifdef __EMSCRIPTEN__
+			if (sclog) printf("[SCALL] EXIT  code=%llu tid=0x%x q=0x%x lr=0x%x r3=0x%x\n", static_cast<unsigned long long>(code), static_cast<unsigned>(ppu.id), s_er3, s_elr, static_cast<unsigned>(ppu.gpr[3]));
+#endif
 			ppu_log.trace("Syscall '%s' (%llu) finished, r3=0x%llx", ppu_syscall_code(code), code, ppu.gpr[3]);
 
 #ifdef __APPLE__

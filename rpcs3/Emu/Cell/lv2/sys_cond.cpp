@@ -576,7 +576,7 @@ error_code sys_cond_wait(ppu_thread& ppu, u32 cond_id, u64 timeout)
 		}
 		else
 		{
-			ppu.state.wait(state);
+			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}
 

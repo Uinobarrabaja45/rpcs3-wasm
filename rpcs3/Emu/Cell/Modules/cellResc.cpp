@@ -105,6 +105,9 @@ error_code cellRescSetDisplayMode(u32 bufferMode)
 	cellResc.todo("cellRescSetDisplayMode(bufferMode=%d)", bufferMode);
 
 	auto& resc_manager = g_fxo->get<cell_resc_manager>();
+#ifdef __EMSCRIPTEN__
+	printf("[RESC] SetDisplayMode bufferMode=%u support=0x%x init=%d max1080=%u\n", bufferMode, static_cast<unsigned>(resc_manager.config.support_modes), static_cast<int>(resc_manager.is_initialized), static_cast<unsigned>(CELL_RESC_1920x1080));
+#endif
 
 	if (!resc_manager.is_initialized)
 	{

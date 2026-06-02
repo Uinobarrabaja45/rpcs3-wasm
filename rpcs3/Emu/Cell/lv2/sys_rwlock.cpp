@@ -108,6 +108,12 @@ error_code sys_rwlock_rlock(ppu_thread& ppu, u32 rw_lock_id, u64 timeout)
 	ppu.state += cpu_flag::wait;
 
 	sys_rwlock.trace("sys_rwlock_rlock(rw_lock_id=0x%x, timeout=0x%llx)", rw_lock_id, timeout);
+#ifdef __EMSCRIPTEN__
+	// Terraria's loader (EE ResourceLoop @0x40d1d0) busy-spins on rwlock id=0 -> ESRCH
+	// (the rwlock was never created / its id slot is 0 in our boot ordering). Treat
+	// id=0 as a no-op success so the loader stops spinning and proceeds.
+	if (rw_lock_id == 0u) { static thread_local u32 s_rw0 = 0; if ((s_rw0++ & 0xFFFu) == 0u) printf("[RWLOCK0] rlock id=0 lr=0x%x tid=0x%x\n", static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.id)); return CELL_OK; }
+#endif
 
 	const auto rwlock = idm::get<lv2_obj, lv2_rwlock>(rw_lock_id, [&, notify = lv2_obj::notify_all_t()](lv2_rwlock& rwlock)
 	{
@@ -224,7 +230,7 @@ error_code sys_rwlock_rlock(ppu_thread& ppu, u32 rw_lock_id, u64 timeout)
 		}
 		else
 		{
-			ppu.state.wait(state);
+			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}
 
@@ -271,6 +277,9 @@ error_code sys_rwlock_runlock(ppu_thread& ppu, u32 rw_lock_id)
 	ppu.state += cpu_flag::wait;
 
 	sys_rwlock.trace("sys_rwlock_runlock(rw_lock_id=0x%x)", rw_lock_id);
+#ifdef __EMSCRIPTEN__
+	if (rw_lock_id == 0u) return CELL_OK;
+#endif
 
 	const auto rwlock = idm::get<lv2_obj, lv2_rwlock>(rw_lock_id, [](lv2_rwlock& rwlock)
 	{
@@ -347,6 +356,9 @@ error_code sys_rwlock_wlock(ppu_thread& ppu, u32 rw_lock_id, u64 timeout)
 	ppu.state += cpu_flag::wait;
 
 	sys_rwlock.trace("sys_rwlock_wlock(rw_lock_id=0x%x, timeout=0x%llx)", rw_lock_id, timeout);
+#ifdef __EMSCRIPTEN__
+	if (rw_lock_id == 0u) return CELL_OK;
+#endif
 
 	const auto rwlock = idm::get<lv2_obj, lv2_rwlock>(rw_lock_id, [&, notify = lv2_obj::notify_all_t()](lv2_rwlock& rwlock) -> s64
 	{
@@ -489,7 +501,7 @@ error_code sys_rwlock_wlock(ppu_thread& ppu, u32 rw_lock_id, u64 timeout)
 		}
 		else
 		{
-			ppu.state.wait(state);
+			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}
 
@@ -533,6 +545,9 @@ error_code sys_rwlock_wunlock(ppu_thread& ppu, u32 rw_lock_id)
 	ppu.state += cpu_flag::wait;
 
 	sys_rwlock.trace("sys_rwlock_wunlock(rw_lock_id=0x%x)", rw_lock_id);
+#ifdef __EMSCRIPTEN__
+	if (rw_lock_id == 0u) return CELL_OK;
+#endif
 
 	const auto rwlock = idm::get<lv2_obj, lv2_rwlock>(rw_lock_id, [&](lv2_rwlock& rwlock)
 	{

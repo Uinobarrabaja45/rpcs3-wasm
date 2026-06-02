@@ -72,7 +72,10 @@ const profileDir = `/tmp/chrome-headless-profile-rpcs3-${Date.now()}`;
 // from "experimental" status on every channel. Harmless once it has.
 const chromeCmd = [
     '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"',
-    '--headless=new',
+    (process.env.HEADLESS === '0' ? '' : '--headless=new'),   // HEADLESS=0 => NON-headless: run in YOUR GUI session for a STABLE hours-long capture (real Metal GPU). Default (unset) = headless (background runs), but headless WebGPU is flaky (random 2-20min crash).
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-background-timer-throttling',
     '--remote-debugging-port=9223',                // 9222 is the Play! port; offset to avoid clashes
     '--remote-debugging-address=127.0.0.1',
     '--enable-unsafe-webgpu',
@@ -81,7 +84,7 @@ const chromeCmd = [
     // the flaky ~8min headless WebGPU renderer death; let Chrome pick Metal.
     `--user-data-dir=${profileDir}`,
     `"${targetUrl}"`,
-].join(' ');
+].filter(Boolean).join(' ');
 console.log(`Command: ${chromeCmd}`);
 const chromeProcess = exec(chromeCmd);
 
@@ -136,6 +139,7 @@ function captureNow(ws) {
     ws.send(JSON.stringify({ id: 4, method: 'Page.captureScreenshot', params: { format: 'png' } }));
 }
 
+let reconnectCount = 0;
 function connectToDebugger(wsUrl) {
     const ws = new WebSocket(wsUrl);
     let captured = false;
@@ -211,7 +215,17 @@ function connectToDebugger(wsUrl) {
     });
 
     ws.on('close', () => {
-        console.log('Debugger connection closed.');
+        // CDP dropped — but the page (and the wasm boot) keep running. Re-attach
+        // instead of killing Chrome, so the slow boot survives the flaky headless
+        // WebGPU disconnects and gets the runway to reach its first flip (the
+        // splash flips repeatedly, so the trigger is still catchable post-reconnect).
+        if (!captured && reconnectCount < 60) {
+            reconnectCount++;
+            console.log(`Debugger connection closed — reconnecting #${reconnectCount} (page kept alive)...`);
+            setTimeout(() => getWsUrl(), 1500);
+            return;
+        }
+        console.log('Debugger connection closed — giving up.');
         chromeProcess.kill('SIGKILL');
         process.exit(1);
     });
@@ -223,20 +237,20 @@ function connectToDebugger(wsUrl) {
     setTimeout(() => {
         if (!captured) {
             captured = true;
-            console.log('No trigger seen in 2400s (40 min) — capturing whatever is on screen.');
+            console.log('No trigger seen in 5400s (90 min) — capturing whatever is on screen.');
             captureNow(ws);
         }
-    }, 2400000);
+    }, 5400000);
 
     // Hard timeout: 25 minutes max, then bail. Extended for the slow JIT-less
     // PPU interpreter: Terraria streams large zlib assets on EE ResourceLoop at
     // ~1.8 KB/s, so reaching the first GCM flip (the 505 splash) takes many
     // minutes. The flip-trigger still fires + captures the moment it happens.
     setTimeout(() => {
-        console.error('Timeout of 2520 seconds exceeded! Crashing...');
+        console.error('Timeout of 5520 seconds exceeded! Crashing...');
         chromeProcess.kill('SIGKILL');
         process.exit(1);
-    }, 2520000);
+    }, 5520000);
 }
 
 setTimeout(() => getWsUrl(), 1000);

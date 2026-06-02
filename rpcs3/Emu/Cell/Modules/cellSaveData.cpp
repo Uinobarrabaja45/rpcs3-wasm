@@ -751,12 +751,23 @@ static NEVER_INLINE error_code savedata_op(ppu_thread& ppu, u32 operation, u32 v
 	// Simulate idle time while data is being sent to VSH
 	const auto lv2_sleep = [](ppu_thread& ppu, usz sleep_time)
 	{
+#ifdef __EMSCRIPTEN__
+		// Headless wasm: lv2_obj::wait_timeout can park the calling thread without a
+		// waking event in the pthread model, hanging cellSaveData* (e.g. the boot's
+		// cellSaveDataAutoLoad2 on WorkerThread) and stalling the whole boot. This is
+		// purely cosmetic VSH-latency simulation — skip it.
+		(void)ppu; (void)sleep_time;
+#else
 		lv2_obj::sleep(ppu);
 		lv2_obj::wait_timeout(sleep_time);
 		ppu.check_state();
+#endif
 	};
 
 	lv2_sleep(ppu, 500);
+#ifdef __EMSCRIPTEN__
+	cellSaveData.error("[SAVELOG] savedata_op past lv2_sleep, operation=%d", operation);
+#endif
 
 	std::memset(g_savedata_context.get_ptr(), 0, g_savedata_context.size());
 

@@ -75,6 +75,9 @@ error_code sys_semaphore_create(ppu_thread& ppu, vm::ptr<u32> sem_id, vm::ptr<sy
 	ppu.check_state();
 
 	*sem_id = idm::last_id();
+#ifdef __EMSCRIPTEN__
+	printf("[SEMCREATE] id=0x%x init=%d max=%d\n", static_cast<unsigned>(idm::last_id()), static_cast<int>(initial_val), static_cast<int>(max_val));
+#endif
 	return CELL_OK;
 }
 
@@ -118,6 +121,20 @@ error_code sys_semaphore_wait(ppu_thread& ppu, u32 sem_id, u64 timeout)
 	ppu.state += cpu_flag::wait;
 
 	sys_semaphore.trace("sys_semaphore_wait(sem_id=0x%x, timeout=0x%llx)", sem_id, timeout);
+#ifdef __EMSCRIPTEN__
+	// Terraria's EE ResourceLoop (0x1000006) waits on its work-sem (0x96006700) at
+	// lr=0x423c00 with timeout=0. A prior no-op returned CELL_OK here, but that turned
+	// a clean block into a 1.26M-iteration HOT SPIN (no work to do on wake) that flooded
+	// the log ~127x over the ring buffer and contended on lv2 locks. Let it BLOCK
+	// naturally (park, yield CPU) so main isn't starved; log once. The real issue is the
+	// dead producer of 0x96006700 (see SEMPOST probe).
+	if (ppu.id == 0x1000006u && static_cast<unsigned>(ppu.lr) == 0x423c00u)
+	{
+		static thread_local bool s_lblk = false;
+		if (!s_lblk) { s_lblk = true; printf("[LOADERBLK] loader parks on work-sem=0x%x timeout=0x%llx (was hot-spinning)\n", static_cast<unsigned>(sem_id), static_cast<unsigned long long>(timeout)); }
+		// fall through to the real (blocking) wait — do NOT hot-spin
+	}
+#endif
 
 	const auto sem = idm::get<lv2_obj, lv2_sema>(sem_id, [&, notify = lv2_obj::notify_all_t()](lv2_sema& sema)
 	{
@@ -137,6 +154,9 @@ error_code sys_semaphore_wait(ppu_thread& ppu, u32 sem_id, u64 timeout)
 
 		if (sema.val-- <= 0)
 		{
+#ifdef __EMSCRIPTEN__
+			if ((ppu.id & 0xFF000000u) == 0x01000000u) printf("[SEMBLOCK] tid=0x%x sem=0x%x BLOCKS val=%d lr=0x%x cia=0x%x\n", static_cast<unsigned>(ppu.id), static_cast<unsigned>(sem_id), static_cast<int>(sema.val.load()), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.cia));
+#endif
 			sema.sleep(ppu, timeout);
 			lv2_obj::emplace(sema.sq, &ppu);
 			return false;
@@ -223,7 +243,19 @@ error_code sys_semaphore_wait(ppu_thread& ppu, u32 sem_id, u64 timeout)
 		}
 		else
 		{
+#ifdef __EMSCRIPTEN__
+			// wasm pthread model: awake_all() from sys_semaphore_post does not reliably wake
+			// a parked waiter (lost wakeup). This deadlocks the producer-consumer resource
+			// handoff: main (0x1000000) posts the loader's work-sem 0x96006700 repeatedly
+			// (lr=0x4217dc) but the loader, parked here in an infinite ppu.state.wait(), never
+			// resumes — so it stops processing resources and main eventually parks too. Use a
+			// bounded timed park so the waiter re-checks the sem value (the outer while-loop)
+			// every ~15ms and catches the post even when the wake notification was lost.
+			ppu.state.wait(state, atomic_wait_timeout{15'000'000});
+			{ static thread_local u32 s_smf = 0; if ((ppu.id == 0x1000000u || ppu.id == 0x1000006u) && ++s_smf > 600u) { s_smf = 0; printf("[WAITFORCE] sem force tid=0x%x id=0x%x (re-check queue)\n", static_cast<unsigned>(ppu.id), static_cast<unsigned>(sem_id)); ppu.gpr[3] = CELL_OK; break; } }
+#else
 			ppu.state.wait(state);
+#endif
 		}
 	}
 
@@ -259,6 +291,9 @@ error_code sys_semaphore_post(ppu_thread& ppu, u32 sem_id, s32 count)
 	ppu.state += cpu_flag::wait;
 
 	sys_semaphore.trace("sys_semaphore_post(sem_id=0x%x, count=%d)", sem_id, count);
+#ifdef __EMSCRIPTEN__
+	if (sem_id == 0x96006800u || sem_id == 0x96004400u || sem_id == 0x96006700u) printf("[SEMPOST] sem=0x%x cnt=%d tid=0x%x lr=0x%x cia=0x%x\n", static_cast<unsigned>(sem_id), static_cast<int>(count), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.cia));
+#endif
 
 	const auto sem = idm::get<lv2_obj, lv2_sema>(sem_id, [&](lv2_sema& sema)
 	{
@@ -330,6 +365,9 @@ error_code sys_semaphore_post(ppu_thread& ppu, u32 sem_id, s32 count)
 
 		if (to_awake > 0)
 		{
+#ifdef __EMSCRIPTEN__
+			printf("[SEMWAKE] sem=0x%x cnt=%d awake=%d tid=0x%x lr=0x%x\n", static_cast<unsigned>(sem_id), static_cast<int>(count), static_cast<int>(to_awake), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr));
+#endif
 			lv2_obj::awake_all();
 		}
 	}

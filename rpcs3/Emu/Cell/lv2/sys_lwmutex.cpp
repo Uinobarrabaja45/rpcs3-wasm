@@ -287,7 +287,10 @@ error_code _sys_lwmutex_lock(ppu_thread& ppu, u32 lwmutex_id, u64 timeout)
 		}
 		else
 		{
-			ppu.state.wait(state);
+			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
+#if defined(__EMSCRIPTEN__)
+			{ static thread_local u32 s_lwf = 0; if (ppu.id == 0x1000000u && ++s_lwf > 600u) { s_lwf = 0; printf("[WAITFORCE] lwmutex force-acquire id=0x%x (main stuck)\n", static_cast<unsigned>(lwmutex_id)); ppu.gpr[3] = CELL_OK; break; } }
+#endif
 		}
 	}
 

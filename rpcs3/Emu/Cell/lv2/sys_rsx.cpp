@@ -125,7 +125,7 @@ bool rsx::thread::send_event(u64 data1, u64 event_flags, u64 data3)
 		{
 			static atomic_t<u32> s_se0{0};
 			const u32 c = s_se0++;
-			if (c < 6 || (c & 0xFF) == 0)
+			if (c < 6)
 				printf("[SEND_EVENT] FILTERED-OUT #%u orig=0x%llx handlers=0x%x port=0x%x driver_info=0x%x\n",
 					c, static_cast<unsigned long long>(se_orig), se_handlers, rsx_event_port, +driver_info);
 		}
@@ -137,7 +137,7 @@ bool rsx::thread::send_event(u64 data1, u64 event_flags, u64 data3)
 	{
 		static atomic_t<u32> s_se1{0};
 		const u32 c = s_se1++;
-		if (c < 6 || (c & 0x7F) == 0)
+		if (c < 6)
 			printf("[SEND_EVENT] SEND #%u masked=0x%llx (orig=0x%llx handlers=0x%x) port=0x%x\n",
 				c, static_cast<unsigned long long>(event_flags),
 				static_cast<unsigned long long>(se_orig), se_handlers, rsx_event_port);
@@ -150,7 +150,7 @@ bool rsx::thread::send_event(u64 data1, u64 event_flags, u64 data3)
 	{
 		static atomic_t<u32> s_ser{0};
 		const u32 c = s_ser++;
-		if (c < 8 || (c & 0x7F) == 0)
+		if (c < 8)
 			printf("[SEND_EVENT] RESULT #%u error=0x%x flags=0x%llx port=0x%x\n",
 				c, +error, static_cast<unsigned long long>(event_flags), rsx_event_port);
 	}

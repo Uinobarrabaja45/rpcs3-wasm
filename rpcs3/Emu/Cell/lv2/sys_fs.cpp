@@ -1234,6 +1234,13 @@ error_code sys_fs_read(ppu_thread& ppu, u32 fd, vm::ptr<void> buf, u64 nbytes, v
 		lv2_obj::sleep(ppu);
 	}
 
+#ifdef __EMSCRIPTEN__
+	// Throttle: the old 4-line-per-read FSLOCK trace flooded the console (~127x the ring
+	// buffer during streaming) and buried main's syscall probes. Keep only a throttled
+	// (1-in-256) op_read-done line below to confirm streaming progress.
+	static thread_local u64 s_fsr = 0;
+	const bool fslog = (ppu.id >= 0x1000000u && ppu.id <= 0x100000cu) && ((s_fsr++ & 0xFFu) == 0u);
+#endif
 	std::unique_lock lock(file->mp->mutex);
 
 	if (!file->file)
@@ -1248,6 +1255,9 @@ error_code sys_fs_read(ppu_thread& ppu, u32 fd, vm::ptr<void> buf, u64 nbytes, v
 	}
 
 	const u64 read_bytes = file->op_read(buf, nbytes);
+#ifdef __EMSCRIPTEN__
+	if (fslog) sys_fs.error("[FSLOCK] id=0x%x read nbytes=0x%llx done=%llu", ppu.id, nbytes, read_bytes);
+#endif
 	const bool failure = !read_bytes && file->file.pos() < file->file.size();
 	lock.unlock();
 	ppu.check_state();

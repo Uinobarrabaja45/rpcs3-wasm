@@ -261,6 +261,9 @@ error_code sys_event_queue_create(cpu_thread& cpu, vm::ptr<u32> equeue_id, vm::p
 
 	cpu.check_state();
 	*equeue_id = idm::last_id();
+#ifdef __EMSCRIPTEN__
+	printf("[EQCREATE] id=0x%x key=0x%llx size=%d\n", static_cast<unsigned>(idm::last_id()), static_cast<unsigned long long>(ipc_key), static_cast<int>(size));
+#endif
 	return CELL_OK;
 }
 
@@ -602,7 +605,7 @@ error_code sys_event_queue_receive(ppu_thread& ppu, u32 equeue_id, vm::ptr<sys_e
 		}
 		else
 		{
-			ppu.state.wait(state);
+			ppu.state.wait(state, atomic_wait_timeout{15000000}); // wasm lost-wakeup guard
 		}
 	}
 
@@ -708,6 +711,9 @@ error_code sys_event_port_connect_local(cpu_thread& cpu, u32 eport_id, u32 equeu
 	}
 
 	port->queue = std::move(queue);
+#ifdef __EMSCRIPTEN__
+	printf("[EQCONNECT] port=0x%x queue=0x%x\n", static_cast<unsigned>(eport_id), static_cast<unsigned>(equeue_id));
+#endif
 
 	return CELL_OK;
 }
@@ -790,6 +796,9 @@ error_code sys_event_port_send(u32 eport_id, u64 data1, u64 data2, u64 data3)
 	}
 
 	sys_event.trace("sys_event_port_send(eport_id=0x%x, data1=0x%llx, data2=0x%llx, data3=0x%llx)", eport_id, data1, data2, data3);
+#ifdef __EMSCRIPTEN__
+	if (!(data1 == 0ull && data2 == 0x6ull)) printf("[EPSEND] port=0x%x data1=0x%llx data2=0x%llx tid=0x%x\n", static_cast<unsigned>(eport_id), static_cast<unsigned long long>(data1), static_cast<unsigned long long>(data2), ppu ? static_cast<unsigned>(ppu->id) : 0u);
+#endif
 
 	bool notified_thread = false;
 

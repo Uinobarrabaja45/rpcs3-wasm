@@ -256,16 +256,21 @@ bool CGSH_WebGPUJs::Render()
 	m_queue.Submit(1, &cmd);
 
 	m_framesRendered++;
-	if ((m_framesRendered % 120) == 1)
 	{
-		// Log the wasm heap size to diagnose the ~3.5-7.5min Chrome death:
-		// if this climbs toward the ~4 GiB wasm32 ceiling near the death it's
-		// an OOM wall (game accumulates decompressed assets); if it's stable
-		// the death is something else (flaky CDP / renderer).
-		const double heapMiB = static_cast<double>(emscripten_get_heap_size()) / (1024.0 * 1024.0);
-		printf("[GSH_WebGPUJs] Render frame=%d booted=%d blit=%d fb=0x%x %ux%u flip=%llu heap=%.0fMiB\n",
-		       m_framesRendered, m_booted ? 1 : 0, blitted ? 1 : 0,
-		       fb_addr, fb_w, fb_h, static_cast<unsigned long long>(flip), heapMiB);
+		// Event-driven log: fire on ANY change of fb/flip/blit (so the first real
+		// framebuffer/flip is caught instantly), plus a sparse 1200-frame (~10s)
+		// heartbeat. This stops the per-second flood from rolling the SCALL/SEMBLOCK
+		// stall-trace out of the console ring buffer.
+		static thread_local unsigned s_pfb = 0xFFFFFFFFu; static thread_local unsigned long long s_pflip = ~0ull; static thread_local int s_pblit = -1;
+		const bool changed = (fb_addr != s_pfb) || (static_cast<unsigned long long>(flip) != s_pflip) || ((blitted ? 1 : 0) != s_pblit);
+		if (changed || (m_framesRendered % 1200) == 1)
+		{
+			const double heapMiB = static_cast<double>(emscripten_get_heap_size()) / (1024.0 * 1024.0);
+			printf("[GSH_WebGPUJs] Render frame=%d booted=%d blit=%d fb=0x%x %ux%u flip=%llu heap=%.0fMiB%s\n",
+			       m_framesRendered, m_booted ? 1 : 0, blitted ? 1 : 0,
+			       fb_addr, fb_w, fb_h, static_cast<unsigned long long>(flip), heapMiB, changed ? " <CHANGED>" : "");
+			s_pfb = fb_addr; s_pflip = static_cast<unsigned long long>(flip); s_pblit = blitted ? 1 : 0;
+		}
 	}
 	return true;
 #else

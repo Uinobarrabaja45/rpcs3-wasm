@@ -1225,6 +1225,9 @@ error_code sys_spu_thread_group_start(ppu_thread& ppu, u32 id)
 	ppu.state += cpu_flag::wait;
 
 	sys_spu.trace("sys_spu_thread_group_start(id=0x%x)", id);
+#ifdef __EMSCRIPTEN__
+	printf("[SPUGSTART] enter id=0x%x\n", static_cast<unsigned>(id));
+#endif
 
 	const auto group = idm::get_unlocked<lv2_spu_group>(id);
 
@@ -1286,6 +1289,9 @@ error_code sys_spu_thread_group_start(ppu_thread& ppu, u32 id)
 	// Because SPU_THREAD_GROUP_STATUS_READY is not possible, run event is delivered immediately
 	// TODO: check data2 and data3
 	group->send_run_event(id, 0, 0);
+#ifdef __EMSCRIPTEN__
+	printf("[SPUGROUP] start id=0x%x max_threads=%u\n", static_cast<unsigned>(id), static_cast<unsigned>(max_threads));
+#endif
 
 	u32 ran_threads = max_threads;
 

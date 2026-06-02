@@ -218,13 +218,15 @@ static error_code prx_load_module(const std::string& vpath, u64 flags, vm::ptr<s
 #if defined(__EMSCRIPTEN__)
 		else if (name == "libsre.sprx")
 		{
-			// wasm32: force libsre.sprx (SPURS) to HLE. The LLE experiment CONFIRMED
-			// the SPU-speed wall: the real SPURS kernel self-aborts ("The SPURS is
-			// aborted" → _sys_process_exit ESTAT) because the ~1000x-slow SPU misses
-			// SPURS deadlines — and the abort cascade stalls the asset loader EARLIER
-			// than HLE-stub does. For the static-splash goal (PPU/RSX-driven), HLE-stub
-			// lets the loader progress furthest (trophy→savedata→userinfo). Functional
-			// SPURS needs the wasm SPU JIT/AOT track (PLAN-wasm-jit.md, Phase 3).
+			// wasm32: force libsre.sprx (SPURS) to HLE-stub. LLE REVIVE RE-CONFIRMED
+			// (stackwalk175): the real SPURS kernel self-aborts at INIT ("The SPURS is
+			// aborted" on audiSpursHdlr0) because the ~1000x-slow SPU interpreter misses
+			// the SPURS init deadline — and no clocks_scale bridges that (1000x relief
+			// needs scale<1, which trips the idle-timeout GROUP_EXIT AND makes boot take
+			// hours). LLE actually stalls the loader EARLIER (registration #1) than the
+			// HLE-stub (#42). So HLE-stub is the furthest-progressing config. Functional
+			// SPURS needs either the SPU JIT/AOT track (PLAN-wasm-jit.md) or a native HLE
+			// of the specific SPU asset-processing workload.
 			ignore = true;
 		}
 #endif

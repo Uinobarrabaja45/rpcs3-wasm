@@ -1566,6 +1566,7 @@ void spu_thread::cpu_task()
 			// [SPUPROG] minimal progress probe: is the SPURS kernel advancing or
 			// stuck? Log pc every ~1M instrs for SPURS threads (to diagnose the
 			// PPU-side handler.c:144 wait_ready timeout).
+			{ static thread_local bool s_spurun = false; if (!s_spurun) { s_spurun = true; printf("[SPURUN] SPU '%s' reached interpreter pc=0x%05x\n", thread_ctrl::get_name().c_str(), +pc); } }
 			const bool prog_spurs = thread_ctrl::get_name().find("SpursKernel") != std::string::npos;
 			u64 prog_n = 0;
 			if (prog_spurs)

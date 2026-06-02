@@ -80,6 +80,14 @@ const FIRMWARE_PRELOAD_PATHS = [
     '/dev_flash/sys/external/libnet.sprx',
     '/dev_flash/sys/external/librudp.sprx',
     '/dev_flash/sys/external/libsre.sprx',
+    // Audio codec firmware images. Terraria's "Multistream" audio engine
+    // opens flashMP3.pic at boot (sys_fs_open) and calls abort() —
+    // "mp3 failed to load MP3 codec (are you using the correct flash?)" —
+    // if it's absent. The real firmware files live in public/dev_flash but
+    // were never preloaded into MEMFS. flashATRAC.pic added alongside since
+    // the same engine init path loads the ATRAC codec too.
+    '/dev_flash/sys/external/flashMP3.pic',
+    '/dev_flash/sys/external/flashATRAC.pic',
 ];
 
 // rpcs3 mounts /dev_flash → `$(EmulatorDir)dev_flash/` which on
