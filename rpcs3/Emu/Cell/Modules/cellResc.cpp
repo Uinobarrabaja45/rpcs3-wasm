@@ -304,10 +304,10 @@ error_code cellRescGcmSurface2RescSrc(vm::cptr<CellGcmSurface> gcmSurface, vm::p
 	rescSrc->offset = gcmSurface->colorOffset[0];
 
 #ifdef __EMSCRIPTEN__
-	printf("[RESC] GcmSurface2RescSrc colorFormat=%u %ux%u pitch=%u offset=0x%x loc=%u -> rescSrc fmt=%u\n",
+	{ static thread_local u32 s_g2r = 0; if ((++s_g2r & 0xFFu) == 0u) printf("[RESC] GcmSurface2RescSrc colorFormat=%u %ux%u pitch=%u offset=0x%x loc=%u -> rescSrc fmt=%u (1/256)\n",
 		static_cast<unsigned>(gcmSurface->colorFormat), static_cast<unsigned>(w), static_cast<unsigned>(h),
 		static_cast<unsigned>(pitch), static_cast<unsigned>(+gcmSurface->colorOffset[0]),
-		static_cast<unsigned>(gcmSurface->colorLocation[0]), static_cast<unsigned>(resc_format));
+		static_cast<unsigned>(gcmSurface->colorLocation[0]), static_cast<unsigned>(resc_format)); }
 #endif
 
 	return CELL_OK;
@@ -354,10 +354,10 @@ error_code cellRescSetSrc(s32 idx, vm::cptr<CellRescSrc> src)
 	}
 
 #ifdef __EMSCRIPTEN__
-	printf("[RESC] cellRescSetSrc idx=%d offset=0x%x pitch=%u %ux%u count=%u\n",
+	{ static thread_local u32 s_ss = 0; if ((++s_ss & 0xFFu) == 0u) printf("[RESC] cellRescSetSrc idx=%d offset=0x%x pitch=%u %ux%u count=%u (1/256)\n",
 		idx, static_cast<unsigned>(src->offset), static_cast<unsigned>(src->pitch),
 		static_cast<unsigned>(src->width), static_cast<unsigned>(src->height),
-		render->display_buffers_count);
+		render->display_buffers_count); }
 #endif
 
 	return CELL_OK;
@@ -380,7 +380,29 @@ error_code cellRescSetConvertAndFlip(ppu_thread& ppu, vm::ptr<CellGcmContextData
 	}
 
 #ifdef __EMSCRIPTEN__
-	printf("[RESC] cellRescSetConvertAndFlip idx=%d\n", idx);
+	{ static thread_local u32 s_caf = 0; if ((++s_caf & 0xFFu) == 0u) printf("[RESC] cellRescSetConvertAndFlip idx=%d (1/256)\n", idx); }
+	// FRAMESTACK (2026-06-03): the game is HARD-GATED — it runs this present every frame but never
+	// issues a real scene draw (presents black). Capture main's frame-loop CALL STACK here (once) so we
+	// can disassemble the frame routine and find the conditional that SKIPS the splash draw. PPC64 ELFv1
+	// back-chain: back ptr @[sp+4] low word, saved LR @[sp+20] low word (BE 8B slots).
+	{
+		static thread_local bool s_fs = false;
+		if (!s_fs && ppu.id == 0x1000003u)   // RenderLoop is the present caller (LR=0x3f7ae4), not main
+		{
+			s_fs = true;
+			printf("[FRAMESTACK] RenderLoop present cia=0x%x lr=0x%x r1=0x%x idx=%d con=0x%x\n",
+				static_cast<u32>(ppu.cia), static_cast<u32>(ppu.lr), static_cast<u32>(ppu.gpr[1]), idx, con.addr());
+			u32 sp = static_cast<u32>(ppu.gpr[1]);
+			for (u32 f = 0; f < 16 && sp >= 0x10000u && sp < 0x60000000u; f++)
+			{
+				const u32 back = vm::read32(sp + 4);
+				const u32 slr  = vm::read32(sp + 20);
+				printf("  [FRAMESTACK-FR] #%u sp=0x%x savedLR=0x%x back=0x%x\n", f, sp, slr, back);
+				if (back <= sp) break;
+				sp = back;
+			}
+		}
+	}
 #endif
 
 	if (con->current + 2 >= con->end)

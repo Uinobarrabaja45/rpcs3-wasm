@@ -1257,6 +1257,24 @@ error_code sys_fs_read(ppu_thread& ppu, u32 fd, vm::ptr<void> buf, u64 nbytes, v
 	const u64 read_bytes = file->op_read(buf, nbytes);
 #ifdef __EMSCRIPTEN__
 	if (fslog) sys_fs.error("[FSLOCK] id=0x%x read nbytes=0x%llx done=%llu", ppu.id, nbytes, read_bytes);
+	// FSREAD (2026-06-03): does the data.vfs (fd=3) read actually return real archive bytes? If it
+	// reads 0 / garbage (preloaded-disc ISO-offset bug), the game can't parse the index -> no assets.
+	{
+		static thread_local u32 s_rd = 0;
+		const u32 rn = ++s_rd;
+		if (rn <= 8u || (rn & 0xFFu) == 0u)
+		{
+			const u8* b = static_cast<const u8*>(buf.get_ptr());
+			const u8 z[16] = {};
+			if (!b) b = z;
+			printf("[FSREAD] #%u tid=0x%x fd=%u req=0x%llx read=0x%llx pos=0x%llx sz=0x%llx first= %02x %02x %02x %02x %02x %02x %02x %02x '%c%c%c%c%c%c%c%c'\n",
+				rn, static_cast<unsigned>(ppu.id), fd, static_cast<unsigned long long>(nbytes), static_cast<unsigned long long>(read_bytes),
+				static_cast<unsigned long long>(file->file ? file->file.pos() : 0), static_cast<unsigned long long>(file->file ? file->file.size() : 0),
+				b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+				(b[0]>=32&&b[0]<127)?b[0]:'.',(b[1]>=32&&b[1]<127)?b[1]:'.',(b[2]>=32&&b[2]<127)?b[2]:'.',(b[3]>=32&&b[3]<127)?b[3]:'.',
+				(b[4]>=32&&b[4]<127)?b[4]:'.',(b[5]>=32&&b[5]<127)?b[5]:'.',(b[6]>=32&&b[6]<127)?b[6]:'.',(b[7]>=32&&b[7]<127)?b[7]:'.');
+		}
+	}
 #endif
 	const bool failure = !read_bytes && file->file.pos() < file->file.size();
 	lock.unlock();
@@ -2513,8 +2531,50 @@ error_code sys_fs_fcntl(ppu_thread& ppu, u32 fd, u32 op, vm::ptr<void> _arg, u32
 		break;
 	}
 
-	case 0xe0000004: // Unknown
-	{
+	case 0xe0000004: // Unknown — Terraria's libfs stats each asset (data.vfs, shaders, images/logo_*.gtf,
+	{                //            sounds) via this op. The original no-op left the output zeroed, so the game
+#ifdef __EMSCRIPTEN__//            saw size 0 / missing for every asset -> nothing loaded -> circular deadlock.
+		// Do a REAL stat: read the path (+0x10), look it up on the mounted disc, fill size + success.
+		// Output-field layout is inferred (first attempt: size at +0x18 as be u64, out_code at +0x2c=0);
+		// the [E4-STAT] log + the game's reaction tell us if/where to refine.
+		// Confirmed by disasm of the caller (libfs @0xc54270): after the syscall the game does
+		//   if (*(buf+0x28) != 0) skip;  result = sign_extend(*(buf+0x2c));  file_obj+0x18 = result
+		// So on success set buf+0x28 = 0 (the "valid" flag) and buf+0x2c = the value (file size). For
+		// not-found loose paths (packed inside data.vfs), leave buf+0x28 (=0x80010003) so the game
+		// correctly falls back to reading data.vfs.
+		auto p = vm::static_ptr_cast<be_t<u32>>(_arg);
+		if (_size >= 0x30u)
+		{
+			const u32 path_ptr = p[4].value();   // +0x10
+			const u32 path_len = p[3].value();   // +0x0c
+			if (path_ptr >= 0x10000u && path_ptr < 0x60000000u && path_len > 0 && path_len < 0x400u)
+			{
+				const char* cpath = static_cast<const char*>(vm::base(path_ptr));
+				const std::string vpath(cpath, ::strnlen(cpath, path_len));
+				// The game uses the returned value as a FILE DESCRIPTOR (it then read/lseek/close it),
+				// so OPEN the file read-only and return a real fd at +0x2c. Loose paths packed inside
+				// data.vfs aren't real files -> open fails -> leave +0x28 nonzero -> game falls back.
+				u32 fd_id = 0;
+				auto [error, ppath, real, file, type] = lv2_file::open(vpath, 0 /*CELL_FS_O_RDONLY*/, 0, nullptr, 0);
+				if (!error)
+				{
+					fd_id = idm::import<lv2_fs_object, lv2_file>([&]() -> shared_ptr<lv2_file>
+					{
+						return stx::make_shared<lv2_file>(ppath, std::move(file), 0, 0, real, type);
+					});
+				}
+				if (fd_id)
+				{
+					p[0xa] = 0u;     // +0x28 = 0 -> result valid
+					p[0xb] = fd_id;  // +0x2c = real fd -> game read/lseek/close it
+				}
+				static thread_local u32 s_e4 = 0;
+				if (s_e4++ < 24)
+					printf("[E4-OPEN] tid=0x%x %s -> %s fd=%u\n", static_cast<unsigned>(ppu.id), vpath.c_str(),
+						fd_id ? "OPENED" : "not-found(fallback)", fd_id);
+			}
+		}
+#endif
 		break;
 	}
 

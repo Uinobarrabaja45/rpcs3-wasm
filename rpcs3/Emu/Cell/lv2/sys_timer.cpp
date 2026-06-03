@@ -5,6 +5,7 @@
 #include "Emu/Cell/ErrorCodes.h"
 #include "Emu/Cell/PPUThread.h"
 #include "Emu/Cell/timers.hpp"
+#include "Emu/Memory/vm.h"
 
 #include "util/asm.hpp"
 #include "Emu/System.h"
@@ -452,6 +453,14 @@ error_code sys_timer_usleep(ppu_thread& ppu, u64 sleep_time)
 	ppu.state += cpu_flag::wait;
 
 	sys_timer.trace("sys_timer_usleep(sleep_time=0x%llx)", sleep_time);
+
+#ifdef __EMSCRIPTEN__
+	// NOTE (2026-06-03): main (0x1000000) parks here @lr=0x63c98 after the 152-frame intro, spinning
+	// on a flag at *(r31+0x18) that signals an async asset-decode completion. Forcing the flag (tried)
+	// makes main exit the poll then dispatch a NULL fn ([exec_task] cia=0x0) -> OOB trap: the result
+	// table the SPU/SPURS pipeline should populate is empty. The real fix is the dead producer (SPU
+	// asset decode never registers), NOT bypassing this wait. Left as a plain (correct) usleep.
+#endif
 
 	if (sleep_time)
 	{

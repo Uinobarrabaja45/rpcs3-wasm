@@ -69,6 +69,42 @@ void WebGPUGSRender::end()
 				static_cast<unsigned>(rsx::method_registers.surface_clip_height()));
 		}
 	}
+	// P2 REAL-DRAW PATH (2026-06-03): when the game issues a real textured-quad draw (the splash IS one),
+	// decode the bound texture (fragment_textures[0]) and rasterize it into the color surface, which flip()
+	// presents. This is the GAME-DRIVEN splash renderer — paired with the synthetic dev-test in
+	// clear_surface that validated the rasterize→VRAM→flip→canvas path. The game currently emits only
+	// degenerate draws (P1 gates the real ones); this is READY for the moment P1 lands. Handles
+	// A8R8G8B8 (the logo's format); scales the texture across the surface (full-screen quad).
+	{
+		const auto& dc  = rsx::method_registers.current_draw_clause;
+		const auto& tex = rsx::method_registers.fragment_textures[0];
+		const u32 toff = tex.offset();
+		const u32 tw = tex.width(), th = tex.height();
+		if (!dc.empty() && toff && tw && th)
+		{
+			const u32 taddr  = rsx::get_address(toff, tex.location());
+			const u32 saddr  = rsx::get_address(rsx::method_registers.surface_offset(0), CELL_GCM_LOCATION_LOCAL);
+			const u32 sw     = rsx::method_registers.surface_clip_width();
+			const u32 sh     = rsx::method_registers.surface_clip_height();
+			const u32 spitch = rsx::method_registers.surface_pitch(0);
+			const u32 tpitch = tex.pitch() ? tex.pitch() : tw * 4u;
+			if (taddr && saddr && sw && sh && spitch)
+			{
+				const u8* const tbase = static_cast<const u8*>(vm::base(taddr));
+				u8* const sbase = static_cast<u8*>(vm::base(saddr));
+				for (u32 y = 0; y < sh; y++)
+				{
+					be_t<u32>* srow = reinterpret_cast<be_t<u32>*>(sbase + static_cast<u64>(y) * spitch);
+					const u32 ty = static_cast<u32>(static_cast<u64>(y) * th / sh);
+					const be_t<u32>* trow = reinterpret_cast<const be_t<u32>*>(tbase + static_cast<u64>(ty) * tpitch);
+					for (u32 x = 0; x < sw; x++)
+						srow[x] = trow[static_cast<u32>(static_cast<u64>(x) * tw / sw)].value(); // A8R8G8B8 passthrough
+				}
+				static thread_local u32 s_pd = 0;
+				if (s_pd++ < 4) printf("[P2-DRAW] GAME-DRIVEN: rasterized bound texture %ux%u fmt=0x%x -> surface %ux%u\n", tw, th, static_cast<unsigned>(tex.format()), sw, sh);
+			}
+		}
+	}
 #endif
 	// Same body as NullGSRender — no actual draw. Phase 7+ will replace
 	// this with WGSL pipeline dispatch translated from RSX FP/VP.
@@ -106,6 +142,46 @@ void WebGPUGSRender::clear_surface(u32 arg)
 		be_t<u32>* row = reinterpret_cast<be_t<u32>*>(basep + static_cast<u64>(y) * pitch);
 		for (u32 x = 0; x < w; x++)
 			row[x] = argb;
+	}
+
+	// === P2 DEV-TEST (2026-06-03): software textured-quad rasterizer — PIPELINE VALIDATION ===
+	// Proves the draw→VRAM-surface→flip→WebGPU-blit→canvas path renders REAL per-pixel geometry
+	// (a textured quad), not just a flat clear. A full-screen splash IS an axis-aligned textured
+	// quad, so this axis-aligned textured-quad rasterizer is the actual reusable splash renderer —
+	// here fed a synthetic UV-gradient+grid texture (clearly a dev pattern, NOT the splash) to
+	// validate it. When P1 lands (game emits the real splash draw), this gets fed the real GTF
+	// texture + the draw's quad coords instead of the synthetic test inputs. Toggle with s_p2test.
+	{
+		static const bool s_p2test = false; // dev-test OFF: the real-draw path in end() is now the renderer;
+		                                    // surface reflects the honest (P1-gated, black) game state.
+		if (s_p2test)
+		{
+			// synthetic 64x64-ish procedural texture sampler: red(x)/green(y) gradient + white grid.
+			const auto texsample = [](float u, float v) -> u32 {
+				int tx = static_cast<int>(u * 64.0f) & 63;
+				int ty = static_cast<int>(v * 64.0f) & 63;
+				u32 r = static_cast<u32>(tx * 4), g = static_cast<u32>(ty * 4), b = 64u;
+				if ((tx & 7) == 0 || (ty & 7) == 0) { r = g = b = 255u; } // grid lines
+				return 0xff000000u | (r << 16) | (g << 8) | b;            // ARGB
+			};
+			// centered axis-aligned quad over the middle half of the surface, with linear UVs.
+			const float qx0 = w * 0.25f, qy0 = h * 0.25f, qx1 = w * 0.75f, qy1 = h * 0.75f;
+			const int minx = static_cast<int>(qx0), maxx = static_cast<int>(qx1);
+			const int miny = static_cast<int>(qy0), maxy = static_cast<int>(qy1);
+			for (int y = miny; y < maxy && y < static_cast<int>(h); y++)
+			{
+				be_t<u32>* row = reinterpret_cast<be_t<u32>*>(basep + static_cast<u64>(y) * pitch);
+				const float vv = (static_cast<float>(y) - qy0) / (qy1 - qy0);
+				for (int x = minx; x < maxx && x < static_cast<int>(w); x++)
+				{
+					const float uu = (static_cast<float>(x) - qx0) / (qx1 - qx0);
+					row[x] = texsample(uu, vv);
+				}
+			}
+			static thread_local u32 s_pt = 0;
+			if (s_pt++ < 3u)
+				printf("[P2-DEVTEST] rasterized synthetic textured quad into surface %ux%u @0x%x (pipeline validation, NOT the splash)\n", w, h, addr);
+		}
 	}
 
 	static thread_local u32 s_clr = 0;

@@ -134,6 +134,33 @@ error_code sys_semaphore_wait(ppu_thread& ppu, u32 sem_id, u64 timeout)
 		if (!s_lblk) { s_lblk = true; printf("[LOADERBLK] loader parks on work-sem=0x%x timeout=0x%llx (was hot-spinning)\n", static_cast<unsigned>(sem_id), static_cast<unsigned long long>(timeout)); }
 		// fall through to the real (blocking) wait — do NOT hot-spin
 	}
+	// RLWAIT (2026-06-03): trace the RenderLoop's idx5 (0x96004500) wait/wake at the lv2 layer
+	// (interpreter-cia probes gave an impossible picture). IN counts wait entries; OUT (at return)
+	// counts wakes. IN>>OUT ⇒ stuck blocked; IN≈OUT ⇒ it wakes but loops without draining the queue.
+	if (ppu.id == 0x1000003u && sem_id == 0x96004500u)
+	{
+		static thread_local u32 s_rwi = 0; const u32 n = ++s_rwi;
+		if (n <= 6u || (n % 256u) == 0u) printf("[RLWAIT-IN] #%u cia=0x%x lr=0x%x timeout=0x%llx\n", n, static_cast<u32>(ppu.cia), static_cast<u32>(ppu.lr), static_cast<unsigned long long>(timeout));
+	}
+	// LOADERWAIT (2026-06-03): the loader (0x1000006) blocks FOREVER on phase-2 queue 0x96006700 (never
+	// posted). Capture its call stack here (once) -> reveals the loader's loop + the phase-1→phase-2
+	// transition, so we can find who SHOULD post 0x96006700 (the missing phase-2 trigger).
+	if (ppu.id == 0x1000006u && (sem_id & 0xFFFF0000u) == 0x96000000u)
+	{
+		static thread_local u32 s_lw = 0; const u32 n = ++s_lw;
+		// log the loader's wait sems over time (which queues it waits on); back-chain on the first.
+		if (n <= 10u || (n & 0x7FFu) == 0u) printf("[LOADERWAIT] #%u loader waits sem=0x%x chan(r31)=0x%x cia=0x%x lr=0x%x\n", n, static_cast<unsigned>(sem_id), static_cast<u32>(ppu.gpr[31]), static_cast<u32>(ppu.cia), static_cast<u32>(ppu.lr));
+		if (n == 1u)
+		{
+			u32 sp = static_cast<u32>(ppu.gpr[1]);
+			for (u32 f = 0; f < 14 && sp >= 0x10000u && sp < 0x60000000u; f++)
+			{
+				const u32 back = vm::read32(sp + 4); const u32 slr = vm::read32(sp + 20);
+				printf("  [LOADERWAIT-FR] #%u sp=0x%x savedLR=0x%x back=0x%x\n", f, sp, slr, back);
+				if (back <= sp) break; sp = back;
+			}
+		}
+	}
 #endif
 
 	const auto sem = idm::get<lv2_obj, lv2_sema>(sem_id, [&, notify = lv2_obj::notify_all_t()](lv2_sema& sema)
@@ -300,6 +327,13 @@ error_code sys_semaphore_wait(ppu_thread& ppu, u32 sem_id, u64 timeout)
 		}
 	}
 
+#ifdef __EMSCRIPTEN__
+	if (ppu.id == 0x1000003u && sem_id == 0x96004500u)
+	{
+		static thread_local u32 s_rwo = 0; const u32 n = ++s_rwo;
+		if (n <= 6u || (n % 256u) == 0u) printf("[RLWAIT-OUT] #%u lr=0x%x r3=0x%x\n", n, static_cast<u32>(ppu.lr), static_cast<u32>(ppu.gpr[3]));
+	}
+#endif
 	return not_an_error(ppu.gpr[3]);
 }
 
@@ -336,7 +370,29 @@ error_code sys_semaphore_post(ppu_thread& ppu, u32 sem_id, s32 count)
 	// Log every post to the game's semaphore pool (0x9600xxxx) EXCEPT the noisy
 	// work-queue 0x96006800, so we can see who (if anyone) posts main's completion
 	// sem 0x96004600 and the audio sem 0x96004100 — the two ends of the boot wall.
-	if (sem_id != 0x96006800u && (sem_id & 0xFFFF0000u) == 0x96000000u) printf("[SEMPOST] sem=0x%x cnt=%d tid=0x%x lr=0x%x cia=0x%x\n", static_cast<unsigned>(sem_id), static_cast<int>(count), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.cia));
+	{ static thread_local u32 s_sp = 0; if (sem_id != 0x96006800u && (sem_id & 0xFFFF0000u) == 0x96000000u && (++s_sp & 0xFFu) == 0u) printf("[SEMPOST] sem=0x%x cnt=%d tid=0x%x lr=0x%x cia=0x%x (1/256)\n", static_cast<unsigned>(sem_id), static_cast<int>(count), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.cia)); }
+	if (sem_id == 0x96006700u) printf("[POST6700] loader phase-2 queue POSTED! cnt=%d tid=0x%x lr=0x%x cia=0x%x\n", static_cast<int>(count), static_cast<unsigned>(ppu.id), static_cast<unsigned>(ppu.lr), static_cast<unsigned>(ppu.cia));
+	// ENQUEUE (2026-06-03): main posts work to the loader's input queue 0x96006800. Capture main's call
+	// stack at the FIRST and the LAST few posts -> main's enqueue loop. Counting posts shows when it stops
+	// (after ~342 resources) and the back-chain reveals the loop that decides what/how-many to enqueue.
+	if (ppu.id == 0x1000000u && sem_id == 0x96006800u)
+	{
+		static thread_local u32 s_eq = 0; const u32 n = ++s_eq;
+		if (n == 1u || n == 300u || n == 600u || n == 635u || (n % 64u) == 0u)
+		{
+			printf("[ENQUEUE] #%u main posts 0x96006800 lr=0x%x cia=0x%x r3=0x%x\n", n, static_cast<u32>(ppu.lr), static_cast<u32>(ppu.cia), static_cast<u32>(ppu.gpr[3]));
+			if (n == 1u)
+			{
+				u32 sp = static_cast<u32>(ppu.gpr[1]);
+				for (u32 f = 0; f < 14 && sp >= 0x10000u && sp < 0x60000000u; f++)
+				{
+					const u32 back = vm::read32(sp + 4); const u32 slr = vm::read32(sp + 20);
+					printf("  [ENQUEUE-FR] #%u sp=0x%x savedLR=0x%x back=0x%x\n", f, sp, slr, back);
+					if (back <= sp) break; sp = back;
+				}
+			}
+		}
+	}
 #endif
 
 	const auto sem = idm::get<lv2_obj, lv2_sema>(sem_id, [&](lv2_sema& sema)

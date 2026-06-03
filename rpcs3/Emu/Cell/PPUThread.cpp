@@ -2505,6 +2505,64 @@ void ppu_thread::exec_task()
 		if ((this->id & 0xFF000000u) == 0x01000000u) // PROGRESS heartbeat: sample main + ResourceLoop so the user can see the boot advancing toward the flip (non-headless is stable, so light printf is fine)
 		{
 			if (this->id == 0x1000000u) { static thread_local u32 s_mf = 0; if ((++s_mf & 0x3FFFFu) == 0u) printf("[MAINFINE] cia=0x%x lr=0x%x r3=0x%x\n", cia, static_cast<u32>(lr), static_cast<u32>(gpr[3])); }
+			// REGTRACK (2026-06-03): track the resource-registration COUNT over the whole run, independent of
+			// main's polling. count @ (*(0x59fb9c)) + 0x290000 - 0x6f9c. Does it climb past main's targets
+			// (#587-595 = 0x24b/0x251-0x253) -> slowness, or plateau -> a real registration stall?
+			if (this->id == 0x1000000u) { static thread_local u32 s_rt = 0; if ((++s_rt & 0x1FFFFu) == 0u) { const u32 base = reinterpret_cast<be_t<u32>*>(mem_ + 0x59fb9cull)->value(); if (base >= 0x400000u && base < 0xc00000u) { const u32 cntv = reinterpret_cast<be_t<u32>*>(mem_ + (u64{base} + 0x290000u - 0x6f9cu))->value(); printf("[REGTRACK] cnt=%u base=0x%x\n", cntv, base); } } }
+			// REGSETUP (2026-06-03): is the register-setup fn 0x86a40 EVER called with a DYNAMIC id (r4>=0x200,
+			// e.g. main's targets 0x251-0x253) or only static manifest ids (<=0x15f)? Catches a gated dynamic/
+			// second-manifest register path (=> find why it fails) vs none-at-all (=> dynamic reg never coded/reached).
+			if (cia == 0x86a40u) { static thread_local u32 s_rs = 0; const u32 n = ++s_rs; if (n <= 6u || static_cast<u32>(gpr[4]) >= 0x200u || (n & 0xFFFu) == 0u) printf("[REGSETUP] #%u id=0x%x cnt=0x%x tid=0x%x lr=0x%x\n", n, static_cast<u32>(gpr[4]), static_cast<u32>(gpr[5]), static_cast<unsigned>(this->id), static_cast<u32>(lr)); }
+			// REGGUARD (2026-06-03): at the commit guard 0x69070, log the resource id (obj+0x1250) and the
+			// guard values (obj+0x1150, obj+0x11d0). Hypothesis: main's targets (rid>=0x200) have a1150==0
+			// (data attributes never populated by the loader) -> commit SKIPPED -> not in index -> main waits.
+			if (cia == 0x69070u) { const u32 ob = static_cast<u32>(gpr[11]); const auto rh = [mem_](u32 a){ return reinterpret_cast<be_t<u16>*>(mem_ + u64{a})->value(); }; const u32 rid = rh(ob + 0x1250u); static thread_local u32 s_gg = 0; const u32 n = ++s_gg; if (n <= 6u || rid >= 0x200u || (n & 0x7FFu) == 0u) printf("[REGGUARD] #%u rid=0x%x a1150=0x%x a11d0=0x%x obj=0x%x\n", n, rid, rh(ob + 0x1150u), rh(ob + 0x11d0u), ob); }
+			// LDRFINE (2026-06-03): map the loader's (0x1000006) PROCESS loop — does it ever reach register
+			// code (0x86a40/0x69xxx/0xe0xxx) after read+inflate, or is it purely I/O (so registration is main's
+			// job, gated)? Dense sample of its live PC.
+			if (this->id == 0x1000006u) { static thread_local u32 s_lf = 0; if ((++s_lf & 0x3FFFu) == 0u) printf("[LDRFINE] cia=0x%x lr=0x%x r3=0x%x\n", static_cast<u32>(cia), static_cast<u32>(lr), static_cast<u32>(gpr[3])); }
+			// LOGOSCAN (2026-06-03): one-shot post-boot — scan emu memory for logo.gtf's decompressed pixel
+			// SIGNATURE (32 ARGB bytes from the Terraria-logo leaves, extracted offline from data.vfs). If
+			// found, the game DID load+decompress the logo (so P1 is registration-only + I can render the
+			// game's OWN loaded copy via P2). If absent, the boot gates BEFORE loading the logos.
+			if (this->id == 0x1000000u) { static thread_local u32 s_gs = 0; if (++s_gs == 2500000u) {
+				// two signatures of offline-Python-decompressed data.vfs chunks:
+				//  sigL = logo.gtf pixels (a VISUAL asset; tests whether boot visuals load at all)
+				//  sigA = a loaded .msf AUDIO chunk (#512, KNOWN-loaded; tests INFLATE bit-correctness)
+				static const u8 sigL[32] = {0xff,0x0c,0x61,0x23,0xff,0x22,0xa8,0x51,0xff,0x22,0xa8,0x51,0xff,0x1d,0x90,0x45,0xff,0x1d,0x90,0x45,0xff,0x22,0xa8,0x51,0xff,0x22,0xa8,0x51,0xff,0x19,0x7b,0x3c};
+				static const u8 sigA[32] = {0xd0,0x8b,0xd0,0x8b,0xb0,0x27,0xb0,0x27,0xb0,0x27,0xb0,0x27,0xbc,0x68,0xbc,0x68,0xc4,0x69,0xc4,0x69,0xc8,0x89,0xc8,0x89,0xb4,0x48,0xb4,0x48,0x9c,0x65,0x9c,0x65};
+				const u32 preL = 0xff0c6123u, preA = 0xd08bd08bu;
+				const u32 ranges[][2] = {{0x100000u,0x10000000u},{0x40000000u,0x41000000u},{0x50000000u,0x51000000u}};
+				u32 fL = 0, fA = 0;
+				for (const auto& rg : ranges) {
+					for (u32 a = rg[0]; a + 32u < rg[1]; a += 4u) {
+						const u32 v = reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value();
+						if (v == preL) { bool m = true; for (u32 k = 0; k < 32u; k++) if (*(mem_ + u64{a} + k) != sigL[k]) { m = false; break; } if (m && fL < 4u) { printf("[LOGOSCAN] logo pixels @0x%x\n", a); fL++; } }
+						else if (v == preA) { bool m = true; for (u32 k = 0; k < 32u; k++) if (*(mem_ + u64{a} + k) != sigA[k]) { m = false; break; } if (m && fA < 4u) { printf("[LOGOSCAN] audio-chunk(inflate) @0x%x\n", a); fA++; } }
+					}
+				}
+				printf("[LOGOSCAN] logo-loaded=%s (%u)  audio-inflate-correct=%s (%u)\n", fL?"YES":"NO", fL, fA?"YES":"NO", fA);
+			}}
+			// RLTRACE (2026-06-03): RenderLoop(0x1000003) is the consumer of main's channel (wake=idx5).
+			// Capture its dispatch channel (r3 @0x40fc78) + count "post 0x96004400" signal hits (0x421524).
+			// Tiny signal-count while main waits => RenderLoop stalls BEFORE main's signal command.
+			if (this->id == 0x1000003u)
+			{
+				if (cia == 0x40fc78u) { static thread_local bool s_rc = false; if (!s_rc) { s_rc = true; printf("[RLCHAN] RenderLoop dispatch channel r3=0x%x\n", static_cast<u32>(gpr[3])); } }
+				if (cia == 0x42179cu) { static thread_local u32 s_rp = 0; const u32 n = ++s_rp; if (n <= 3u || (n % 128u) == 0u) printf("[RLPROC] RenderLoop enters cmd-processor 0x42179c #%u (chan r3=0x%x)\n", n, static_cast<u32>(gpr[3])); }
+				if (cia == 0x421524u) { static thread_local u32 s_sg = 0; const u32 n = ++s_sg; if (n <= 4u || (n % 64u) == 0u) printf("[RLSIGNAL] RenderLoop reached 0x96004400 post #%u (r30=0x%x)\n", n, static_cast<u32>(gpr[30])); }
+				// RLOP: 0x410cac per-command dispatch (mtctr@0x410d34) — log opcode r11 + handler r0.
+				if (cia == 0x410d34u) { static thread_local u32 s_op = 0; const u32 n = ++s_op; if (n <= 16u || (n % 128u) == 0u) printf("[RLOP] #%u opcode=%u handler=0x%x lr=0x%x\n", n, static_cast<u32>(gpr[11]), static_cast<u32>(gpr[0]), static_cast<u32>(lr)); }
+				// RLBCTRL: the REAL bctrl target at 0x4216b0 (mtctr@0x4216a4: r0=target, r9=OPD, r30=object).
+				// lr=0x4216b4 idx5 waits happen INSIDE this target — so this is the actual blocking handler.
+				if (cia == 0x4216a4u) { static thread_local u32 s_bc = 0; const u32 n = ++s_bc; if (n <= 16u || (n % 256u) == 0u) printf("[RLBCTRL] #%u target=0x%x opd=0x%x obj=0x%x objvt=0x%x\n", n, static_cast<u32>(gpr[0]), static_cast<u32>(gpr[9]), static_cast<u32>(gpr[30]), reinterpret_cast<be_t<u32>*>(mem_ + (u64{static_cast<u32>(gpr[30])} & 0xFFFFFFFFu))->value()); }
+				// RLDRAIN: ring header the RenderLoop observes right before bl 0x3c4c58 (check-empty) in the drain
+				// loop 0x421708 (r31=channel @0x42172c). Compare read/write indices vs main's committed command.
+				if (cia == 0x42172cu) { static thread_local u32 s_dq = 0; const u32 n = ++s_dq; if (n <= 4u || (n % 512u) == 0u) { const u32 ch = static_cast<u32>(gpr[31]); const auto rd = [mem_](u32 a){ return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); }; printf("[RLDRAIN] #%u chan=0x%x ringhdr +18:%08x +1c:%08x +20:%08x +24:%08x +28:%08x +2c:%08x\n", n, ch, rd(ch+0x18), rd(ch+0x1c), rd(ch+0x20), rd(ch+0x24), rd(ch+0x28), rd(ch+0x2c)); } }
+				// RLFINE: sample the RenderLoop's live PC to map its actual loop (esp. the last region
+				// before it parks). Resolves the RLCHAN/RLDRAIN=0 contradiction — what loop it really runs.
+				{ static thread_local u32 s_rf = 0; if ((++s_rf & 0x1FFFFu) == 0u) printf("[RLFINE] cia=0x%x lr=0x%x r3=0x%x\n", static_cast<u32>(cia), static_cast<u32>(lr), static_cast<u32>(gpr[3])); }
+			}
 			static thread_local u32 s_wtc = 0;
 			if ((++s_wtc & 0x7FFFFFu) == 0) // very low rate (~every 8M instr): progress heartbeat, negligible overhead on a long run
 			{
@@ -2532,6 +2590,32 @@ void ppu_thread::exec_task()
 				if (this->id == 0x1000000u)   // DIAG ON: RESSCAN +/-8000 scan + BLKDUMP + MAINCIA (resource-registration wall test)
 		{
 			g_main_cia_latch = static_cast<u32>(cia); // latch main's live interpreter PC; frozen => where main is parked (read via [MAINLAST] from another thread)
+				// MAINSPIN (2026-06-03): post-stream, main's latch freezes at 0x32dd0 (a dt/time fn prologue)
+				// while [MAINLAST]="not in syscall" -> main blocks in a HOST wait right after this PC. The
+				// `lr` here = the caller loop L (main's real top-level loop); hit-count distinguishes a tight
+				// poll-spin (rises fast) from a one-time park (stays ~1). Back-chain walks deeper callers.
+				if (cia == 0x32dd0u)
+				{
+					static thread_local u32 s_ms = 0; const u32 n = ++s_ms;
+					if (n <= 4u || (n % 8192u) == 0u)
+					{
+						const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+						const u32 toc = static_cast<u32>(gpr[2]);
+						const u32 clkptr = rdm(toc - 0x7888u);           // -0x7888(r2): ptr to current-time double
+						const u32 structb = rdm(toc - 0x78acu);          // -0x78ac(r2): base for the +0x2731dc/+0x2731e0 reads
+						printf("[MAINSPIN] #%u cia=0x32dd0 lr=0x%x r1=0x%x r2=0x%x clkptr=0x%x clk=%08x%08x structb=0x%x f@31dc=%08x f@31e0=%08x\n",
+							n, static_cast<u32>(lr), static_cast<u32>(gpr[1]), toc, clkptr,
+							clkptr ? rdm(clkptr) : 0u, clkptr ? rdm(clkptr + 4) : 0u,
+							structb, rdm((structb + 0x270000u) + 0x31dcu), rdm((structb + 0x270000u) + 0x31e0u));
+						u32 sp = static_cast<u32>(gpr[1]);
+						for (u32 f = 0; f < 8 && sp >= 0x10000u && sp < 0x40000000u; f++)
+						{
+							const u32 back = rdm(sp + 4); const u32 slr = rdm(sp + 20);
+							printf("  [MAINSPIN-FR] #%u sp=0x%x savedLR=0x%x back=0x%x\n", f, sp, slr, back);
+							if (back <= sp) break; sp = back;
+						}
+					}
+				}
 			// IDX6-DECODE (2026-06-02): one-shot raw disasm of main's frame-sync loop around the
 			// sys_semaphore_wait(0x96004600) at lr=0x411150. idx6 is NEVER posted; main livelocks
 			// (WAITFORCE limps it). Decode what main re-tests after the wait returns (a memory flag?
@@ -2549,7 +2633,7 @@ void ppu_thread::exec_task()
 						printf("  [IDX6D] @0x%x: %08x %08x %08x %08x\n", p, rdm(p), rdm(p+4), rdm(p+8), rdm(p+0xc));
 					// back-chain stack walk (PPC64 ELFv1: back ptr @[sp+4] low word, saved LR @[sp+20] low word, big-endian 8B slots)
 					u32 sp = static_cast<u32>(gpr[1]);
-					for (u32 f = 0; f < 10 && sp >= 0x10000u && sp < 0x40000000u; f++)
+					for (u32 f = 0; f < 14 && sp >= 0x10000u && sp < 0x60000000u; f++) // main stack lives @0x5008xxxx
 					{
 						const u32 back = rdm(sp + 4);
 						const u32 slr = rdm(sp + 20);
@@ -2559,9 +2643,110 @@ void ppu_thread::exec_task()
 					}
 				}
 			}
+			// CODEDUMP (2026-06-03): one-shot dump of deadlock-relevant code regions from runtime memory
+			// (EBOOT segments are encrypted on disc, so disassemble these live bytes offline w/ capstone).
+			{
+				static thread_local bool s_cd = false;
+				if (!s_cd && this->id == 0x1000000u)
+				{
+					s_cd = true;
+					const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+					const u32 regions[][2] = {
+						{0x426300u, 0x426560u}, // main 0x96004400 wait (final block)
+						{0x421400u, 0x421900u}, // RenderLoop cmd dispatcher (jump table + idx5 waits @0x421468/0x4216b4) + drain
+						{0x421700u, 0x421860u}, // main handshake @0x4217dc/0x4217bc
+						{0x423a80u, 0x423d00u}, // worker wait routine @0x423c00
+						{0x63b00u,  0x63e00u},  // usleep poll loop @0x63c98 + caller
+						{0x40fb00u, 0x40fe00u}, // RenderLoop idle/consume @0x40fc7c
+						{0x3c4a00u, 0x3c4f00u}, // SPSC ring primitives: 0x3c4c58 check-empty, 0x3c4dd4 commit
+						{0x410000u, 0x412000u}, // render module: dispatcher 0x410cac + all opcode handlers + idx5-wait handler
+						{0x32c00u,  0x33200u},  // SESSION6: main settles at 0x32e7c after the deadlock break — decode this loop
+						{0x10f800u, 0x110400u}, // SESSION7: main's top loop — sys_time_get_current_time returns to 0x10feb8 here
+						{0x33200u,  0x33800u},  // SESSION7: continuation of the 0x32dd0 dt fn (find its blr + the poll/wait it leads to)
+						{0x3f7800u, 0x3f7f80u}, // SESSION7: RenderLoop frame routine — calls cellRescSetConvertAndFlip @lr=0x3f7ae4
+						{0x402600u, 0x403200u}, // SESSION7: main's TOP frame loop — calls flip-barrier wait @lr=0x402aac; scene-build is here
+						{0x4a5800u, 0x4a5e00u}, // SESSION7: main's RENDER fn — calls flip-sync, returns to 0x4a5ce4; scene-build here
+						{0x409600u, 0x409d00u}, // SESSION7: main's GAME LOOP — calls render @0x4097e0/0x409b78
+						{0x27580u,  0x27780u},  // SESSION7: main's resource-PRESENCE poll (entry 0x2761c, loop 0x27638, found-handler 0x2766c) — decode the EXACT table lookup/compare offset
+						{0x69040u,  0x69180u},  // SESSION7: the register fn (cnt write @0x690b4) — how registration works
+						{0xe0140u,  0xe0280u},  // SESSION7: the unrolled registration driver START (cnt 1.. @lr=0xe0164)
+						{0xe7880u,  0xe7d80u},  // SESSION7: registration driver END — last commit @lr=0xe795c (cnt=342). Does it continue (stalled) or return (complete)?
+						{0x1d6200u, 0x1d6500u},  // SESSION7: resource-manager — calls static manifest @0x1d6270, returns 0x1d6274. POST-manifest = load/re-commit logic?
+						{0x1d6e00u, 0x1d7080u},  // SESSION7: resource-manager outer (0x1d6fec calls 0x1d6274)
+						{0x1d4700u, 0x1d4c80u},  // SESSION7: DYNAMIC register-setup path (0x86a40 callers 0x1d4798/0x1d49e0/0x1d4a84/0x1d4b1c) — does it commit?
+						{0x275c0u,  0x275f8u},  // SESSION7: poll pre-check 0x275f8 (data-loaded? returns 0=loaded)
+						{0x425680u, 0x425a00u},  // SESSION7: loader completion-dispatch ~0x4257b4 (LDRFINE lr=0x42570c) — the post-load callback that should register?
+					};
+					for (const auto& rg : regions)
+						for (u32 b = rg[0]; b < rg[1]; b += 32)
+							printf("[CODEDUMP] %06x: %08x %08x %08x %08x %08x %08x %08x %08x\n", b,
+								rdm(b), rdm(b+4), rdm(b+8), rdm(b+0xc), rdm(b+0x10), rdm(b+0x14), rdm(b+0x18), rdm(b+0x1c));
+				}
+			}
+			// CHANDUMP (2026-06-03): dump main's actor/channel object on entry to the 0x96004400 wait
+			// (0x426434: r28=channel). Decode the producer/consumer link: vtable(+0), queue rd-ptr(+0xa8)/
+			// count(+0xac), completion sem(+0xe4), consumer-wake sem ptr(+0xe8), flags(+0xc8/+0xcc/+0xd4).
+			if (cia == 0x426460u && this->id == 0x1000000u)
+			{
+				static thread_local bool s_ch = false;
+				if (!s_ch)
+				{
+					s_ch = true;
+					const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+					const u32 ch = static_cast<u32>(gpr[28]);
+					printf("[CHANDUMP] main channel r28=0x%x r27=0x%x r29=0x%x\n", ch, static_cast<u32>(gpr[27]), static_cast<u32>(gpr[29]));
+					for (u32 o = 0; o <= 0x100u; o += 16)
+						printf("  [CHAN] @+0x%x: %08x %08x %08x %08x\n", o, rdm(ch+o), rdm(ch+o+4), rdm(ch+o+8), rdm(ch+o+0xc));
+					const u32 vt = rdm(ch);
+					printf("  [CHAN-VT] vtable=0x%x: %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", vt,
+						rdm(vt), rdm(vt+4), rdm(vt+8), rdm(vt+0xc), rdm(vt+0x10), rdm(vt+0x14), rdm(vt+0x18), rdm(vt+0x1c), rdm(vt+0x20));
+					const u32 wp = rdm(ch+0xe8);
+					printf("  [CHAN-WAKE] obj=0x%x: type=%08x sem_id=%08x (this is main's consumer-wake sem)\n", wp, rdm(wp), rdm(wp+4));
+					const u32 q = rdm(ch+0x18);
+					for (u32 o = 0; o <= 0x60u; o += 16)
+						printf("  [CHAN-Q] queue=0x%x +0x%x: %08x %08x %08x %08x\n", q, o, rdm(q+o), rdm(q+o+4), rdm(q+o+8), rdm(q+o+0xc));
+					// pending command is a C++ object: cmd+0x14 -> obj -> vtable -> vtable[0]={fn,toc}
+					const u32 cmdobj = rdm(q+0x14);   // 0x592a58
+					const u32 cvt    = rdm(cmdobj);   // 0x59bb70 (vtable)
+					const u32 hfn    = rdm(cvt) & ~3u;// vtable[0] fn = real handler (0x4116b8)
+					printf("[CMD-HANDLER] cmd=0x%x type=%d obj=0x%x vtable=0x%x fn0=0x%x m1=0x%x m2=0x%x m3=0x%x\n",
+						q, static_cast<int>(rdm(q+0x20)), cmdobj, cvt, rdm(cvt), rdm(cvt+8), rdm(cvt+0x10), rdm(cvt+0x18));
+					if (hfn >= 0x10000u && hfn < 0x588ce8u)
+						for (u32 b = hfn; b < hfn + 0x240u; b += 32)
+							printf("[CODEDUMP] %06x: %08x %08x %08x %08x %08x %08x %08x %08x\n", b,
+								rdm(b), rdm(b+4), rdm(b+8), rdm(b+0xc), rdm(b+0x10), rdm(b+0x14), rdm(b+0x18), rdm(b+0x1c));
+				}
+			}
+			// GAMECLOCK (2026-06-03): the game's time double lives at *0x4e9980 (main read f11 from it @0x32dd0).
+			// Counter-based (cia probes are unreliable) — dump it over main's execution to test if the clock
+			// is advancing. If stuck near zero, main's time-based state machine never reaches the splash.
+			{
+				static thread_local u32 s_g6 = 0;
+				if ((++s_g6 & 0x1FFFFu) == 0u)
+				{
+					const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+					printf("[GAMECLOCK] n=%u time@0x4e9980=%08x%08x cia=0x%x\n", s_g6, rdm(0x4e9980u), rdm(0x4e9984u), static_cast<u32>(cia));
+					static thread_local u32 s_inrange = 0; static thread_local bool s_dumped = false;
+					const u32 c = static_cast<u32>(cia);
+					if (c >= 0x32c00u && c < 0x33400u) s_inrange++; else s_inrange = 0;
+					if (!s_dumped && s_inrange >= 8u)
+					{
+						s_dumped = true;
+						printf("[STALL] cia=0x%x lr=0x%x r0=0x%x r3=0x%x r4=0x%x r5=0x%x r9=0x%x r10=0x%x r28=0x%x r29=0x%x r30=0x%x r31=0x%x\n",
+							c, static_cast<u32>(lr), static_cast<u32>(gpr[0]), static_cast<u32>(gpr[3]), static_cast<u32>(gpr[4]), static_cast<u32>(gpr[5]), static_cast<u32>(gpr[9]), static_cast<u32>(gpr[10]), static_cast<u32>(gpr[28]), static_cast<u32>(gpr[29]), static_cast<u32>(gpr[30]), static_cast<u32>(gpr[31]));
+						u32 sp = static_cast<u32>(gpr[1]);
+						for (u32 f = 0; f < 14 && sp >= 0x10000u && sp < 0x60000000u; f++)
+						{
+							const u32 back = rdm(sp + 4); const u32 slr = rdm(sp + 20);
+							printf("  [STALL-FR] #%u sp=0x%x savedLR=0x%x\n", f, sp, slr);
+							if (back <= sp) break; sp = back;
+						}
+					}
+				}
+			}
 			// WAITLOOP-DECODE (2026-06-03): main is PAST idx6 but idles in a sys_timer_usleep(20ms) loop
 			// @lr=0x63c98, presenting EMPTY frames (scene draws have verts=0). Decode what flag it re-tests.
-			if (cia >= 0x63c40u && cia <= 0x63d00u)
+			if (cia == 0x63c98u)
 			{
 				static thread_local bool s_dw = false;
 				if (!s_dw)
@@ -2570,8 +2755,33 @@ void ppu_thread::exec_task()
 					const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
 					printf("[WAITLOOP] r3=0x%x r4=0x%x r5=0x%x r6=0x%x r24=0x%x r25=0x%x r26=0x%x r27=0x%x r28=0x%x r29=0x%x r30=0x%x r31=0x%x cia=0x%x lr=0x%x\n",
 						static_cast<u32>(gpr[3]),static_cast<u32>(gpr[4]),static_cast<u32>(gpr[5]),static_cast<u32>(gpr[6]),static_cast<u32>(gpr[24]),static_cast<u32>(gpr[25]),static_cast<u32>(gpr[26]),static_cast<u32>(gpr[27]),static_cast<u32>(gpr[28]),static_cast<u32>(gpr[29]),static_cast<u32>(gpr[30]),static_cast<u32>(gpr[31]),static_cast<u32>(cia),static_cast<u32>(lr));
-					for (u32 p = 0x63bc0u; p < 0x63d00u; p += 16)
-						printf("  [WAITLOOP] @0x%x: %08x %08x %08x %08x\n", p, rdm(p), rdm(p+4), rdm(p+8), rdm(p+0xc));
+					printf("[WAITFLAG] @0x63c98 lr=0x%x  arg-hunt reg : *(reg+0x18):\n", static_cast<u32>(lr));
+					for (u32 ri = 3; ri <= 31; ri++) {
+						const u32 rv = static_cast<u32>(gpr[ri]);
+						if (rv >= 0x10000u && rv < 0x10000000u)
+							printf("  [WAITFLAG] r%u=0x%x  +0x18=0x%x  +0x0=0x%x +0x4=0x%x +0x14=0x%x +0x1c=0x%x +0x10=0x%x\n",
+								ri, rv, rdm(rv+0x18), rdm(rv), rdm(rv+4), rdm(rv+0x14), rdm(rv+0x1c), rdm(rv+0x10));
+					}
+				}
+				// WAITFORCE (2026-06-03): past the 152-frame intro, set the flag main spins on to 1 ONCE,
+				// a diagnostic to see what is behind the gate (does main submit the splash, and via which path?).
+				{
+					static thread_local u32 s_hits = 0;
+					static thread_local bool s_forced = false;
+					if (!s_forced && ++s_hits == 15u)
+					{
+						s_forced = true;
+						const auto rdm = [mem_](u32 a) -> u32 { return reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); };
+						const u32 a31 = static_cast<u32>(gpr[31]);
+						const u32 a30 = static_cast<u32>(gpr[30]);
+						printf("[WAITFORCE] hit=600 r31=0x%x *(r31+0x18)=0x%x  r30=0x%x *(r30+0x18)=0x%x\n",
+							a31, rdm(a31+0x18), a30, rdm(a30+0x18));
+						for (u32 p = 0x63c40u; p <= 0x63ca0u; p += 16)
+							printf("  [WF-DIS] @0x%x: %08x %08x %08x %08x\n", p, rdm(p), rdm(p+4), rdm(p+8), rdm(p+0xc));
+						// NOTE: forcing *(r31+0x18)=1 here (tried) makes main exit the poll then dispatch a
+						// NULL fn (exec_task cia=0x0) -> OOB trap. The flag gates a real async completion
+						// whose result table is empty (dead SPU pipeline) — do NOT force it. Diagnostic only.
+					}
 				}
 			}
 			// MAINFREEZE: main's interpreter parks at 0x9c6f74. Dump the instruction + regs + lr + ctr
@@ -2658,6 +2868,65 @@ void ppu_thread::exec_task()
 					if (r31q >= 0x10000u && r31q < 0x5ff00000u)
 					{
 						const u16 tq = reinterpret_cast<be_t<u16>*>(mem_ + (u64{r31q} + 0x6cu))->value();
+						{ // IDSCAN (2026-06-03): authoritative — search the WHOLE table for main's tq; count
+						  // entries with a REAL id (+0x60 != 0xffff AND != 0). found -> H-bug (offset); absent -> empty table.
+							const u32 curs = static_cast<u32>(gpr[29]);
+							static thread_local u32 s_ids = 0;
+							if (curs >= 0x800000u && curs < 0xb00000u && tq != 0u && (s_ids++ < 4u || (s_ids & 0x3FFu) == 0u))
+							{
+								const auto rdh = [mem_](u32 a){ return reinterpret_cast<be_t<u16>*>(mem_ + u64{a})->value(); };
+								u32 realreg = 0; s32 fk = 0x7fffffff; u32 foff = 0; u16 f60f = 0;
+								for (s32 k = -4000; k <= 4000; k++)
+								{
+									const s64 e = static_cast<s64>(curs) + static_cast<s64>(k) * 0x68c;
+									if (e < 0x10000 || e + 0x80 >= 0x5ff00000) continue;
+									const u32 ea = static_cast<u32>(e);
+									const u16 f60 = rdh(ea + 0x60);
+									if (f60 != 0xffffu && f60 != 0u) realreg++;
+									for (u32 off = 0x40u; off <= 0x78u; off += 2u) if (rdh(ea + off) == tq) { if (fk == 0x7fffffff) { fk = k; foff = off; f60f = f60; } }
+								}
+								printf("[IDSCAN] tq=0x%x cur=0x%x realreg=%u foundk=%d foundoff=0x%x f60@=0x%04x\n", static_cast<unsigned>(tq), curs, realreg, static_cast<int>(fk), foff, f60f);
+								// IDSCAN2: the CORRECT two-level structure decoded from the poll asm @0x27700.
+								// inner array @ r10g + 0x290000 - 0x6f8c, stride 0x80, id halfword @ offset 0.
+								{
+									const u32 r2v = static_cast<u32>(gpr[2]);
+									const u32 r10g = reinterpret_cast<be_t<u32>*>(mem_ + (u64{r2v} - 0x78acu))->value();
+									const u32 inner = r10g + 0x290000u - 0x6f8cu;
+									const u32 cnt = reinterpret_cast<be_t<u32>*>(mem_ + (u64{r10g} + 0x290000u - 0x6f9cu))->value(); // registered count @0x880694
+									s32 fk2 = -1; u32 nz = 0;
+									char ids[600]; u32 p = 0;
+									for (u32 i = 0; i < 256u && p < 560u; i++) { const u32 a = inner + i * 0x80u; const u16 v = rdh(a); if (v != 0u && v != 0xffffu) { nz++; p += static_cast<u32>(snprintf(ids + p, sizeof(ids) - p, "%x:%04x ", i, v)); } if (v == tq && fk2 < 0) fk2 = static_cast<s32>(i); }
+									ids[p] = 0;
+									printf("[IDSCAN2] tq=0x%x cnt=%u inner=0x%x found_i=%d nz256=%u  idx:id = %s\n",
+										static_cast<unsigned>(tq), cnt, inner, static_cast<int>(fk2), nz, ids);
+								}
+							}
+						}
+						{ // IDDUMP (2026-06-03): one-shot — dump +0x50..0x70 of REGISTERED entries; do main's
+						  // wanted IDs (0x8/0xe1/0x6/0x96/0x131) exist at SOME offset (H-bug) or are ABSENT (H-logic)?
+							static thread_local bool s_idd = false;
+							const u32 curd = static_cast<u32>(gpr[29]);
+							if (!s_idd && curd >= 0x800000u && curd < 0xb00000u) // real table cursor (REGCOUNT range), not the 0x1f garbage polls
+							{
+								s_idd = true;
+								const auto rdh = [mem_](u32 a){ return reinterpret_cast<be_t<u16>*>(mem_ + u64{a})->value(); };
+								printf("[IDDUMP] main wants tgt=0x%x cur=0x%x. Registered entries (+50..+70):\n", static_cast<unsigned>(tq), curd);
+								u32 nn = 0;
+								for (s32 k = -400; k <= 400 && nn < 16; k++)
+								{
+									const s64 e = static_cast<s64>(curd) + static_cast<s64>(k) * 0x68c;
+									if (e < 0x10000 || e + 0x80 >= 0x5ff00000) continue;
+									const u32 ea = static_cast<u32>(e);
+									if (rdh(ea + 0x60) != 0xffff)
+									{
+										printf("  [IDDUMP] k=%d:", k);
+										for (u32 off = 0x50u; off <= 0x70u; off += 2u) printf(" %04x", rdh(ea + off));
+										printf("\n");
+										nn++;
+									}
+								}
+							}
+						}
 						// BROAD: redirect EVERY main resource-presence check to "found". The
 						// never-registered id set is dynamic (varies per scan), so hardcoding is
 						// wrong. Registered ids reach 0x2766c anyway (same result); only the
@@ -2665,6 +2934,9 @@ void ppu_thread::exec_task()
 						// resource-presence wait lets main reach the flip. (If it crashes early,
 						// gate on a poll-count threshold so early legit checks run normally.)
 						{
+							// (POLLBYPASS5 redirect restored after the run90 experiment, which PROVED main never
+							// posts 0x96006700 regardless of the bypass — main just busy-polls IDs 0x8/0xe1/0x6/
+							// 0x96/0x131 from its loop @0x27638; the bypass papers it. Producer of phase-2 is elsewhere.)
 							static thread_local u32 s_byp5 = 0;
 							if ((s_byp5++ & 0xFFFFFFu) == 0u) printf("[POLLBYPASS5] broad-redirect tgt=0x%x 0x27700->0x2766c n=%u\n", static_cast<unsigned>(tq), s_byp5);
 							cia = 0x2766cu;

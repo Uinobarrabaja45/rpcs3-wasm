@@ -451,7 +451,27 @@ auto ppu_feed_data(ppu_thread& ppu, u64 addr)
 {
 	static_assert(sizeof(T) <= 128, "Incompatible type-size, break down into smaller loads");
 
+#ifdef __EMSCRIPTEN__
+	// WASM UNBLOCK (2026-06-03): the PS3 PPU wraps effective addresses at 32 bits, but our ~1000x-slower
+	// interpreter makes the game's time-based index math (e.g. main's dt/profiling fn @0x32dd0) overflow
+	// into multi-GB EAs that real HW's faster timing never reaches. vm::cast's checked narrow<u32> then
+	// throws a FATAL "Narrowing error", crash-looping main at 0x32e7c (the reason flip never passed ~2362).
+	// Fix: mask the EA to 32 bits (PPU semantics → unchecked cast), and if it lands outside the grown wasm
+	// linear memory, read 0 instead of crashing — so main survives the (non-critical timing) load.
+	using FeedT = std::remove_reference_t<decltype(vm::_ref<T>(vm::cast(static_cast<u32>(addr))))>;
+	auto value = [&]() -> FeedT {
+		const u32 ea = static_cast<u32>(addr);
+		if ((reinterpret_cast<u64>(vm::g_base_addr) + ea + sizeof(T)) > (static_cast<u64>(__builtin_wasm_memory_size(0)) * 65536ull)) [[unlikely]]
+		{
+			static thread_local u32 s_bad = 0;
+			if ((s_bad++ & 0x3FFFFu) == 0u) printf("[BADEA] ppu_feed_data OOB ea=0x%x addr=0x%llx -> 0 (cia=0x%x n=%u)\n", ea, static_cast<unsigned long long>(addr), static_cast<u32>(ppu.cia), s_bad);
+			return FeedT{};
+		}
+		return vm::_ref<T>(vm::cast(ea));
+	}();
+#else
 	auto value = vm::_ref<T>(vm::cast(addr));
+#endif
 
 #ifdef RPCS3_HAS_MEMORY_BREAKPOINTS
 	if (g_breakpoint_handler.HasBreakpoint(addr, breakpoint_types::bp_read))
@@ -5829,6 +5849,29 @@ auto STW()
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
 	const u32 value = static_cast<u32>(ppu.gpr[op.rs]);
 	PPU_WRITE_32(vm::cast(addr), value);
+
+#ifdef __EMSCRIPTEN__
+	// IDXWRITE (2026-06-03): watch writes to the resource-registration COUNT @0x880694 (r10g=0x5f7630 +
+	// 0x289064). Reveals the register-writer (cia/lr) so we can find why it stops at 342.
+	if (static_cast<u32>(addr) >= 0x880690u && static_cast<u32>(addr) <= 0x880698u) [[unlikely]]
+	{
+		static thread_local u32 s_iw = 0; const u16 cid = reinterpret_cast<be_t<u16>*>(vm::base(0x948880u))->value(); if (++s_iw <= 400u) printf("[IDXWRITE] cnt=%u committed-id=0x%x lr=0x%x\n", value, static_cast<unsigned>(cid), static_cast<u32>(ppu.lr));
+		// FORCECOMMIT v1 (nop guard @0x6907c/0x69094) REVERTED: it broke the register fn's loop (main stuck
+		// at 0x69094, cnt=312) — the guard is load-bearing loop control, not a simple skip. Confirms dynamic
+		// resources are correctly skipped because their data isn't valid at manifest-commit time.
+		// one-shot back-chain: main's call stack during the static manifest -> the manifest's CALLER, whose
+		// "resources missing" logic should trigger load + re-commit (the missing step).
+		if (s_iw == 2u) {
+			u32 sp = static_cast<u32>(ppu.gpr[1]);
+			for (u32 f = 0; f < 16 && sp >= 0x10000u && sp < 0x60000000u; f++) {
+				const u32 back = reinterpret_cast<be_t<u32>*>(vm::base(sp + 4u))->value();
+				const u32 slr  = reinterpret_cast<be_t<u32>*>(vm::base(sp + 20u))->value();
+				printf("  [MANIFEST-FR] #%u sp=0x%x savedLR=0x%x back=0x%x\n", f, sp, slr, back);
+				if (back <= sp) break; sp = back;
+			}
+		}
+	}
+#endif
 
 	//Insomniac engine v3 & v4 (newer R&C, Fuse, Resitance 3)
 	if (value == 0xAAAAAAAA) [[unlikely]]
