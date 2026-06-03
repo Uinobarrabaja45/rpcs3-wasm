@@ -1007,3 +1007,135 @@ crash is PRE-EXISTING — present in runs 115-120 too, a teardown artifact).
   draws the splash into the source, P2-DRAW rasterizes it → flip → canvas → splash. Nothing else is missing.
 - (Note: A8R8G8B8 passthrough assumes linear/un-swizzled; if real splash textures are swizzled, add de-swizzle.
   The crash @0x32e7c narrowing in main's dt-fn is a separate, pre-existing teardown issue worth a look.)
+
+---
+
+## SESSION 8 (2026-06-03) — 🎉 THE SPLASHES RENDER (real RSX → flip → WebGPU)
+
+**The session-long "stuck at flip ~2362" was a CRASH-LOOP, not a wait.** main was crashing
+every ~80s at cia=0x32e7c with a `Narrowing error` thrown by `ppu_feed_data<u32>`
+(PPUInterpreter.cpp:454, `vm::cast(addr)` → checked `narrow<u32>`), the page auto-reloaded,
+and flip reset to 301 — over and over. What every prior session read as "main parked at
+0x32e7c" was main **repeatedly crashing**.
+
+### Root cause
+Our PPU interpreter is ~1000× slower than real HW. The game's time-based index math (main's
+dt/profiling fn @0x32dd0 → `fctiwz`/`extsw` at 0x32eac–0x32ed8) overflows: a large timing
+value sign-extends to a wild effective address (observed `addr=0xffffffffb506ce80`). The PS3
+PPU wraps EAs at 32 bits and real HW's faster timing never reaches these values, but our
+`vm::cast` turns the >4GB EA into a FATAL narrowing crash.
+
+### Fix  (PPUInterpreter.cpp `ppu_feed_data`, ~line 452)
+Under `__EMSCRIPTEN__`: mask the EA to 32 bits (PPU-correct wrap → unchecked cast) and, if it
+lands outside the grown wasm linear memory, return 0 instead of crashing. One bad load now
+returns 0 (logged `[BADEA]`) and main survives.
+
+### Result
+- **0 narrowing crashes, 0 reboots** (was crash-looping all session).
+- main advances PAST the crash into its **real frame loop**, synchronizing with EE RenderLoop
+  via frame-barrier semaphore **0x96004600** (main blocks 1436×, RenderLoop wakes 1436× —
+  balanced; not a deadlock, a running game loop).
+- main reached new boot phases: `cellVideoOutConfigure`, `cellUserInfoGetStat/GetList`,
+  `cellAudioOut*`, new code at 0x49xxxx.
+- **The ENGINE SOFTWARE boot splash renders crisply on the WebGPU canvas** (run ml1 shot 001):
+  real RSX execution → `WebGPUGSRender::end()` P2-DRAW (fragment_textures[0] → 960×540 surface)
+  → flip() → WebGPU blit. **"No faked pixels" satisfied.** User confirmed 3 splashes render.
+
+### Next gate: the menu (Terraria title screen) is BLACK after the splashes
+The splashes are single full-screen A8R8G8B8 (fmt 0xa5) textures — the P2-DRAW full-screen
+blit handles them perfectly. The title screen renders a "title world" (many positioned,
+UV-mapped textured tiles) — **real geometry the full-screen-blit path fundamentally cannot
+show.** Added texture-sequence instrumentation ([P2-DRAW] logs each new texture offset) to
+determine whether the game REACHES the menu draws (→ next step: a real geometry rasterizer /
+the WebGPU pipeline) or STALLS before them (→ fix the loader/asset gate: loader 0x1000006 was
+seen blocked in sys_semaphore_wait on 0x96006700, splash logo-in-memory=NO).
+
+### Menu gate — DEEP DIAGNOSIS (2026-06-03, run123)
+
+After the 3 splashes (3 distinct full-screen A8R8G8B8 textures: off=0x1fa480, 0x3f4880,
+0x5eec80), main calls the function at **0x32dd0** — the **title-world procedural generator**:
+a time-seeded **xorshift PRNG** (0x32e7c–0x32e98: `slwi r9,r10,0xb; xor; srwi; xor; clrldi
+0x21`) whose output is scaled `r5 = (int)((rand & 0x7FFFFFFF) * f3)`, with f3 = `*(0x4e9980)`
+(=2^-31) × a large TOC constant C1. r5 comes out **~135M**, then indexes a buffer:
+`r11=r5+0x13; r31=r11<<4; r29=extsw(r31); r12=r29+r23; lwz r31,8(r12)`. r5*16 exceeds 2^31,
+`extsw` sign-extends it negative, r12 → wild EA (observed 0xffffffffd10fc430). My OOB guard
+returns 0 → the 0 propagates to a **function-pointer call → main jumps to cia=0x0 with lr=0,
+null-loops forever** (game logic frozen; RenderLoop keeps presenting the last/black frame).
+
+**Two stacked gates remain for the menu:**
+1. **The generator overflow / null-loop.** r5 should be small (a valid buffer index) but is
+   ~135M. Either C1 is mis-set, the PRNG STATE (4×u32 @ struct+0x270000+0x31d4..0x31e0) is
+   garbage (uninitialized title-world seed → same family as the long-standing P1 asset/
+   registration wall), or a mask is missing. Needs the seed-writer + C1 value to resolve.
+2. **Geometry rendering.** Even past (1), the title screen renders a tiled world (many
+   positioned, UV-mapped quads). The current renderer only blits ONE full-screen texture
+   (great for splashes, useless for tiles) — needs a real geometry rasterizer / WebGPU pipeline.
+
+**Status: the splash milestone is DONE and solid. The menu is a fresh multi-gate phase.**
+
+### Probe result (run124): the null-loop is INDEPENDENT of the overflowed load
+
+Changed the OOB load to return a real clamped value instead of 0. **main null-loops
+identically** (1.06M iterations, same as run123). So the overflow and the null-loop are
+co-symptoms, not cause→effect. Reverted to `return 0` (cleaner; splashes render either way).
+
+Actual null-loop mechanism (`[null-fn DIAG #1]`): main executes `bctrl` to **ctr=0** with
+**lr=0x18001c00000000** (low 32 bits = 0 → blr-emulate returns to 0x0 → infinite loop). This is
+a **null vtable call**: main invokes a method on the title-world object whose vtable pointer is
+garbage — i.e. **the object was never constructed**. Called from the resource manager path
+(generator @0x32dd0 ← lr=0x1d4954).
+
+**Conclusion — the menu is a different magnitude than the splash.** The splash was a single
+full-screen texture the game DID set up. The menu requires the game's title-world OBJECT to be
+constructed (asset/registration system working end-to-end — the long-standing P1 wall), THEN
+real tiled-geometry rendering. Both PRNG overflow and null vtable trace to the same unconstructed
+object. This is "make the game actually run," not a render patch.
+
+### CONSTRUCTOR HUNT — root cause found (runs 125-127, 2026-06-03)
+
+Traced the menu null-loop end-to-end:
+- **Null return site: blr @0x1d4970.** Its epilogue does `ld r28,0x120(r1); mtlr r28; …; blr`,
+  restoring the return address FROM THE STACK — and that saved slot (plus saved r29/r30/r31)
+  is **garbage (0x18001c00000000, low-32=0)** → blr → cia=0 → 1.7M-iteration null-loop.
+- **Who corrupts the stack:** the title-world generator @0x32dd0 (called from this fn,
+  lr=0x1d4954). It computes a PRNG index and does `[(idx+0x13)*16 + base]` loads AND
+  hash-addressed stores. With a bad index those addresses are wild and **stomp the caller's
+  stack frame** (saved LR/regs).
+- **The bad value — decomposed at the faulting access (`[BADEA]` r-dump):**
+  - r23 (buffer BASE) = **0x5ae328 — VALID.**
+  - r5 (INDEX) = **0x4e3f19ab ≈ 1.3 billion** = r10(0xce3f19ab) & 0x7FFFFFFF = the **raw,
+    unscaled 31-bit PRNG output.**
+  - EA = (0x4e3f19ab+0x13)*16 + 0x5ae328 (32-bit wrap) + 8 = **0xe44c7f10** (matches) → OOB
+    on our VM AND on a real PS3 (3.8GB). So r5 is genuinely wrong — it must be SCALED small.
+- **The broken constant:** r5 should be `(int)(rand × f3)` scaled into [0, buffer_size), but
+  r5 == raw rand ⇒ **f3 = 1.0**. f3 = `*(0x4e9980)`(=2^-31) × `*(TOC-0x7628 = 0x59fe20)`(≈2^31)
+  = 1.0. One of those static constants is wrong/uninitialized — the title-world generator's
+  CONFIG (its index scale) is never set up. Same family as the static-init/asset wall.
+
+**This IS the constructor we're hunting: whatever initializes the generator's scale config
+never runs (or runs with bad data), leaving f3 = 1.0.** Open question: the CORRECT f3 value
+(needs a desktop-RPCS3 reference to read 0x4e9980 / 0x59fe20 on a clean boot) and which
+init/ctor writes them. Diagnostic probes left in place: [NULLBLR]/[NULLCTR] (PPUInterpreter
+BCLR/BCCTR) + the decomposed [BADEA].
+
+### MAJOR FIX + remaining gate (runs 128-130, 2026-06-03)
+
+**🔧 Fixed a fundamental WASM bug: float→int conversions were silent no-ops.**
+`FCTIW/FCTIWZ/FCTID/FCTIDZ` (PPUInterpreter.cpp) had only `#if ARCH_X64 / #elif ARCH_ARM64`
+branches — **no `#else`**, so on wasm32 the destination FPR was never written. Every `fctiwz`
+(double→int32 truncate) etc. was a no-op leaving stale bits. The title-world generator scaled
+its PRNG index via fctiwz and got the RAW ~1.3e9 value instead of [0,5) → wild address. Added
+portable implementations (truncate/round + PPC out-of-range clamp). Result: **the BADEA wild
+access is GONE** (generator index now correct). The scale constants were CORRECT all along
+(C1=5.0) — the bug was ours, not the game's. This fix is ubiquitous (float→int is everywhere),
+likely improving correctness across ALL games on the wasm port.
+
+**Menu still gated — by a separate stack corruption (the next lead).**
+main still null-loops: function @0x1d48xx returns (blr @0x1d4970) to a garbage saved-LR
+**0x18001c00000000** (= the 32-bit code addr 0x18001c shifted into the HIGH half; low 32 = 0 →
+blr → cia=0). The `[LRHI]` mtlr-watch proves there is NO upstream garbage-mtlr chain — the only
+>32-bit mtlr is the epilogue restoring this value from the stack. So a **stray STORE wrote
+0x18001c00000000 into main's stack frame** (saved-LR slot ~0x500806b0, parent r1=0x50080590).
+Fixing fctiwz did NOT remove this → it's an independent corruption. NEXT: store-watch main's
+frame to catch the stray writer (which op / which thread / what value-source produces the
+high-shifted 0x18001c).

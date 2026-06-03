@@ -2607,6 +2607,18 @@ void ppu_thread::exec_task()
 							n, static_cast<u32>(lr), static_cast<u32>(gpr[1]), toc, clkptr,
 							clkptr ? rdm(clkptr) : 0u, clkptr ? rdm(clkptr + 4) : 0u,
 							structb, rdm((structb + 0x270000u) + 0x31dcu), rdm((structb + 0x270000u) + 0x31e0u));
+						// GENSCALE: read the title-world generator's index scale constants so we can diff vs
+						// desktop RPCS3. f3 = f11*C1 is the per-index scale; it comes out 1.0 (no scaling) ->
+						// the PRNG index isn't reduced into the buffer range -> overflow -> stack stomp.
+						if (n == 1u)
+						{
+							const u32 toc2 = static_cast<u32>(gpr[2]);
+							printf("[GENSCALE] f11(clk@0x%x)=%08x%08x  C1(@0x%x,-0x7628)=%08x%08x  C@-7640=%08x%08x  C@-7620=%08x%08x  [f3=f11*C1; if f3==1.0 the scale is broken]\n",
+								clkptr, clkptr ? rdm(clkptr) : 0u, clkptr ? rdm(clkptr + 4) : 0u,
+								toc2 - 0x7628u, rdm(toc2 - 0x7628u), rdm(toc2 - 0x7628u + 4u),
+								rdm(toc2 - 0x7640u), rdm(toc2 - 0x7640u + 4u),
+								rdm(toc2 - 0x7620u), rdm(toc2 - 0x7620u + 4u));
+						}
 						u32 sp = static_cast<u32>(gpr[1]);
 						for (u32 f = 0; f < 8 && sp >= 0x10000u && sp < 0x40000000u; f++)
 						{

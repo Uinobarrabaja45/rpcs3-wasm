@@ -463,8 +463,16 @@ auto ppu_feed_data(ppu_thread& ppu, u64 addr)
 		const u32 ea = static_cast<u32>(addr);
 		if ((reinterpret_cast<u64>(vm::g_base_addr) + ea + sizeof(T)) > (static_cast<u64>(__builtin_wasm_memory_size(0)) * 65536ull)) [[unlikely]]
 		{
+			// WASM unblock: out-of-range EA (slow-interpreter time-math overflow) — return 0 instead of a
+			// fatal narrowing crash so main survives this (non-critical) load and the splashes render. The
+			// menu's null-loop is INDEPENDENT of this load (proven 2026-06-03 by the clamp probe: returning a
+			// real value here doesn't prevent it — it's a null vtable call on an unconstructed object. See PLAN).
 			static thread_local u32 s_bad = 0;
-			if ((s_bad++ & 0x3FFFFu) == 0u) printf("[BADEA] ppu_feed_data OOB ea=0x%x addr=0x%llx -> 0 (cia=0x%x n=%u)\n", ea, static_cast<unsigned long long>(addr), static_cast<u32>(ppu.cia), s_bad);
+			if ((s_bad++ & 0x3FFFFu) == 0u) printf("[BADEA] OOB ea=0x%x cia=0x%x | r5(idx)=0x%llx r23(base)=0x%llx r9=0x%llx r7=0x%llx r4=0x%llx r10=0x%llx (n=%u)\n",
+				ea, static_cast<u32>(ppu.cia),
+				static_cast<unsigned long long>(ppu.gpr[5]), static_cast<unsigned long long>(ppu.gpr[23]),
+				static_cast<unsigned long long>(ppu.gpr[9]), static_cast<unsigned long long>(ppu.gpr[7]),
+				static_cast<unsigned long long>(ppu.gpr[4]), static_cast<unsigned long long>(ppu.gpr[10]), s_bad);
 			return FeedT{};
 		}
 		return vm::_ref<T>(vm::cast(ea));
@@ -3340,6 +3348,27 @@ auto BCLR()
 
 	if (ctr_ok && cond_ok)
 	{
+#ifdef __EMSCRIPTEN__
+		// NULLBLR (2026-06-03): catch main returning (blr) to a garbage lr whose low-32 bits are 0 → cia=0
+		// (the menu-transition null-loop). Dump the blr site + code so we can decode which function ends here
+		// and trace who called it with a corrupt lr (→ the unconstructed singleton).
+		if (target == 0 && ppu.id == 0x1000000u) [[unlikely]]
+		{
+			static thread_local u32 s_nullblr = 0;
+			if (s_nullblr++ < 3)
+			{
+				const u32 site = vm::get_addr(this_op);
+				printf("[NULLBLR] main blr->0 @0x%x lr=0x%llx r3=0x%llx r11=0x%llx r12=0x%llx r29=0x%llx r30=0x%llx r31=0x%llx\n",
+					site, static_cast<unsigned long long>(ppu.lr),
+					static_cast<unsigned long long>(ppu.gpr[3]), static_cast<unsigned long long>(ppu.gpr[11]),
+					static_cast<unsigned long long>(ppu.gpr[12]), static_cast<unsigned long long>(ppu.gpr[29]),
+					static_cast<unsigned long long>(ppu.gpr[30]), static_cast<unsigned long long>(ppu.gpr[31]));
+				for (u32 p = site - 0x30; p <= site + 0x10; p += 0x10)
+					printf("  [NULLBS] @0x%x: %08x %08x %08x %08x\n", p,
+						vm::read32(p), vm::read32(p + 4), vm::read32(p + 8), vm::read32(p + 0xc));
+			}
+		}
+#endif
 		ppu_record_call<Flags...>(ppu, target, op, true);
 		ppu.cia = target;
 	}
@@ -3479,6 +3508,29 @@ auto BCCTR()
 	if (op.bo & 0x10 || ppu.cr[op.bi] == ((op.bo & 0x8) != 0))
 	{
 		const u32 target = static_cast<u32>(ppu.ctr) & ~3;
+#ifdef __EMSCRIPTEN__
+		// NULLCTR (2026-06-03): catch main's branch-to-null vtable call AT the call site (the exec_task
+		// null-fn DIAG fires post-jump with a garbage lr, so its call-site dump is useless). Dump the bctr
+		// site + the loads around it so we can decode which base pointer read back null (→ which singleton
+		// was never constructed). Gated to main + rare (target==0), one-shot capped.
+		if (target == 0 && ppu.id == 0x1000000u) [[unlikely]]
+		{
+			static thread_local u32 s_nullctr = 0;
+			if (s_nullctr++ < 3)
+			{
+				const u32 site = (vm::get_addr(this_op) + 4) - 4;
+				printf("[NULLCTR] main bctr->0 @0x%x lr=0x%llx r3=0x%llx r4=0x%llx r11=0x%llx r12=0x%llx r28=0x%llx r29=0x%llx r30=0x%llx r31=0x%llx\n",
+					site, static_cast<unsigned long long>(ppu.lr),
+					static_cast<unsigned long long>(ppu.gpr[3]), static_cast<unsigned long long>(ppu.gpr[4]),
+					static_cast<unsigned long long>(ppu.gpr[11]), static_cast<unsigned long long>(ppu.gpr[12]),
+					static_cast<unsigned long long>(ppu.gpr[28]), static_cast<unsigned long long>(ppu.gpr[29]),
+					static_cast<unsigned long long>(ppu.gpr[30]), static_cast<unsigned long long>(ppu.gpr[31]));
+				for (u32 p = site - 0x40; p <= site + 0x10; p += 0x10)
+					printf("  [NULLCS] @0x%x: %08x %08x %08x %08x\n", p,
+						vm::read32(p), vm::read32(p + 4), vm::read32(p + 8), vm::read32(p + 0xc));
+			}
+		}
+#endif
 		ppu_record_call<Flags...>(ppu, target, op, true);
 		ppu.cia = target;
 	}
@@ -5053,7 +5105,20 @@ auto MTSPR()
 		ppu.xer.cnt = value & 0x7f;
 		break;
 	}
-	case 0x008: ppu.lr = ppu.gpr[op.rs]; break;
+	case 0x008:
+#ifdef __EMSCRIPTEN__
+		// LRHI (2026-06-03): PS3 addresses are 32-bit, so mtlr of a >32-bit value is abnormal — it's the
+		// corruption that later makes main blr to cia=0 (menu null-loop, lr=0x18001c00000000). Log the FIRST
+		// few on main to find which register (and prior op) produced the high bits.
+		if ((ppu.gpr[op.rs] >> 32) != 0 && ppu.id == 0x1000000u) [[unlikely]]
+		{
+			static thread_local u32 s_lrhi = 0;
+			if (s_lrhi++ < 4)
+				printf("[LRHI] main mtlr r%u=0x%llx @cia=0x%x (PS3 LR should be 32-bit!)\n",
+					static_cast<u32>(op.rs), static_cast<unsigned long long>(ppu.gpr[op.rs]), static_cast<u32>(ppu.cia));
+		}
+#endif
+		ppu.lr = ppu.gpr[op.rs]; break;
 	case 0x009: ppu.ctr = ppu.gpr[op.rs]; break;
 	case 0x100: ppu.vrsave = static_cast<u32>(ppu.gpr[op.rs]); break;
 	default: fmt::throw_exception("MTSPR 0x%x", n);
@@ -6509,6 +6574,19 @@ auto FCTIW()
 		d = std::bit_cast<f64, s64>(_mm_cvtsi128_si32(res));
 	#elif defined(ARCH_ARM64)
 		d = std::bit_cast<f64, s64>(!(b == b) ? INT32_MIN : vqmovnd_s64(std::bit_cast<f64>(vrndi_f64(std::bit_cast<float64x1_t>(b)))));
+	#else
+		// wasm/portable (2026-06-03): same missing-impl bug as FCTIWZ (silent no-op). Round to nearest
+		// (honors the host rounding mode, which RPCS3 keeps synced with FPSCR) then clamp like PPC.
+		s64 r;
+		if (b != b) r = INT32_MIN;
+		else
+		{
+			const f64 rn = std::nearbyint(b);
+			if (rn >= 2147483648.0) r = INT32_MAX;
+			else if (rn < -2147483648.0) r = INT32_MIN;
+			else r = static_cast<s32>(rn);
+		}
+		d = std::bit_cast<f64, s64>(r);
 	#endif
 		ppu_set_fpcc<Flags...>(ppu, 0., 0.); // undefined (TODO)
 	};
@@ -6530,6 +6608,18 @@ auto FCTIWZ()
 		d = std::bit_cast<f64, s64>(_mm_cvtsi128_si32(res));
 	#elif defined(ARCH_ARM64)
 		d = std::bit_cast<f64, s64>(!(b == b) ? INT32_MIN : vqmovnd_s64(std::bit_cast<s64>(vcvt_s64_f64(std::bit_cast<float64x1_t>(b)))));
+	#else
+		// wasm/portable (2026-06-03): FCTIWZ was UNIMPLEMENTED here (no arch branch) -> a silent no-op that
+		// left the destination FPR holding stale bits. This corrupted EVERY double->int32 truncation on wasm;
+		// e.g. Terraria's title-world generator scaled its PRNG index via fctiwz and got the RAW ~1.3e9 value
+		// instead of [0,5), overflowing into a wild address that stomped the caller's stack and froze the menu
+		// in a null-loop. Truncate toward zero with PPC out-of-range clamping.
+		s64 r;
+		if (b != b) r = INT32_MIN;                   // NaN
+		else if (b >= 2147483648.0) r = INT32_MAX;   // > INT32_MAX -> clamp
+		else if (b < -2147483648.0) r = INT32_MIN;   // < INT32_MIN -> clamp
+		else r = static_cast<s32>(b);                // truncate toward zero
+		d = std::bit_cast<f64, s64>(r);
 	#endif
 		ppu_set_fpcc<Flags...>(ppu, 0., 0.); // undefined (TODO)
 	};
@@ -6789,6 +6879,19 @@ auto FCTID()
 		d = std::bit_cast<f64>(_mm_cvtsi128_si64(res));
 	#elif defined(ARCH_ARM64)
 		d = std::bit_cast<f64, s64>(!(b == b) ? f64{INT64_MIN} : std::bit_cast<f64>(vrndi_f64(std::bit_cast<float64x1_t>(b))));
+	#else
+		// wasm/portable (2026-06-03): was a silent no-op (missing arch branch) -> corrupted double->int64
+		// round-to-nearest. Round then clamp to int64 range.
+		s64 r;
+		if (b != b) r = INT64_MIN;
+		else
+		{
+			const f64 rn = std::nearbyint(b);
+			if (rn >= 9223372036854775808.0) r = INT64_MAX;
+			else if (rn < -9223372036854775808.0) r = INT64_MIN;
+			else r = static_cast<s64>(rn);
+		}
+		d = std::bit_cast<f64>(r);
 	#endif
 		ppu_set_fpcc<Flags...>(ppu, 0., 0.); // undefined (TODO)
 	};
@@ -6810,6 +6913,15 @@ auto FCTIDZ()
 		d = std::bit_cast<f64>(_mm_cvtsi128_si64(res));
 	#elif defined(ARCH_ARM64)
 		d = std::bit_cast<f64>(!(b == b) ? int64x1_t{INT64_MIN} : vcvt_s64_f64(std::bit_cast<float64x1_t>(b)));
+	#else
+		// wasm/portable (2026-06-03): was a silent no-op (missing arch branch) -> corrupted double->int64
+		// truncation. Truncate toward zero then clamp to int64 range.
+		s64 r;
+		if (b != b) r = INT64_MIN;
+		else if (b >= 9223372036854775808.0) r = INT64_MAX;
+		else if (b < -9223372036854775808.0) r = INT64_MIN;
+		else r = static_cast<s64>(b);
+		d = std::bit_cast<f64>(r);
 	#endif
 		ppu_set_fpcc<Flags...>(ppu, 0., 0.); // undefined (TODO)
 	};

@@ -100,8 +100,19 @@ void WebGPUGSRender::end()
 					for (u32 x = 0; x < sw; x++)
 						srow[x] = trow[static_cast<u32>(static_cast<u64>(x) * tw / sw)].value(); // A8R8G8B8 passthrough
 				}
+				// Log each NEW texture offset (reveals the asset SEQUENCE: splash1, splash2, splash3,
+				// then any menu/title textures) + periodic. Tells us whether the game keeps feeding new
+				// art after the splashes (menu draws) or stalls on the last splash.
 				static thread_local u32 s_pd = 0;
-				if (s_pd++ < 4) printf("[P2-DRAW] GAME-DRIVEN: rasterized bound texture %ux%u fmt=0x%x -> surface %ux%u\n", tw, th, static_cast<unsigned>(tex.format()), sw, sh);
+				static thread_local u32 s_lastoff = 0xFFFFFFFFu;
+				s_pd++;
+				if (toff != s_lastoff || (s_pd % 5000u) == 0u)
+				{
+					s_lastoff = toff;
+					printf("[P2-DRAW] draw#%u TEX off=0x%x %ux%u fmt=0x%x pitch=%u -> surf %ux%u\n",
+						static_cast<unsigned>(s_pd), static_cast<unsigned>(toff), tw, th,
+						static_cast<unsigned>(tex.format()), static_cast<unsigned>(tpitch), sw, sh);
+				}
 			}
 		}
 	}
