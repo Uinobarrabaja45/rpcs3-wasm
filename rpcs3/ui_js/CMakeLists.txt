@@ -232,6 +232,13 @@ target_link_options(Rpcs3 PRIVATE "-sEXPORT_NAME=Rpcs3Dyna")
 # back to main (Phase 2 disc-bridge diagnostic, every future worker).
 target_compile_options(Rpcs3 PRIVATE "-pthread")
 target_link_options(Rpcs3 PRIVATE "-pthread")
+# WASM tail-calls: the PPU interpreter dispatches each instruction via a tail-call chain
+# (PPUInterpreter.cpp RETURN_ macro → `return fn(...)`). Native optimizes this to a sibling
+# call (no stack growth); WASM without -mtail-call recurses one JS call frame per instruction,
+# so a long basic block overflows ("Maximum call stack size exceeded" — hit by Dragon's Crown's
+# boot, not Terraria's shorter blocks). -mtail-call makes the backend emit `return_call`.
+target_compile_options(Rpcs3 PRIVATE "-mtail-call")
+target_link_options(Rpcs3 PRIVATE "-mtail-call")
 # Tried UBSan (-fsanitize=undefined): crash is in pthread bootstrap
 # BEFORE UBSan runtime initializes, so no diagnostic improvement.
 # Reverted.

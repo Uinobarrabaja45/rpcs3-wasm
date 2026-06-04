@@ -17,15 +17,17 @@ const TERRARIA: Required<GameDef> = {
   rom: 'terraria.iso',
   state: 'demons_souls_state.bin',
 };
+const DRAGON_CROWN: Required<GameDef> = {
+  name: 'Dragon Crown',
+  ref: 'dragoncrown.png',
+  rom: 'dragoncrown.iso',
+  state: 'dragoncrown_state.bin',
+};
 
 export const GAMES: Record<string, GameDef> = {
-  // `demons` is the legacy default key (Demon's Souls was the placeholder
-  // PS3 title); `terraria` is the active dev ROM. Both point to TERRARIA
-  // so URLs from either era keep working — `?compare=terraria` and
-  // `?compare=demons` both resolve to the same definition.
-  demons: TERRARIA,
+
   terraria: TERRARIA,
-  ni_no_kuni: { name: 'Ni no Kuni', ref: 'HUDref_ninokuni.png', rom: 'ninokuni.iso', state: 'ninokuni_state.bin' },
+  dragoncrown: DRAGON_CROWN,
   uncharted: { name: 'Uncharted: Drake\'s Fortune', ref: 'HUDref_uncharted.png', rom: 'uncharted.iso', state: 'uncharted_state.bin' },
   lbp: { name: 'LittleBigPlanet', ref: 'HUDref_lbp.png', rom: 'lbp.iso', state: 'lbp_state.bin' },
   mgs4: { name: 'Metal Gear Solid 4', ref: 'HUDref_mgs4.png', rom: 'mgs4.iso', state: 'mgs4_state.bin' },
@@ -39,5 +41,5 @@ export function getRunnableGame(key: string | null | undefined): Required<GameDe
   if (candidate?.rom) {
     return candidate as Required<GameDef>;
   }
-  return TERRARIA;
+  return DRAGON_CROWN;
 }

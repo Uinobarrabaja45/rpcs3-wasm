@@ -1,9 +1,54 @@
 #include "stdafx.h"
 #include "Emu/Cell/PPUModule.h"
+#include "Emu/IdManager.h"
 
 #include "cellFiber.h"
+#include "Emu/Cell/PPUThread.h"
+#include "Emu/Cell/PPUFunction.h"
+#include "Emu/Cell/Modules/sysPrxForUser.h"
+#include "Emu/Cell/lv2/sys_ppu_thread.h"
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+#include <memory>
+#include <thread>
+#include <chrono>
 
 LOG_CHANNEL(cellFiber);
+
+// ── Minimal cellFiberPpuUtilWorkerControl implementation (2026-06-04) ─────────────────────────────────────────
+// rpcs3's cellFiber is fully stubbed (every function just returns CELL_OK), so fiber/coroutine-based games never
+// run their game logic. Dragon's Crown: RunFibers was a no-op → its FiberFunc worker threads exited → NO game
+// fiber ever executed → no render, main polls forever. This implements the worker-control TASK model DC uses (it
+// never calls cellFiberPpuYield, and signals each fiber ~143×): CreateFiber registers a fiber {entry, arg, stack};
+// SendSignal marks it runnable; RunFibers (the worker-thread loop) runs each runnable fiber's entry to completion
+// as a guest call on the fiber's own stack, re-runnable on the next signal. Process-static state (POC; move to
+// g_fxo for production). The mutex is released before each guest call so a fiber may re-enter cellFiber (SendSignal).
+namespace
+{
+	struct ppu_fiber_rec
+	{
+		vm::ptr<CellFiberPpuEntry> entry{};
+		u64 arg = 0;
+		u32 control_addr = 0;
+		u32 stack_ea = 0;
+		u32 stack_size = 0;
+		atomic_t<bool> runnable{false};
+		atomic_t<bool> running{false};
+		atomic_t<u32>  signals{0}; // pending SendSignal count; WaitSignal blocks until > 0 then consumes one
+		atomic_t<u32>  tid{0};     // guest ppu_thread id running this fiber (set after spawn, for WaitSignal)
+	};
+
+	struct ppu_worker_ctl
+	{
+		std::vector<u32> fiber_addrs;
+		atomic_t<bool> shutdown{false};
+	};
+
+	std::mutex g_cf_mtx;
+	std::unordered_map<u32, std::shared_ptr<ppu_fiber_rec>> g_cf_fibers; // CellFiberPpu addr -> rec
+	std::unordered_map<u32, std::shared_ptr<ppu_worker_ctl>> g_cf_ctls;  // control addr -> worker ctl
+}
 
 template <>
 void fmt_class_string<CellFiberError>::format(std::string& out, u64 arg)
@@ -226,7 +271,7 @@ vm::ptr<void> cellFiberPpuSelf()
 
 error_code cellFiberPpuSendSignal(vm::ptr<CellFiberPpu> fiber, vm::ptr<u32> numWorker)
 {
-	cellFiber.todo("cellFiberPpuSendSignal(fiber=*0x%x, numWorker=*0x%x)", fiber, numWorker);
+	cellFiber.trace("cellFiberPpuSendSignal(fiber=*0x%x, numWorker=*0x%x)", fiber, numWorker);
 
 	if (!fiber)
 	{
@@ -238,12 +283,76 @@ error_code cellFiberPpuSendSignal(vm::ptr<CellFiberPpu> fiber, vm::ptr<u32> numW
 		return CELL_FIBER_ERROR_ALIGN;
 	}
 
+	{
+		std::lock_guard lock(g_cf_mtx);
+		if (auto it = g_cf_fibers.find(fiber.addr()); it != g_cf_fibers.end())
+		{
+			it->second->signals++;
+			it->second->runnable = true;
+		}
+	}
+
+	if (numWorker)
+	{
+		*numWorker = 0;
+	}
+
 	return CELL_OK;
 }
 
-error_code cellFiberPpuWaitSignal()
+error_code cellFiberPpuWaitSignal(ppu_thread& ppu)
 {
-	cellFiber.todo("cellFiberPpuWaitSignal()");
+	cellFiber.trace("cellFiberPpuWaitSignal()");
+
+	// [DISASM PROBE] one-shot dump of MAIN's readiness-poll loop (main's Wakeup returns to 0x5b82e0, so its
+	// sys_mutex_lock(0x85000300) poll is right after) so it can be disassembled offline to find the exact control
+	// field/value main waits for. Dumped from the fiber thread, but vm memory (the code) is shared. Remove later.
+	{
+		static atomic_t<u32> s_dis{0};
+		if (s_dis.compare_and_swap_test(0, 1))
+		{
+			std::string s;
+			for (u32 a = 0x5b8100; a <= 0x5b8700; a += 4) s += fmt::format("%08x", +vm::read32(a));
+			cellFiber.warning("[MAINDIS] base=0x5b8100 ops=%s", s.c_str());
+		}
+	}
+
+	// thread-per-fiber: block THIS fiber's guest thread until it is signaled (cellFiberPpu[UtilWorkerControl]
+	// SendSignal). Without this the fiber busy-loops (WaitSignal was a no-op stub) and never yields, so DC's
+	// engine never makes forward progress. Locate the fiber by the calling thread id (recorded in CreateFiber).
+	// NOTE: the fiber thread is auto-started inside sys_ppu_thread_create and can reach WaitSignal BEFORE
+	// CreateFiber finishes recording rec->tid (confirmed by log ordering). So re-lookup the record on each
+	// iteration until it appears, rather than giving up and busy-returning.
+	std::shared_ptr<ppu_fiber_rec> rec;
+	bool logged = false;
+
+	while (!ppu.is_stopped())
+	{
+		if (!rec)
+		{
+			std::lock_guard lock(g_cf_mtx);
+			for (auto& [addr, r] : g_cf_fibers)
+			{
+				if (r->tid.load() == ppu.id) { rec = r; break; }
+			}
+		}
+		if (!logged)
+		{
+			static atomic_t<u32> s_w{0}; const u32 n = ++s_w;
+			if (n <= 40u) cellFiber.warning("[FIBERWAIT] #%u tid=0x%x found=%d", n, ppu.id, rec ? 1 : 0);
+			logged = true;
+		}
+		if (rec)
+		{
+			const u32 cur = rec->signals.load();
+			if (cur > 0 && rec->signals.compare_and_swap_test(cur, cur - 1))
+			{
+				{ static atomic_t<u32> s_k{0}; const u32 n = ++s_k; if (n <= 40u) cellFiber.warning("[FIBERWAKE] tid=0x%x", ppu.id); }
+				break;
+			}
+		}
+		std::this_thread::sleep_for(std::chrono::microseconds(150));
+	}
 
 	return CELL_OK;
 }
@@ -519,9 +628,9 @@ error_code _cellFiberPpuUtilWorkerControlAttributeInitialize(vm::ptr<CellFiberPp
 	return CELL_OK;
 }
 
-error_code cellFiberPpuUtilWorkerControlRunFibers(vm::ptr<CellFiberPpuUtilWorkerControl> control)
+error_code cellFiberPpuUtilWorkerControlRunFibers(ppu_thread& ppu, vm::ptr<CellFiberPpuUtilWorkerControl> control)
 {
-	cellFiber.todo("cellFiberPpuUtilWorkerControlRunFibers(control=*0x%x)", control);
+	cellFiber.warning("cellFiberPpuUtilWorkerControlRunFibers(control=*0x%x)", control);
 
 	if (!control)
 	{
@@ -531,6 +640,24 @@ error_code cellFiberPpuUtilWorkerControlRunFibers(vm::ptr<CellFiberPpuUtilWorker
 	if (!control.aligned())
 	{
 		return CELL_FIBER_ERROR_ALIGN;
+	}
+
+	std::shared_ptr<ppu_worker_ctl> ctl;
+	{
+		std::lock_guard lock(g_cf_mtx);
+		if (auto it = g_cf_ctls.find(control.addr()); it != g_cf_ctls.end()) ctl = it->second;
+	}
+	if (!ctl)
+	{
+		return CELL_OK;
+	}
+
+	// Fibers run on their own dedicated guest threads (thread-per-fiber, see CreateFiber). The worker just parks
+	// here so it doesn't fall through to its post-RunFibers shutdown path; it unparks on emu stop or control
+	// shutdown. (In real cellFiber this call IS the cooperative scheduler; here the per-fiber threads are.)
+	while (!ctl->shutdown && !ppu.is_stopped())
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(8));
 	}
 
 	return CELL_OK;
@@ -596,7 +723,7 @@ error_code cellFiberPpuUtilWorkerControlDisconnectEventQueue()
 
 error_code cellFiberPpuUtilWorkerControlSendSignal(vm::ptr<CellFiberPpu> fiber, vm::ptr<u32> numWorker)
 {
-	cellFiber.todo("cellFiberPpuUtilWorkerControlSendSignal(fiber=*0x%x, numWorker=*0x%x)", fiber, numWorker);
+	cellFiber.trace("cellFiberPpuUtilWorkerControlSendSignal(fiber=*0x%x, numWorker=*0x%x)", fiber, numWorker);
 
 	if (!fiber)
 	{
@@ -606,6 +733,23 @@ error_code cellFiberPpuUtilWorkerControlSendSignal(vm::ptr<CellFiberPpu> fiber, 
 	if (!fiber.aligned())
 	{
 		return CELL_FIBER_ERROR_ALIGN;
+	}
+
+	bool found = false;
+	{
+		std::lock_guard lock(g_cf_mtx);
+		if (auto it = g_cf_fibers.find(fiber.addr()); it != g_cf_fibers.end())
+		{
+			it->second->signals++;
+			it->second->runnable = true;
+			found = true;
+		}
+	}
+	{ static atomic_t<u32> s_sig{0}; const u32 n = ++s_sig; if (n <= 40u) cellFiber.warning("[FIBERSIG] #%u fiber=0x%x found=%d", n, fiber.addr(), found ? 1 : 0); }
+
+	if (numWorker)
+	{
+		*numWorker = 0;
 	}
 
 	return CELL_OK;
@@ -652,11 +796,46 @@ error_code cellFiberPpuUtilWorkerControlWakeup(vm::ptr<CellFiberPpuUtilWorkerCon
 	return CELL_OK;
 }
 
-error_code cellFiberPpuUtilWorkerControlCreateFiber(vm::ptr<CellFiberPpuUtilWorkerControl> control, vm::ptr<CellFiberPpu> fiber, vm::ptr<CellFiberPpuEntry> entry, u64 arg, u32 priority, vm::ptr<void> eaStack, u32 sizeStack, vm::cptr<CellFiberPpuAttribute> attr)
+// HLE worker-thread entry (thread-per-fiber). Runs ONE DC fiber on its own guest ppu_thread: when the fiber is
+// runnable, run its guest entry on this thread's stack. If the entry returns (a "task" fiber) we park until it is
+// re-signaled (SendSignal sets runnable); if the entry loops forever (a "service" fiber) it simply runs here for
+// the thread's lifetime. Either way a blocked/looping fiber no longer stalls the cellFiber worker, and fibers
+// coordinate with each other and the game via DC's own sync (sema/event/lwmutex).
+void cellFiberWorkerThreadEntry(ppu_thread& ppu, vm::ptr<CellFiberPpu> fiber)
 {
-	cellFiber.todo("cellFiberPpuUtilWorkerControlCreateFiber(control=*0x%x, fiber=*0x%x, entry=*0x%x, arg=0x%x, priority=%d, eaStack=*0x%x, sizeStack=0x%x, attr=*0x%x)", control, fiber, entry, arg, priority, eaStack, sizeStack, attr);
+	std::shared_ptr<ppu_fiber_rec> rec;
+	{
+		std::lock_guard lock(g_cf_mtx);
+		if (auto it = g_cf_fibers.find(fiber.addr()); it != g_cf_fibers.end()) rec = it->second;
+	}
+	if (!rec)
+	{
+		cellFiber.error("[FIBERTHREAD] no record for fiber=0x%x", fiber.addr());
+		return;
+	}
+	cellFiber.warning("[FIBERTHREAD] start fiber=0x%x entry=0x%x arg=0x%x", fiber.addr(), rec->entry.addr(), rec->arg);
 
-	if (!control)
+	while (!ppu.is_stopped())
+	{
+		if (rec->runnable.exchange(false))
+		{
+			rec->running = true;
+			{ static atomic_t<u32> s_run{0}; const u32 n = ++s_run; if (n <= 60u) cellFiber.warning("[FIBERRUN] #%u fiber=0x%x entry=0x%x", n, fiber.addr(), rec->entry.addr()); }
+			rec->entry(ppu, rec->arg); // run the guest fiber entry
+			rec->running = false;
+		}
+		else
+		{
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+		}
+	}
+}
+
+error_code cellFiberPpuUtilWorkerControlCreateFiber(ppu_thread& ppu, vm::ptr<CellFiberPpuUtilWorkerControl> control, vm::ptr<CellFiberPpu> fiber, vm::ptr<CellFiberPpuEntry> entry, u64 arg, u32 priority, vm::ptr<void> eaStack, u32 sizeStack, vm::cptr<CellFiberPpuAttribute> attr)
+{
+	cellFiber.warning("cellFiberPpuUtilWorkerControlCreateFiber(control=*0x%x, fiber=*0x%x, entry=*0x%x, arg=0x%x, priority=%d, eaStack=*0x%x, sizeStack=0x%x, attr=*0x%x)", control, fiber, entry, arg, priority, eaStack, sizeStack, attr);
+
+	if (!control || !fiber || !entry)
 	{
 		return CELL_FIBER_ERROR_NULL_POINTER;
 	}
@@ -665,6 +844,36 @@ error_code cellFiberPpuUtilWorkerControlCreateFiber(vm::ptr<CellFiberPpuUtilWork
 	{
 		return CELL_FIBER_ERROR_ALIGN;
 	}
+
+	auto rec = std::make_shared<ppu_fiber_rec>();
+	rec->entry        = entry;
+	rec->arg          = arg;
+	rec->control_addr = control.addr();
+	rec->stack_ea     = eaStack.addr();
+	rec->stack_size   = sizeStack;
+	rec->runnable     = true; // a newly-created fiber is ready to run
+	{
+		std::lock_guard lock(g_cf_mtx);
+		g_cf_fibers[fiber.addr()] = rec;
+		auto& ctl = g_cf_ctls[control.addr()];
+		if (!ctl) ctl = std::make_shared<ppu_worker_ctl>();
+		ctl->fiber_addrs.push_back(fiber.addr());
+	}
+
+	// Spawn a dedicated guest ppu_thread that runs this fiber's GUEST entry directly. NOTE: the WASM build
+	// redirects HLE-area thread entries (rtoc==0) to a return-stub (see _sys_ppu_thread_create), so an HLE
+	// wrapper as the thread entry would immediately return — we must start the thread at the real guest fiber
+	// entry (valid rtoc). A service-style fiber loops here for the thread's lifetime; fibers coordinate with
+	// each other and the game via DC's own sync (sema/event/lwmutex) and via cellFiberPpuWaitSignal/SendSignal.
+	const vm::var<char[]> _name = vm::make_str("cellFiberPpu");
+	vm::var<u64> tid;
+	const u32 ssz  = (sizeStack >= 0x4000u) ? sizeStack : 0x10000u;
+	const s32 prio = static_cast<s32>(priority <= 3071u ? priority : 1000u);
+	ppu_execute<&sys_ppu_thread_create>(ppu, +tid, entry.addr(), arg, prio, ssz, SYS_PPU_THREAD_CREATE_JOINABLE, +_name);
+	const auto tid_ptr = +tid;
+	const u32 new_tid  = static_cast<u32>(*tid_ptr);
+	rec->tid = new_tid; // so cellFiberPpuWaitSignal (called by this guest thread) can locate this fiber
+	cellFiber.warning("[FIBERSPAWN] fiber=0x%x entry=0x%x arg=0x%x ssz=0x%x prio=%d tid=0x%x", fiber.addr(), entry.addr(), arg, ssz, prio, new_tid);
 
 	return CELL_OK;
 }
@@ -705,7 +914,7 @@ error_code cellFiberPpuUtilWorkerControlCheckFlags(vm::ptr<CellFiberPpuUtilWorke
 
 error_code cellFiberPpuUtilWorkerControlInitializeWithAttribute(vm::ptr<CellFiberPpuUtilWorkerControl> control, vm::ptr<CellFiberPpuUtilWorkerControlAttribute> attr)
 {
-	cellFiber.todo("cellFiberPpuUtilWorkerControlInitializeWithAttribute(control=*0x%x, attr=*0x%x)", control, attr);
+	cellFiber.warning("cellFiberPpuUtilWorkerControlInitializeWithAttribute(control=*0x%x, attr=*0x%x)", control, attr);
 
 	if (!control)
 	{
@@ -717,11 +926,17 @@ error_code cellFiberPpuUtilWorkerControlInitializeWithAttribute(vm::ptr<CellFibe
 		return CELL_FIBER_ERROR_ALIGN;
 	}
 
+	std::lock_guard lock(g_cf_mtx);
+	if (!g_cf_ctls[control.addr()]) g_cf_ctls[control.addr()] = std::make_shared<ppu_worker_ctl>();
+
 	return CELL_OK;
 }
 
 DECLARE(ppu_module_manager::cellFiber)("cellFiber", []()
 {
+	// Internal HLE thread-entry used by thread-per-fiber CreateFiber (must be registered so func_addr resolves).
+	REG_HIDDEN_FUNC(cellFiberWorkerThreadEntry);
+
 	REG_FUNC(cellFiber, _cellFiberPpuInitialize);
 
 	REG_FUNC(cellFiber, _cellFiberPpuSchedulerAttributeInitialize);

@@ -161,6 +161,22 @@ struct ppu_exec_select
 #define RETURN RETURN_
 #endif
 
+#ifdef __EMSCRIPTEN__
+// WASM call-stack guard. The interpreter dispatches each instruction by *recursing* into the next handler's
+// lambda (a tail call on native — zero stack growth — but wasm cannot tail-call this signature because
+// ppu_opcode_t is passed as a stack argument, and wasm `return_call` forbids stack args). So a long run of
+// instructions without returning to the exec_task driver grows the JS call stack one frame per instruction and
+// eventually overflows ("Maximum call stack size exceeded" — hit by Dragon's Crown's boot; Terraria's runs are
+// short enough to escape it). Fix: every N instructions, set ppu.cia to the next op and UNWIND to the driver
+// loop, which simply re-dispatches at ppu.cia. The counter self-corrects — it's reset to 0 here, and is merely
+// conservative (bounds a little early) after a non-guard return (e.g. ppu_ret), never unsafe. N=1000 keeps total
+// JS frames far under the engine's ~10k limit even with a few helper frames per instruction.
+thread_local u32 g_ppu_intrp_depth = 0;
+#define WASM_INTRP_DEPTH_GUARD(next_op_) if (++g_ppu_intrp_depth >= 1000u) [[unlikely]] { g_ppu_intrp_depth = 0; ppu.cia = vm::get_addr(next_op_); return; }
+#else
+#define WASM_INTRP_DEPTH_GUARD(next_op_)
+#endif
+
 #define RETURN_(...) \
 	if constexpr (Build == 0) { \
 		static_cast<void>(exec); \
@@ -169,13 +185,13 @@ struct ppu_exec_select
 			const auto next_op = this_op + 1; \
 			const auto fn = atomic_storage<ppu_intrp_func_t>::load(next_fn->fn); \
 			ppu.cia = vm::get_addr(next_op); \
-			return fn(ppu, {*next_op}, next_op, next_fn + 1); \
+			WASM_INTRP_DEPTH_GUARD(next_op) return fn(ppu, {*next_op}, next_op, next_fn + 1); \
 		}; \
 		return +[](ppu_thread& ppu, ppu_opcode_t op, be_t<u32>* this_op, ppu_intrp_func* next_fn) { \
 			exec(__VA_ARGS__); \
 			const auto next_op = this_op + 1; \
 			const auto fn = atomic_storage<ppu_intrp_func_t>::observe(next_fn->fn); \
-			return fn(ppu, {*next_op}, next_op, next_fn + 1); \
+			WASM_INTRP_DEPTH_GUARD(next_op) return fn(ppu, {*next_op}, next_op, next_fn + 1); \
 		}; \
 	}
 

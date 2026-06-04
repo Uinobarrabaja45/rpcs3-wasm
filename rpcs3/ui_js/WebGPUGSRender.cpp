@@ -161,6 +161,23 @@ void WebGPUGSRender::end()
 			if (saddr && sw && sh && spitch && stride >= 20u && a0.size() >= 2u)
 			{
 				u8* const sbase = static_cast<u8*>(vm::base(saddr));
+				// Per-frame clear: the menu's full-screen RTT composite normally re-fills surf=0x0 every frame,
+				// but that's the opaque-black layer we skip — so without it surf=0x0 accumulates STALE pixels
+				// (the green/pink garbage seen between frames). Clear to opaque black once per frame, on the
+				// first draw after a flip (g_webgpu_flip_count changes at flip()).
+				{
+					static thread_local u64 s_lastClearFlip = ~0ull;
+					const u64 cf = g_webgpu_flip_count.load(std::memory_order_relaxed);
+					if (cf != s_lastClearFlip)
+					{
+						s_lastClearFlip = cf;
+						for (u32 yy = 0; yy < sh; yy++)
+						{
+							be_t<u32>* crow = reinterpret_cast<be_t<u32>*>(sbase + static_cast<u64>(yy) * spitch);
+							for (u32 xx = 0; xx < sw; xx++) crow[xx] = 0xff000000u;
+						}
+					}
+				}
 				const u32 vbase = rsx::method_registers.vertex_data_base_offset();
 				const auto resolve = [&](u32 rawoff) -> const u8* {
 					const u32 a = rsx::get_address(rsx::get_vertex_offset_from_base(vbase, rawoff & 0x7fffffffu), rawoff >> 31);
@@ -184,14 +201,41 @@ void WebGPUGSRender::end()
 				const u32 tpitch = tex.pitch() ? tex.pitch() : tw * 4u;
 				const u32 taddr = (tex.offset() && tw && th) ? rsx::get_address(tex.offset(), tex.location()) : 0u;
 				const u8* const tbase = taddr ? static_cast<const u8*>(vm::base(taddr)) : nullptr;
-				const bool texOK = tbase && tlin && tw && th && (tbf == 0x85u || tbf == 0x82u || tbf == 0x83u);
+				const bool isPow2 = tw && th && (tw & (tw - 1u)) == 0u && (th & (th - 1u)) == 0u;
+				const bool texOK = tbase && tw && th && (
+					(tlin && (tbf == 0x85u || tbf == 0x82u || tbf == 0x83u || tbf == 0x86u)) ||  // linear formats
+					(!tlin && isPow2 && (tbf == 0x85u || tbf == 0x82u || tbf == 0x83u)));         // swizzled pow2 (Morton)
 				const auto sampleTex = [&](float u, float v) -> u32 { // returns ARGB (real alpha)
 					int tx = static_cast<int>(u * static_cast<float>(tw)); int ty = static_cast<int>(v * static_cast<float>(th));
 					tx = tx < 0 ? 0 : (tx >= static_cast<int>(tw) ? static_cast<int>(tw) - 1 : tx);
 					ty = ty < 0 ? 0 : (ty >= static_cast<int>(th) ? static_cast<int>(th) - 1 : ty);
-					const u8* rp = tbase + static_cast<u64>(ty) * tpitch;
-					if (tbf == 0x85u) { const u8* p = rp + static_cast<u64>(tx) * 4u; return (u32(p[0])<<24)|(u32(p[1])<<16)|(u32(p[2])<<8)|u32(p[3]); }
-					const u8* p = rp + static_cast<u64>(tx) * 2u; const u32 w16 = (u32(p[0])<<8) | p[1];
+					if (tbf == 0x86u) // DXT1 (CELL_GCM_TEXTURE_COMPRESSED_DXT1): 4x4 blocks, 8 bytes; tpitch = block-row stride
+					{
+						const u8* blk = tbase + static_cast<u64>(ty >> 2) * tpitch + static_cast<u64>(tx >> 2) * 8u;
+						const u32 c0 = (u32(blk[0])<<8)|blk[1], c1 = (u32(blk[2])<<8)|blk[3];      // RGB565 (BE)
+						const u32 bits = u32(blk[4])|(u32(blk[5])<<8)|(u32(blk[6])<<16)|(u32(blk[7])<<24);
+						const u32 sel = (bits >> (2u*((static_cast<u32>(ty)&3u)*4u + (static_cast<u32>(tx)&3u)))) & 3u;
+						const u32 r0=((c0>>11)&0x1fu)<<3,g0=((c0>>5)&0x3fu)<<2,b0=(c0&0x1fu)<<3;
+						const u32 r1=((c1>>11)&0x1fu)<<3,g1=((c1>>5)&0x3fu)<<2,b1=(c1&0x1fu)<<3;
+						u32 R,G,B,A=255u;
+						if (sel==0u){R=r0;G=g0;B=b0;} else if (sel==1u){R=r1;G=g1;B=b1;}
+						else if (c0>c1){ if(sel==2u){R=(2u*r0+r1)/3u;G=(2u*g0+g1)/3u;B=(2u*b0+b1)/3u;} else {R=(r0+2u*r1)/3u;G=(g0+2u*g1)/3u;B=(b0+2u*b1)/3u;} }
+						else { if(sel==2u){R=(r0+r1)/2u;G=(g0+g1)/2u;B=(b0+b1)/2u;} else {R=0u;G=0u;B=0u;A=0u;} } // sel==3 → transparent
+						return (A<<24)|(R<<16)|(G<<8)|B;
+					}
+					// Non-DXT texel byte pointer: linear row-major, or swizzled Morton (interleave x,y bits —
+					// handles non-square pow2). 1x1 textures fall out naturally (tx=ty=0 → tbase).
+					const u32 bpp = (tbf == 0x85u) ? 4u : 2u;
+					const u8* p;
+					if (tlin) { p = tbase + static_cast<u64>(ty) * tpitch + static_cast<u64>(tx) * bpp; }
+					else
+					{
+						u32 sx = static_cast<u32>(tx), sy = static_cast<u32>(ty), off = 0u, shift = 0u, mx = tw - 1u, my = th - 1u;
+						while (mx || my) { if (mx){ off |= (sx&1u)<<shift; sx>>=1; ++shift; mx>>=1; } if (my){ off |= (sy&1u)<<shift; sy>>=1; ++shift; my>>=1; } }
+						p = tbase + static_cast<u64>(off) * bpp;
+					}
+					if (tbf == 0x85u) { return (u32(p[0])<<24)|(u32(p[1])<<16)|(u32(p[2])<<8)|u32(p[3]); }
+					const u32 w16 = (u32(p[0])<<8) | p[1];
 					if (tbf == 0x82u) { const u32 A=(w16&0x8000u)?255u:0u,R=((w16>>10)&0x1fu)<<3,G=((w16>>5)&0x1fu)<<3,B=(w16&0x1fu)<<3; return (A<<24)|(R<<16)|(G<<8)|B; }
 					const u32 A=((w16>>12)&0xfu)*17u,R=((w16>>8)&0xfu)*17u,G=((w16>>4)&0xfu)*17u,B=(w16&0xfu)*17u; return (A<<24)|(R<<16)|(G<<8)|B; // 0x83
 				};
@@ -220,6 +264,24 @@ void WebGPUGSRender::end()
 					u32 vR=255,vG=255,vB=255,vA=255; // vertex color (a3, vertex 0) modulator
 					if (cbase) { const u8* cp = cbase + static_cast<u64>(q)*stride; vR=cp[0];vG=cp[1];vB=cp[2];vA=cp[3]; }
 					const float wdt=(maxx>minx)?(maxx-minx):1.0f, hgt=(maxy>miny)?(maxy-miny):1.0f;
+					// Skip full-screen OPAQUE-BLACK layers (empty render-to-texture composites that would black
+					// out the menu). Classify by sampling 5 points; skip only if ALL are opaque (~black).
+					const bool fullscreen = (maxx-minx) > static_cast<float>(sw)*0.9f && (maxy-miny) > static_cast<float>(sh)*0.9f;
+					bool blackRTT = false;
+					if (fullscreen && texOK)
+					{
+						blackRTT = true;
+						static const float sp[5][2] = {{0.5f,0.5f},{0.1f,0.1f},{0.9f,0.1f},{0.1f,0.9f},{0.9f,0.9f}};
+						for (int sgi = 0; sgi < 5; sgi++)
+						{
+							const u32 tc = sampleTex(minu+(maxu-minu)*sp[sgi][0], minv+(maxv-minv)*sp[sgi][1]);
+							if (((tc>>24)&0xffu) < 0xc0u || (tc & 0x00ffffffu) != 0u) { blackRTT = false; break; }
+						}
+					}
+					// Skip a quad sampling the ENTIRE large atlas (uv≈0..1 of a >1024² texture) — an artifact that
+					// dumps the raw atlas sheet over the menu (no real sprite samples a whole 3900² atlas).
+					const bool fullAtlasDump = texOK && tw > 1024u && th > 1024u && minu < 0.02f && maxu > 0.98f && minv < 0.02f && maxv > 0.98f;
+					if (!blackRTT && !fullAtlasDump)
 					for (int y = y0; y < y1; y++)
 					{
 						be_t<u32>* row = reinterpret_cast<be_t<u32>*>(sbase + static_cast<u64>(y)*spitch);
@@ -233,7 +295,7 @@ void WebGPUGSRender::end()
 								const u32 t = sampleTex(uu, vv);
 								fA=(((t>>24)&0xffu)*vA)/255u; fR=(((t>>16)&0xffu)*vR)/255u; fG=(((t>>8)&0xffu)*vG)/255u; fB=((t&0xffu)*vB)/255u;
 							}
-							else { fA=vA; fR=vR; fG=vG; fB=vB; } // flat vertex color (swizzled/unhandled tex)
+							else { fA=vA; fR=vR; fG=vG; fB=vB; } // flat vertex color (swizzled/unhandled tex, e.g. DXT1 text)
 							if (fA == 0u) continue;                                                     // fully transparent → skip
 							if (fA >= 250u) { row[x] = 0xff000000u | (fR<<16)|(fG<<8)|fB; continue; }   // opaque → overwrite
 							const u32 d = row[x];                                                       // else src-over blend onto surface
@@ -241,23 +303,23 @@ void WebGPUGSRender::end()
 							row[x] = 0xff000000u | (((fR*fA+dR*ia)/255u)<<16) | (((fG*fA+dG*ia)/255u)<<8) | ((fB*fA+dB*ia)/255u);
 						}
 					}
-					// Diagnostics: first 6 draws (full-screen composites) + first 12 SMALL quads (real sprites/atlas).
+					// Diagnostics with surface/texture offsets to map the multi-pass (RTT) flow.
 					static thread_local u64 s_rq2 = 0;
 					const bool small = (maxx - minx) < static_cast<float>(sw) * 0.8f;
 					const u32 centerTexel = texOK ? sampleTex((minu + maxu) * 0.5f, (minv + maxv) * 0.5f) : 0u;
+					const u32 surfoff = rsx::method_registers.surface_offset(0);
+					const u32 texoff = tex.offset();
 					if (s_rq < 6u)
 					{
 						s_rq++;
-						printf("[RAST] q#%llu pos(%.0f,%.0f)-(%.0f,%.0f) uv(%.2f,%.2f)-(%.2f,%.2f) vcol=%02x%02x%02x%02x tfmt=0x%x texOK=%d %ux%u ctex=%08x\n",
-							static_cast<unsigned long long>(s_rq), minx, miny, maxx, maxy, minu, minv, maxu, maxv,
-							vR, vG, vB, vA, tfmt, texOK?1:0, tw, th, centerTexel);
+						printf("[RAST] q#%llu pos(%.0f,%.0f)-(%.0f,%.0f) surf=0x%x tex=0x%x tfmt=0x%x texOK=%d blackRTT=%d %ux%u ctex=%08x vcol=%02x%02x%02x%02x\n",
+							static_cast<unsigned long long>(s_rq), minx, miny, maxx, maxy, surfoff, texoff, tfmt, texOK?1:0, blackRTT?1:0, tw, th, centerTexel, vR,vG,vB,vA);
 					}
 					if (small && s_rq2 < 12u)
 					{
 						s_rq2++;
-						printf("[RASTSP] s#%llu pos(%.0f,%.0f)-(%.0f,%.0f) uv(%.2f,%.2f)-(%.2f,%.2f) vcol=%02x%02x%02x%02x tfmt=0x%x texOK=%d %ux%u ctex=%08x\n",
-							static_cast<unsigned long long>(s_rq2), minx, miny, maxx, maxy, minu, minv, maxu, maxv,
-							vR, vG, vB, vA, tfmt, texOK?1:0, tw, th, centerTexel);
+						printf("[RASTSP] s#%llu pos(%.0f,%.0f)-(%.0f,%.0f) surf=0x%x tex=0x%x uv(%.2f,%.2f)-(%.2f,%.2f) tfmt=0x%x texOK=%d %ux%u ctex=%08x vcol=%02x%02x%02x%02x\n",
+							static_cast<unsigned long long>(s_rq2), minx, miny, maxx, maxy, surfoff, texoff, minu,minv,maxu,maxv, tfmt, texOK?1:0, tw, th, centerTexel, vR,vG,vB,vA);
 					}
 				}
 				// Present the rasterized surface via M2a: clean A8R8G8B8 sw×sh → flip blits it 1:1.
@@ -299,11 +361,15 @@ void WebGPUGSRender::clear_surface(u32 arg)
 		return;
 
 	u8* const basep = static_cast<u8*>(vm::base(addr));
+	// CUT-1+: force OPAQUE so undrawn areas present as the clear color (not the transparent canvas showing
+	// white through). The game clears the menu backbuffer to 0x00000000 (its animated world bg lives in a
+	// separate RTT we don't populate); making it opaque black gives the menu UI a clean dark backdrop.
+	const u32 fillv = argb | 0xff000000u;
 	for (u32 y = 0; y < h; y++)
 	{
 		be_t<u32>* row = reinterpret_cast<be_t<u32>*>(basep + static_cast<u64>(y) * pitch);
 		for (u32 x = 0; x < w; x++)
-			row[x] = argb;
+			row[x] = fillv;
 	}
 
 	// === P2 DEV-TEST (2026-06-03): software textured-quad rasterizer — PIPELINE VALIDATION ===

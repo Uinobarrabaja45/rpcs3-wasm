@@ -17,4 +17,13 @@ You think you can do that ?
 
 
 
-continue ./PLAN-first-frame.md if a decision arises, pick the best option and proceed autonomously — do not ask, just decide and keep going. (The WebGPU renderer in ./PLAN-Vulkan-port-to-WebGPU.md is already built + de-risked; the game-logic gate here is the only path to a rendered Terraria menu.)
+continue ./PLAN-first-frame.md if a decision arises, pick the best option and proceed autonomously — do not ask, just decide and keep going. (The WebGPU renderer in ./PLAN-Vulkan-port-to-WebGPU.md is already built + de-risked; the game-logic gate here is the only path to a rendered Terraria menu.) 
+Use js/rpcs3_browser/public/terraria.png as a goal
+
+
+/loop 1 minute
+
+continue ./PLAN-first-frame.md ./PLAN-Vulkan-port-to-WebGPU.md if a decision arises, pick the best option and proceed autonomously — do not ask, just decide and keep going. 
+Focus on game terraria.
+Use js/rpcs3_browser/public/terraria.png as a goal.
+Make sure the render is stable by captureing more than once (now it's very flashy)
