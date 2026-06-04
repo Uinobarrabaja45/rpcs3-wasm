@@ -4,6 +4,7 @@
 #include <cmath>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #ifdef HAS_WEBGPU
@@ -215,6 +216,7 @@ bool CGSH_WebGPUJs::Render()
 				// [A][R][G][B]. Packing them as a host little-endian u32 lays the
 				// bytes out [B][G][R][A] == BGRA8Unorm, which is the surface
 				// format — so the swizzle is just this byte repack.
+				uint64_t nonblack = 0; // non-black (RGB!=0) pixel count -> coverage, to detect full-WORLD frames vs small-UI frames
 				for (uint32_t y = 0; y < fb_h; y++)
 				{
 					const uint8_t* srcRow = base + static_cast<size_t>(y) * src_pitch;
@@ -222,22 +224,43 @@ bool CGSH_WebGPUJs::Render()
 					for (uint32_t x = 0; x < fb_w; x++)
 					{
 						const uint8_t* p = srcRow + static_cast<size_t>(x) * 4;
-						dstRow[x] = (static_cast<uint32_t>(p[0]) << 24) |
-						            (static_cast<uint32_t>(p[1]) << 16) |
-						            (static_cast<uint32_t>(p[2]) << 8)  |
-						             static_cast<uint32_t>(p[3]);
+						const uint32_t px = (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) | (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+						dstRow[x] = px;
+						if (px & 0x00ffffffu) nonblack++;
 					}
 				}
-
-				wgpu::TexelCopyTextureInfo dst = {};
-				dst.texture = m_fbTexture;
-				dst.aspect  = wgpu::TextureAspect::All;
-				wgpu::TexelCopyBufferLayout layout = {};
-				layout.bytesPerRow  = fb_w * 4;
-				layout.rowsPerImage = fb_h;
-				wgpu::Extent3D ext = { fb_w, fb_h, 1 };
-				m_queue.WriteTexture(&dst, m_fbStaging.data(),
-					static_cast<size_t>(fb_w) * fb_h * 4, &layout, &ext);
+				// PERSISTENT COMPOSITE (2026-06-04): the menu draws the full-screen WORLD background only ~every 28s but
+				// the small UI quads EVERY frame, relying on the world persisting between. The old hold-the-best-frame gate
+				// could not reconcile this AND its strict-max threshold crept up over minutes until nothing passed -> the
+				// canvas FROZE, and sparse frames still flashed. Instead keep a persistent host buffer that always holds the
+				// world, overlay each frame's UI onto it, and present it EVERY frame: no hold -> no freeze; never black ->
+				// no flash; UI composited per frame -> it animates. A high-coverage frame (world fills the screen) fully
+				// REFRESHES the buffer (clean biome transitions); a low-coverage frame overlays only its non-black pixels.
+				const double coverage = static_cast<double>(nonblack) / (static_cast<double>(fb_w) * fb_h);
+				static std::vector<uint32_t> s_persist;
+				const size_t npix = static_cast<size_t>(fb_w) * fb_h;
+				if (s_persist.size() != npix) s_persist.assign(npix, 0xFF000000u);
+				const bool worldFrame = (m_lastFlip == 0) || (coverage > 0.55);
+				if (worldFrame)
+				{
+					std::memcpy(s_persist.data(), m_fbStaging.data(), npix * 4);
+				}
+				else
+				{
+					for (size_t i = 0; i < npix; i++) { const uint32_t px = m_fbStaging[i]; if (px & 0x00ffffffu) s_persist[i] = px; }
+				}
+				static int s_gateLog = 0;
+				if (s_gateLog++ < 12 || (flip % 50u) == 0u) printf("[STABLE] flip=%llu coverage=%.3f world=%d (present every frame)\n", static_cast<unsigned long long>(flip), coverage, worldFrame ? 1 : 0);
+				{
+					wgpu::TexelCopyTextureInfo dst = {};
+					dst.texture = m_fbTexture;
+					dst.aspect  = wgpu::TextureAspect::All;
+					wgpu::TexelCopyBufferLayout layout = {};
+					layout.bytesPerRow  = fb_w * 4;
+					layout.rowsPerImage = fb_h;
+					wgpu::Extent3D ext = { fb_w, fb_h, 1 };
+					m_queue.WriteTexture(&dst, s_persist.data(), npix * 4, &layout, &ext);
+				}
 				m_lastFlip = flip;
 			}
 		}

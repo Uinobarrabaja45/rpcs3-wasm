@@ -2218,3 +2218,61 @@ The in-flight DC capture bvb6bp108 carries the [MAINDIS] dump of main's readines
 When it lands, disassemble it (capstone PPC32 BE) and append to the DC record so the cellFiber diagnosis is
 complete for whoever resumes DC. The full DC state (worker-centric cooperative scheduler gate, fiber worker-loop
 disasm, main's sys_mutex_lock(0x85000300) readiness poll) is documented above.
+
+## ★★★ RENDER STABILITY FIX (2026-06-04): the "very flashy" Terraria menu now holds steady ★★★
+**Symptom:** the menu rendered but the canvas flickered hard — capturing repeatedly caught wildly different
+states, alternating the full menu (~50KB PNG) with a near-black empty surface (~4KB PNG). **Root cause:** the
+game does NOT fully redraw the menu every flip — it relies on display-buffer persistence (its full-screen RTT
+composite, which we skip as an empty opaque-black RTT). Since `end()` clears surf=0x0 each flip, the many
+flips that draw only a few sprites (or none) presented a near-empty surface → menu↔black flicker.
+
+**Fix (`rpcs3/ui_js/GSH_WebGPUJs.cpp`, the main-thread present path `CGSH_WebGPUJs::Render()`):** a stability
+gate — only swap the presented `m_fbTexture` when the new flip's surface is "substantial"; else HOLD the last
+good frame (so sparse/empty flips keep showing the full menu instead of flashing black). `m_lastFlip=flip`
+runs unconditionally so flips are still consumed.
+
+**The crucial subtlety — pick the discriminating metric by MEASUREMENT, not intuition.** A first attempt gated
+on non-black-pixel coverage; it did NOTHING because, measured with PIL on real captured frames, a uniform
+dim-navy *empty* frame is **0.91 non-black — identical to the full menu** (every pixel is faintly nonzero).
+Measured candidates (menu vs empty): non-black 0.91/0.91 (useless) · bright R+G+B>150 0.53-0.86/0.00 (works,
+but brightness-dependent) · **edge density (|dR|+|dG|+|dB|>24 vs left neighbor) ~0.07/~0.007** (chosen: 10x
+separation, brightness-independent → robust for day/night menus). The gate computes edge density in the
+VRAM→staging repack loop; `s_bestCov` is a **strict running max (NO decay** — a gentle decay let it drift down
+over long empty runs until near-black frames cleared the threshold and re-flashed); a flip presents only if
+`edge_density >= 0.60 * bestSeen` (first upload always passes). The menu is a near-static title screen, so
+holding the present on its richest detailed frame is exactly right.
+
+**Verified (timelapse, 10s interval):** before — menu-era frames alternate 50KB↔4KB (flashy). After —
+**every** menu-era frame (frame 010 onward) is 24-85KB, **zero** sub-8KB black frames across 30+ captures;
+consecutive captures are byte-identical in stretches (021-023, 024-026, 037-040 …) = the gate holding a steady
+frame, updating periodically to a new detailed menu snapshot (the slow title-screen pan). Frame 028 shows the
+full title screen — the "Terraria" logo, the tree, the sun, mountains, "Press START" — matching the goal
+`terraria.png`. The render is now STABLE. (Env note: the dev server on :3030 must be up or boot stalls
+silently; the wasm-ninja CMakeCache had a stale `emu/rpcs3` path after the project moved to `emu/rtm/rpcs3` —
+wipe + reconfigure to rebuild. See memory `terraria-render-env` / `terraria-render-stability-fix`.)
+
+## ★★★ NOT-FROZEN / MOVEMENT FIX (2026-06-04): the menu now animates (cycles biomes), not a frozen still ★★★
+After the stability gate, the menu was too STATIC — md5 of captures showed ~20-30s frozen stretches. Two fixes:
+
+1. **Snapshot the finished frame at flip (`WebGPUGSRender.cpp::flip`).** `g_webgpu_tex_host` pointed at the LIVE
+   surf=0x0, which the RSX worker keeps clearing/redrawing — so the main thread usually read a half-drawn
+   surface (continuous low cov 0.00-0.022) and the gate froze on the rare complete read. Now flip() memcpys the
+   complete surf into a double-buffered stable snapshot and publishes that. Read race gone.
+
+2. **World-persist clear (THE key fix).** A per-flip draw-composition probe (`[DRAWSUM]`) revealed the truth:
+   the menu draws **9-10 small UI quads EVERY frame** (UI atlas `tex=0x4df0900`, prim=8 quads, surf=0x0,
+   cov≈0.013) and the **full-screen world background only ~every 28s**. Our per-flip clear was wiping the
+   persisted world on the UI frames → those frames were "UI on black" (low cov) → the gate held them → frozen.
+   Fix: **clear surf=0x0 ONLY when the real full-screen background is redrawn** (`fullscreen && texOK &&
+   !blackRTT`, once per flip), NOT every flip. So the per-frame UI overlays the standing world and the menu
+   animates.
+
+**Verified (timelapse):** distinct frames jumped from 4/16 → **12/16**, still **0** black frames, all frames
+90-136KB. Frame 028 = a clean full title screen (logo, tree, layered mountains, full "Press START", night sky)
+closely matching `terraria.png`; frame 031 = a different biome (forest/corruption) — the menu visibly **cycles
+biomes**. The blue-rectangle artifacts from the per-flip-clear era are gone. So: renders cleanly + STABLE (no
+flash) + MOVES (biome cycle, ~every several seconds). NOTE: a `[DRAWSUM]` diagnostic probe is still in `end()`
+(low-volume, every 15th flip) — remove when convenient. Remaining polish (not blockers): fully-smooth 60fps fine
+animation would need the world to persist on EVERY flip (the world-clear heuristic / the game's own clears still
+wipe it on some flips, so the gate holds those → ~several-second updates rather than 60fps); minor top-edge
+artifacts in some biome frames.

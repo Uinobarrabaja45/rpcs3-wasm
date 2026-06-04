@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <cstdio>
+#include <vector>
+#include <cstring>
 
 // Cross-thread flip counter — bumped on the RSX worker, read on the
 // browser main thread inside GSH_WebGPUJs::Render and mainLoopTick.
@@ -41,6 +43,11 @@ std::atomic<u32> g_webgpu_tex_pitch{0};
 std::atomic<u64> g_webgpu_tex_flip{0}; // flip count this texture is valid for (0 = none)
 static u64 s_frame_tex_host = 0; static u32 s_frame_tex_w = 0, s_frame_tex_h = 0, s_frame_tex_pitch = 0;
 static bool s_frame_has_tex = false; // worker-only: set in end(), published in flip()
+// Double-buffered snapshot of the FINISHED frame (see flip()): the worker memcpys the complete surf=0x0
+// here at flip time; the main thread reads this stable copy instead of the live (being-redrawn) surface.
+// Ping-pong by flip parity so the worker writes one buffer while the main reads the other.
+static std::vector<u8> s_frame_snapshot[2];
+static int s_frame_snap_idx = 0;
 
 u64 WebGPUGSRender::get_cycles()
 {
@@ -55,6 +62,31 @@ WebGPUGSRender::WebGPUGSRender(utils::serial* ar) noexcept : GSRender(ar)
 void WebGPUGSRender::end()
 {
 #ifdef __EMSCRIPTEN__
+	// [DRAWSUM] per-frame draw-composition probe (2026-06-04): the menu fully rasterizes to surf=0x0 only ~every
+	// 28s; between, surf is near-empty. Find what the OTHER flips draw (primitive + target surface + texture) and
+	// whether our quads-only rasterizer ignores them (world as triangles? a separate RTT we then skip-composite?).
+	{
+		const auto& dcd = rsx::method_registers.current_draw_clause;
+		const u64 cfd = g_webgpu_flip_count.load(std::memory_order_relaxed);
+		static thread_local u64 s_dsFlip = ~0ull;
+		static thread_local u32 s_dsQuad = 0, s_dsNonQuad = 0, s_dsSurf = 0, s_dsTex = 0, s_dsLastPrim = 0;
+		if (cfd != s_dsFlip)
+		{
+			const u32 tot = s_dsQuad + s_dsNonQuad;
+			if (s_dsFlip != ~0ull && tot > 0 && (s_dsFlip % 15 == 0 || tot > 15))
+				printf("[DRAWSUM] flip=%llu quads=%u nonquads=%u lastPrim=%u surf=0x%x tex=0x%x\n",
+					static_cast<unsigned long long>(s_dsFlip), s_dsQuad, s_dsNonQuad, s_dsLastPrim, s_dsSurf, s_dsTex);
+			s_dsFlip = cfd; s_dsQuad = 0; s_dsNonQuad = 0; s_dsSurf = 0; s_dsTex = 0;
+		}
+		if (!dcd.empty())
+		{
+			s_dsSurf = rsx::method_registers.surface_offset(0);
+			s_dsLastPrim = static_cast<u32>(dcd.primitive);
+			s_dsTex = rsx::method_registers.fragment_textures[0].offset();
+			if (dcd.command == rsx::draw_command::array && dcd.primitive == rsx::primitive_type::quads) s_dsQuad++;
+			else s_dsNonQuad++;
+		}
+	}
 	// Wall-B diagnostic (2026-06-02): is the game actually issuing scene draws?
 	// If end() fires with real vertex counts, the scene (incl. the 505 splash) IS being
 	// submitted to RSX and only this nop-draw backend is dropping it — i.e. a real
@@ -161,23 +193,12 @@ void WebGPUGSRender::end()
 			if (saddr && sw && sh && spitch && stride >= 20u && a0.size() >= 2u)
 			{
 				u8* const sbase = static_cast<u8*>(vm::base(saddr));
-				// Per-frame clear: the menu's full-screen RTT composite normally re-fills surf=0x0 every frame,
-				// but that's the opaque-black layer we skip — so without it surf=0x0 accumulates STALE pixels
-				// (the green/pink garbage seen between frames). Clear to opaque black once per frame, on the
-				// first draw after a flip (g_webgpu_flip_count changes at flip()).
-				{
-					static thread_local u64 s_lastClearFlip = ~0ull;
-					const u64 cf = g_webgpu_flip_count.load(std::memory_order_relaxed);
-					if (cf != s_lastClearFlip)
-					{
-						s_lastClearFlip = cf;
-						for (u32 yy = 0; yy < sh; yy++)
-						{
-							be_t<u32>* crow = reinterpret_cast<be_t<u32>*>(sbase + static_cast<u64>(yy) * spitch);
-							for (u32 xx = 0; xx < sw; xx++) crow[xx] = 0xff000000u;
-						}
-					}
-				}
+				// World-persist model (2026-06-04): we DON'T clear surf=0x0 every flip anymore. The game redraws the
+				// full-screen world background only ~every 28s but the small UI quads EVERY frame, relying on the world
+				// persisting between redraws. A per-flip clear wiped the world on UI frames, so the menu FROZE (only the
+				// rare full-world frame had content). Instead we clear only when the real full-screen background is
+				// redrawn (see the PERSIST-THE-WORLD clear in the per-quad loop), so each frame's UI overlays the standing
+				// world and the menu animates per frame.
 				const u32 vbase = rsx::method_registers.vertex_data_base_offset();
 				const auto resolve = [&](u32 rawoff) -> const u8* {
 					const u32 a = rsx::get_address(rsx::get_vertex_offset_from_base(vbase, rawoff & 0x7fffffffu), rawoff >> 31);
@@ -281,6 +302,23 @@ void WebGPUGSRender::end()
 					// Skip a quad sampling the ENTIRE large atlas (uv≈0..1 of a >1024² texture) — an artifact that
 					// dumps the raw atlas sheet over the menu (no real sprite samples a whole 3900² atlas).
 					const bool fullAtlasDump = texOK && tw > 1024u && th > 1024u && minu < 0.02f && maxu > 0.98f && minv < 0.02f && maxv > 0.98f;
+					// PERSIST-THE-WORLD clear: clear surf=0x0 ONLY when the real full-screen background (textured, NOT the
+					// skipped opaque-black RTT) is redrawn -- once per flip, before it fills the screen. Between these
+					// redraws the buffer persists, so each frame's small UI quads overlay the standing world (animation).
+					if (fullscreen && texOK && !blackRTT)
+					{
+						static thread_local u64 s_lastWorldClear = ~0ull;
+						const u64 cfw = g_webgpu_flip_count.load(std::memory_order_relaxed);
+						if (cfw != s_lastWorldClear)
+						{
+							s_lastWorldClear = cfw;
+							for (u32 yy = 0; yy < sh; yy++)
+							{
+								be_t<u32>* crow = reinterpret_cast<be_t<u32>*>(sbase + static_cast<u64>(yy) * spitch);
+								for (u32 xx = 0; xx < sw; xx++) crow[xx] = 0xff000000u;
+							}
+						}
+					}
 					if (!blackRTT && !fullAtlasDump)
 					for (int y = y0; y < y1; y++)
 					{
@@ -448,7 +486,17 @@ void WebGPUGSRender::flip(const rsx::display_flip_info_t& info)
 		const u64 next = g_webgpu_flip_count.load(std::memory_order_relaxed) + 1;
 		if (s_frame_has_tex)
 		{
-			g_webgpu_tex_host.store(s_frame_tex_host, std::memory_order_relaxed);
+			// Snapshot the FINISHED surface into a stable double-buffer, and publish THAT (not the live surf pointer).
+			// Pointing g_webgpu_tex_host at the live surf raced with the worker clearing/redrawing the next frame,
+			// so the main thread usually read a half-drawn low-detail surface and the stability gate froze on the
+			// rare complete read. Snapshotting the finished frame makes every main read a complete frame -> the menu
+			// animates smoothly (and the gate still blocks genuinely empty flips).
+			const u64 snap_bytes = static_cast<u64>(s_frame_tex_h) * s_frame_tex_pitch;
+			s_frame_snap_idx ^= 1;
+			std::vector<u8>& snap = s_frame_snapshot[s_frame_snap_idx];
+			if (snap.size() < snap_bytes) snap.resize(snap_bytes);
+			if (s_frame_tex_host && snap_bytes) std::memcpy(snap.data(), reinterpret_cast<const void*>(static_cast<uintptr_t>(s_frame_tex_host)), snap_bytes);
+			g_webgpu_tex_host.store(static_cast<u64>(reinterpret_cast<uintptr_t>(snap.data())), std::memory_order_relaxed);
 			g_webgpu_tex_w.store(s_frame_tex_w, std::memory_order_relaxed);
 			g_webgpu_tex_h.store(s_frame_tex_h, std::memory_order_relaxed);
 			g_webgpu_tex_pitch.store(s_frame_tex_pitch, std::memory_order_relaxed);
