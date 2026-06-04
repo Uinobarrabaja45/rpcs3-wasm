@@ -119,3 +119,97 @@ canvas {
 .boot-panel button:hover {
   background: rgba(255, 255, 255, 0.18);
 }
+
+/* Loading gauge — shown over the blank canvas while the PS3 boots and the game
+   loads, until the first frame renders. Matches the FPS pill / boot panel
+   language: translucent dark capsule, backdrop blur, tabular figures. */
+.loading-gauge {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1050;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 26px 30px 22px;
+  background-color: rgba(20, 20, 22, 0.72);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  border-radius: 16px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55),
+              inset 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  color: white;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+               "Helvetica Neue", "Segoe UI", Roboto, sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 0.5s ease;
+}
+
+/* Fade out once the game starts rendering. */
+.loading-gauge--done {
+  opacity: 0;
+}
+
+.loading-gauge__spinner {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2.5px solid rgba(255, 255, 255, 0.18);
+  border-top-color: #60a5fa;
+  animation: loading-gauge-spin 0.8s linear infinite;
+}
+
+@keyframes loading-gauge-spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading-gauge__label {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  opacity: 0.95;
+}
+
+.loading-gauge__track {
+  width: 260px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.loading-gauge__fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  transition: width 0.35s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Sliding sheen so the bar reads as "working" even while the width creeps. */
+.loading-gauge__fill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  transform: translateX(-100%);
+  animation: loading-gauge-sheen 1.4s ease-in-out infinite;
+}
+
+@keyframes loading-gauge-sheen {
+  100% { transform: translateX(100%); }
+}
+
+.loading-gauge__pct {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  opacity: 0.7;
+  letter-spacing: 0.02em;
+}

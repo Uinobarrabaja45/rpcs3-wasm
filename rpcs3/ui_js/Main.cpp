@@ -11,6 +11,8 @@
 // Rpcs3VmJs.cpp should be replaced with real Emu.* calls.
 
 #include <cstdio>
+#include <cstdint>
+#include <atomic>
 #include <string>
 
 #include <emscripten/bind.h>
@@ -33,6 +35,16 @@ EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_context = 0;
 static std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
 #ifdef HAS_WEBGPU
 static CGSH_WebGPUJs* g_gsHandler = nullptr;
+// The game's RSX flip counter (defined in WebGPUGSRender.cpp). Bumped ONLY when
+// the game presents a real frame — unlike g_frameCount, which also counts the
+// ~2/s boot keep-alive presents. Exposed to JS as getFlipCount() so the loading
+// gauge can tell "still booting" (flip == 0) from "game is rendering" (flip > 0).
+extern std::atomic<std::uint64_t> g_webgpu_flip_count;
+// Count of VARIED (real on-screen content) composites — stays 0 through the
+// all-black/navy boot, non-zero once the game is actually VISIBLE. This is the
+// signal the loading gauge uses to hide (flip_count alone fires on boot's black
+// flips, before anything is visible).
+extern std::atomic<std::uint32_t> g_webgpu_content_frames;
 #endif
 
 // ───────── stats / pacing knobs exposed to JS ─────────
@@ -282,6 +294,27 @@ namespace
 	void stop()        { if (g_virtualMachine) g_virtualMachine->Stop();   }
 	int  getFrames()   { return g_frameCount; }
 	void clearStats()  { g_frameCount = 0; }
+	// Game-render signal for the JS loading gauge: the RSX flip count stays 0 all
+	// through boot and goes non-zero only once the game presents its first real
+	// frame (getFrames can't be used for this — it also counts boot keep-alives).
+	int  getFlipCount()
+	{
+#ifdef HAS_WEBGPU
+		return static_cast<int>(g_webgpu_flip_count.load(std::memory_order_relaxed));
+#else
+		return 0;
+#endif
+	}
+	// "Is the game actually VISIBLE yet?" — 0 all through boot (black/navy frames),
+	// non-zero once a real varied frame is composited. The loading gauge hides on this.
+	int  getContentFrames()
+	{
+#ifdef HAS_WEBGPU
+		return static_cast<int>(g_webgpu_content_frames.load(std::memory_order_relaxed));
+#else
+		return 0;
+#endif
+	}
 	void setResolution(int w, int h)
 	{
 		g_renderWidth = w;
@@ -305,6 +338,8 @@ EMSCRIPTEN_BINDINGS(rpcs3_js_module)
 	emscripten::function("resume",                  &resume);
 	emscripten::function("stop",                    &stop);
 	emscripten::function("getFrames",               &getFrames);
+	emscripten::function("getFlipCount",            &getFlipCount);
+	emscripten::function("getContentFrames",        &getContentFrames);
 	emscripten::function("clearStats",              &clearStats);
 	emscripten::function("setResolution",           &setResolution);
 	emscripten::function("setFrameskip",            &setFrameskip);

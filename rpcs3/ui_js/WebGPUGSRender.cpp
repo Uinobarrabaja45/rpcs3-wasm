@@ -16,6 +16,13 @@
 // we target, so the read path adds no contention.
 std::atomic<u64> g_webgpu_flip_count{0};
 
+// Count of VARIED (real menu/game content) frames the compositor has presented —
+// bumped only when color-stddev clears the worldFrame threshold (GSH_WebGPUJs.cpp),
+// so it stays 0 through the all-black/navy boot and goes non-zero only once real
+// content is on screen. Exposed to JS (getContentFrames) so the loading gauge hides
+// when the game is actually VISIBLE, not merely when the first (black) flip happens.
+std::atomic<u32> g_webgpu_content_frames{0};
+
 // Front display-buffer descriptor published by flip() (RSX worker) and read
 // by GSH_WebGPUJs::Render (browser main thread). wasm32 pthreads share one
 // linear memory, so the main thread can read the framebuffer pixels directly
@@ -62,31 +69,6 @@ WebGPUGSRender::WebGPUGSRender(utils::serial* ar) noexcept : GSRender(ar)
 void WebGPUGSRender::end()
 {
 #ifdef __EMSCRIPTEN__
-	// [DRAWSUM] per-frame draw-composition probe (2026-06-04): the menu fully rasterizes to surf=0x0 only ~every
-	// 28s; between, surf is near-empty. Find what the OTHER flips draw (primitive + target surface + texture) and
-	// whether our quads-only rasterizer ignores them (world as triangles? a separate RTT we then skip-composite?).
-	{
-		const auto& dcd = rsx::method_registers.current_draw_clause;
-		const u64 cfd = g_webgpu_flip_count.load(std::memory_order_relaxed);
-		static thread_local u64 s_dsFlip = ~0ull;
-		static thread_local u32 s_dsQuad = 0, s_dsNonQuad = 0, s_dsSurf = 0, s_dsTex = 0, s_dsLastPrim = 0;
-		if (cfd != s_dsFlip)
-		{
-			const u32 tot = s_dsQuad + s_dsNonQuad;
-			if (s_dsFlip != ~0ull && tot > 0 && (s_dsFlip % 15 == 0 || tot > 15))
-				printf("[DRAWSUM] flip=%llu quads=%u nonquads=%u lastPrim=%u surf=0x%x tex=0x%x\n",
-					static_cast<unsigned long long>(s_dsFlip), s_dsQuad, s_dsNonQuad, s_dsLastPrim, s_dsSurf, s_dsTex);
-			s_dsFlip = cfd; s_dsQuad = 0; s_dsNonQuad = 0; s_dsSurf = 0; s_dsTex = 0;
-		}
-		if (!dcd.empty())
-		{
-			s_dsSurf = rsx::method_registers.surface_offset(0);
-			s_dsLastPrim = static_cast<u32>(dcd.primitive);
-			s_dsTex = rsx::method_registers.fragment_textures[0].offset();
-			if (dcd.command == rsx::draw_command::array && dcd.primitive == rsx::primitive_type::quads) s_dsQuad++;
-			else s_dsNonQuad++;
-		}
-	}
 	// Wall-B diagnostic (2026-06-02): is the game actually issuing scene draws?
 	// If end() fires with real vertex counts, the scene (incl. the 505 splash) IS being
 	// submitted to RSX and only this nop-draw backend is dropping it — i.e. a real

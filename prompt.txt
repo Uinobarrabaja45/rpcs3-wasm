@@ -42,3 +42,19 @@ Focus on game terraria.
 the goal is canvas look like js/rpcs3_browser/public/terraria.png.
 
 also make sure the render is not flashy by capturing more than once.
+
+
+
+I' ve checked manually. it's still very flashy
+
+
+
+/loop 1 minute
+
+
+
+continue ./PLAN-first-frame.md ./PLAN-Vulkan-port-to-WebGPU.md if a decision arises, pick the best option and proceed autonomously — do not ask, just decide and keep going. 
+
+Focus on game terraria.
+
+/goal  is to make canvas look similar to js/rpcs3_browser/public/terraria.png. make sure the render is consistent by capturing more than  5 times and contain text of "PRESS START".

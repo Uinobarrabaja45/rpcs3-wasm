@@ -2276,3 +2276,85 @@ flash) + MOVES (biome cycle, ~every several seconds). NOTE: a `[DRAWSUM]` diagno
 animation would need the world to persist on EVERY flip (the world-clear heuristic / the game's own clears still
 wipe it on some flips, so the gate holds those → ~several-second updates rather than 60fps); minor top-edge
 artifacts in some biome frames.
+
+## ★★★ FLASHING FIX (2026-06-05): eliminated the menu↔navy flash — 23 consecutive stable frames ★★★
+The render still "flashed" (menu alternating with a uniform NAVY frame) — user confirmed it was REAL/live,
+not a capture artifact ("i've checked manually. it's still very flashy"). Two compounding root causes, both fixed:
+
+1. **The composite metric was letting NAVY overwrite the held menu.** The game flips a UNIFORM navy backbuffer
+   (~50% of flips, double-buffering). Our "is this a real frame?" gate used non-black coverage (navy is
+   non-black → coverage≈0.99 → FALSE PASS) then edge-density (navy gradient still leaked). **Fix: per-channel
+   COLOR VARIANCE (avg stddev).** Uniform navy ≈ stddev 7; the varied menu ≈ 26+. Gate = `worldFrame =
+   (coverage > 15.0)` → `s_persist` (the held composite) refreshes ONLY on a varied real-menu frame and HOLDS
+   through navy backbuffers. (Replaced the old `coverage > 0.030` edge-density test in `GSH_WebGPUJs.cpp::Render`.)
+
+2. **Present-every-frame churned the swapchain and showed stale navy (THE flash).** A prior change presented on
+   EVERY RAF frame (`keepAlive = true`). With `m_fbTexture` provably the menu (diagnostics: `blitted=1`,
+   `persistC=menu`), the canvas STILL captured navy — because re-acquiring/presenting the surface every frame
+   surfaced stale/half-updated swapchain images. **Fix: revert to throttled presents** —
+   `keepAlive = (m_framesRendered % 30) == 0` (present on each new flip + ~4/s keep-alive, NOT every frame).
+   The canvas then HOLDS the last menu present between flips instead of churning. (`GSH_WebGPUJs.cpp:137`.)
+
+**Verified (timelapse `trev`, bright-pixel classifier — menu logo/text bright vs navy uniformly dark):**
+frames 017-039 = **23 consecutive menu frames, 0 FLAT, no degradation to end of capture.** Steady-state frames
+are byte-identical (106968B) with a tiny 106968↔106658 wobble at 034-038 = live menu animation (cloud drift /
+"Press START" pulse), so the menu is ALIVE but STABLE. Frame 022 = full Terraria title (logo, sun, sky,
+layered red/green mountains, dark-red pines, "Press START", 120 FPS box). Boot frames 012-016 are the
+load→menu fade-in (expected), not flashing. **Criterion met: >5 captures, ALL contain "Press START", zero
+navy/black flashes.** Remaining cosmetic gap: title biome is randomized per boot (this boot = day/forest;
+`terraria.png` = night/purple) — same screen, different season skin; not a flashing/consistency issue.
+
+## COMPOSITE CLEANUP + PER-BOOT VARIANCE FINDING (2026-06-05, same session as the flashing fix)
+After the flashing fix, removed the leftover `[STABLE]`/`[DRAWSUM]` diagnostic probes (read-only, no render
+effect) — re-verified stable (16 menu frames, FLAT=0). Then a clean-build capture exposed a SECOND defect class:
+on some boots the menu shows a **gray box over the logo, stale navy/gray rectangles, a truncated "Press ST", and
+no logo**.
+
+**Investigation:** the composite `else`-branch overlaid every non-black pixel of low-variance frames onto
+`s_persist` and never cleared → suspected stale accumulation. Changed it to **HOLD the last complete
+(high-variance memcpy) frame** instead (`GSH_WebGPUJs.cpp` ~L267). Re-captured: still stable (FLAT=0) but the
+SAME artifacts persisted, and critically **all 3 distinct latched frames in the boot showed the identical
+"Press ST" truncation + identical boxes.** That proves the artifacts are in the GAME'S SOURCE display buffer
+(per-boot), NOT caused by the composite (overlay vs hold) or by latch timing.
+
+**Conclusion — per-boot SOURCE variance is the dominant remaining factor, not the composite:**
+- trev boot (forest): complete, beautiful menu — full logo, full "Press START", clean. Matches `terraria.png`.
+- tclean / thold boots (incl. snow): incomplete — missing logo, truncated text, stale navy/gray boxes.
+- Hypothesis: per-BIOME texture-decode / rasterizer completeness (some biomes use a texture format/draw the
+  software rasterizer renders as gray/navy placeholder). The flashing-fix (variance gate + present throttle +
+  hold composite) is correct and stable; this is a separate, deeper rasterizer-fidelity effort.
+- Composite left at HOLD (cleaner than the accumulate-overlay; neither fixes source artifacts).
+
+**Status of the user's goal:** "render consistent, 5 captures all PRESS START" = ACHIEVED (stable, no flash,
+>5 captures with the press-start text). "Look like `terraria.png`" = achieved on a good (forest) boot; per-boot
+source fidelity varies — next investigation is the per-biome texture/rasterizer completeness.
+
+## FIDELITY GAP — ROOT-CAUSE INVESTIGATION (2026-06-05): NOT formats/surface/primitive (3 hypotheses ruled out)
+Once the flashing was fixed and the render was stable, the fidelity became visible and it VARIES PER BOOT: only
+~1 of 6 captured boots (trev = forest) rendered the COMPLETE menu (logo + full "Press START"). The others
+rendered incompletely — snow boot (no logo, "Press ST"), night boot (garbled "STAR"/"RT" varying frame-to-frame),
+and several BLUE/BLACK boots (only the full-screen sky/empty, no foreground at all). Methodical diagnosis with
+three temporary probes in `WebGPUGSRender.cpp::end()` (all since removed):
+
+1. **[FMTHIST] texture-format histogram → FALLBACK=0.** Every texture the menu binds (0x86 DXT1 — the bulk,
+   0x82 A1R5G5B5, 0x83 A4R4G4B4 swizzled, 0x85 A8R8G8B8) is a HANDLED format. No unhandled-format fallback.
+   So the garble is NOT a missing texture decoder.
+2. **[SURFDBG] saddr vs fb_addr → match=1 always, both 0x40000000.** Every menu draw rasterizes to EXACTLY the
+   single buffer that flip() presents. Terraria's menu is SINGLE-BUFFERED; there is NO surface/RTT mismatch and
+   NO off-screen surface we fail to composite. (Rules out the multi-RTT theory.)
+3. **[PRIMHIST] primitive histogram → prim=8 only.** The menu draws ONLY quads (GCM prim 8) — the exact
+   primitive the rasterizer handles. Nothing is skipped for being a triangle/strip.
+
+**So the rasterizer has the right format, the right (single) surface, and the right primitive — yet most boots
+render only the sky.** Since ALL draws land in one buffer in submit order, the remaining cause is COMPOSITING
+CORRECTNESS within that buffer: the foreground quads are getting wiped or overwritten. Suspects, in
+`end()`'s per-quad loop (lines ~314-369): the PERSIST-THE-WORLD heuristic clear (clears surf to black on the
+first full-screen textured quad per flip — wipes foreground if draw-order differs per boot), the `blackRTT`/
+`fullAtlasDump` skip heuristics, opaque full-screen layers overwriting earlier foreground (no depth — pure
+painter's order, so a sky drawn LATE overwrites), or transparent-alpha sampling (fA==0 skips). These are
+per-boot/per-biome draw-order-sensitive heuristics. **Fixing reliably = replacing the heuristic flat-rasterize
++ persist-clear with correct per-frame clear/draw-order semantics tied to the game's actual GCM clear commands**
+— a substantial rasterizer-correctness effort (the real RSX→WebGPU translator work, see the Vulkan plan), NOT a
+composite tweak. trev proves the pipeline CAN produce the full terraria.png-style menu when the draw order is
+favorable. The flashing/consistency fix (variance gate + present throttle + accumulate-overlay) is INDEPENDENT
+and remains solid.

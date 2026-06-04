@@ -1,5 +1,5 @@
 import './App.css';
-import { ChangeEvent, useState, useEffect } from 'react';
+import { ChangeEvent, useState, useEffect, useRef } from 'react';
 import { Rpcs3Module } from './Rpcs3Module';
 import { useAppDispatch, useAppSelector, bootFile, init } from "./Actions";
 import { getRunnableGame } from './Games';
@@ -27,6 +27,74 @@ function Stats() {
     <div className="fps-pill" aria-live="polite" aria-label={`${fps} frames per second`}>
       <span className="fps-pill__num">{fps}</span>
       <span className="fps-pill__label">FPS</span>
+    </div>
+  );
+}
+
+// Loading gauge shown over the (blank) canvas from boot-start until the game is
+// actually visible. There is no real progress signal during the ~2-3 min PS3
+// boot, so the bar trickles with a smooth asymptotic curve toward ~95% and snaps
+// to 100% the instant getContentFrames() goes non-zero (the count of varied,
+// real-content composited frames, Main.cpp), then fades out.
+function LoadingGauge() {
+  const [progress, setProgress] = useState(0);
+  const [done, setDone] = useState(false);
+  const [unmount, setUnmount] = useState(false);
+  const startRef = useRef<number>(Date.now());
+
+  // End loading when real content is actually ON SCREEN. The signal is
+  // getContentFrames() — the count of VARIED composited frames, which stays 0
+  // through the all-black/navy boot and goes non-zero only once the game is
+  // visible. (getFrames counts boot keep-alive presents; getFlipCount counts the
+  // game's black boot flips — both fire too early, so neither works here.)
+  useEffect(() => {
+    if (done) return;
+    const start = startRef.current;
+    const id = setInterval(() => {
+      const m = Rpcs3Module as { getContentFrames?: () => number } | undefined;
+      const content = m && typeof m.getContentFrames === 'function' ? m.getContentFrames() : -1;
+      const elapsed = (Date.now() - start) / 1000;
+      // content > 0 → a real (non-black) frame is on screen. content < 0 → older
+      // wasm without the accessor; fall back to a generous boot budget.
+      if (content > 0 || (content < 0 && elapsed > 300)) {
+        setDone(true);
+      }
+    }, 250);
+    return () => clearInterval(id);
+  }, [done]);
+
+  // Trickle the bar (no real progress until the first frame), then snap to 100%
+  // and fade out once rendering starts.
+  useEffect(() => {
+    if (done) {
+      setProgress(100);
+      const t = setTimeout(() => setUnmount(true), 650);
+      return () => clearTimeout(t);
+    }
+    const id = setInterval(() => {
+      const elapsed = (Date.now() - startRef.current) / 1000;
+      setProgress(95 * (1 - Math.exp(-elapsed / 55))); // ~63% @1min, ~86% @2min, never reaches 95
+    }, 150);
+    return () => clearInterval(id);
+  }, [done]);
+
+  if (unmount) return null;
+  const pct = Math.round(Math.min(100, progress));
+  return (
+    <div
+      className={`loading-gauge${done ? ' loading-gauge--done' : ''}`}
+      role="progressbar"
+      aria-valuenow={pct}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-label="Loading game"
+    >
+      <div className="loading-gauge__spinner" aria-hidden="true" />
+      <div className="loading-gauge__label">{done ? 'Ready' : 'Booting PS3 — loading game…'}</div>
+      <div className="loading-gauge__track">
+        <div className="loading-gauge__fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="loading-gauge__pct">{pct}%</div>
     </div>
   );
 }
@@ -122,6 +190,7 @@ function App() {
   return (
     <div className="App">
       {showFPS && state.value === 'loaded' && <Stats />}
+      {bootHidden && <LoadingGauge />}
       {showPanel && (
         <div className="boot-panel">
           <h2>RPCS3 — WebGPU PS3 emulator (POC)</h2>

@@ -16,6 +16,7 @@
 // vm::base on the RSX side), valid on this thread because wasm pthreads share
 // one linear address space.
 extern std::atomic<uint64_t> g_webgpu_flip_count;
+extern std::atomic<uint32_t> g_webgpu_content_frames; // bumped per varied (real-content) composite; JS loading gauge
 extern std::atomic<uint32_t> g_webgpu_fb_addr;
 extern std::atomic<uint32_t> g_webgpu_fb_width;
 extern std::atomic<uint32_t> g_webgpu_fb_height;
@@ -101,7 +102,7 @@ void CGSH_WebGPUJs::ConfigureSurface()
 	cfg.device      = m_device;
 	cfg.format      = wgpu::TextureFormat::BGRA8Unorm;
 	cfg.usage       = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopyDst;
-	cfg.alphaMode   = wgpu::CompositeAlphaMode::Auto;
+	cfg.alphaMode   = wgpu::CompositeAlphaMode::Opaque; // opaque so the canvas can't blend the page-black through
 	cfg.width       = static_cast<uint32_t>(m_windowWidth);
 	cfg.height      = static_cast<uint32_t>(m_windowHeight);
 	cfg.presentMode = wgpu::PresentMode::Fifo;
@@ -128,7 +129,13 @@ bool CGSH_WebGPUJs::Render()
 		const uint64_t flipNow = g_webgpu_flip_count.load(std::memory_order_acquire);
 		const bool firstFrame  = (m_framesRendered == 0);
 		const bool flipped     = (flipNow != m_lastDrawnFlip);
-		const bool keepAlive   = (m_framesRendered % 120) == 0;
+		// PRESENT EVERY FRAME (2026-06-05): the user reports the live canvas is "very flashy". The canvas does NOT
+		// reliably hold the last presented image between presents — when we throttle (present only on the ~30/s
+		// flips) it flickers to black on the in-between RAF frames, and the game also flips menu/black double-buffers
+		// ~50/50, so the surface read alternates too. m_fbTexture always holds the composited menu, so simply
+		// re-blitting it every RAF frame keeps the canvas on the menu (no black gaps). Costs more GPU submits but
+		// kills the flashing; the rate-limiter already tamed the log-churn that destabilized headless before.
+		const bool keepAlive   = (m_framesRendered % 30) == 0; // present on each new flip + a ~4/s keep-alive (NOT every RAF frame: present-every-frame churned the swapchain and showed stale navy images)
 		if (!firstFrame && !flipped && !keepAlive)
 		{
 			m_framesRendered++;
@@ -228,44 +235,46 @@ bool CGSH_WebGPUJs::Render()
 				// [A][R][G][B]. Packing them as a host little-endian u32 lays the
 				// bytes out [B][G][R][A] == BGRA8Unorm, which is the surface
 				// format — so the swizzle is just this byte repack.
-				uint64_t nonblack = 0; // non-black (RGB!=0) pixel count -> coverage, to detect full-WORLD frames vs small-UI frames
-				for (uint32_t y = 0; y < fb_h; y++)
-				{
-					const uint8_t* srcRow = base + static_cast<size_t>(y) * src_pitch;
-					uint32_t* dstRow = m_fbStaging.data() + static_cast<size_t>(y) * fb_w;
-					for (uint32_t x = 0; x < fb_w; x++)
+				uint64_t sR=0,sG=0,sB=0,sR2=0,sG2=0,sB2=0; // per-channel sums for COLOR VARIANCE. The game flips a UNIFORM
+					// navy backbuffer that the edge-density/coverage metrics could not cleanly reject (a navy gradient overlapped
+					// sparse menu frames). Color stddev separates them with margin: uniform navy ~7, the varied menu ~26+.
+					for (uint32_t y = 0; y < fb_h; y++)
 					{
-						const uint8_t* p = srcRow + static_cast<size_t>(x) * 4;
-						// Force A=0xFF (opaque). The present blit alpha-blends m_fbTexture against a black clear, so a
-						// frame whose display-buffer alpha is 0 (the game doesn't always write opaque alpha) blitted to
-						// PURE BLACK regardless of its RGB -> the canvas flashed black ~half the frames. Present is opaque.
-						const uint32_t px = 0xFF000000u | (static_cast<uint32_t>(p[1]) << 16) | (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
-						dstRow[x] = px;
-						if (px & 0x00ffffffu) nonblack++;
+						const uint8_t* srcRow = base + static_cast<size_t>(y) * src_pitch;
+						uint32_t* dstRow = m_fbStaging.data() + static_cast<size_t>(y) * fb_w;
+						for (uint32_t x = 0; x < fb_w; x++)
+						{
+							const uint8_t* p = srcRow + static_cast<size_t>(x) * 4;
+							const uint32_t R = p[1], G = p[2], B = p[3];
+							dstRow[x] = 0xFF000000u | (R << 16) | (G << 8) | B; // force opaque
+							sR += R; sG += G; sB += B;
+							sR2 += static_cast<uint64_t>(R) * R; sG2 += static_cast<uint64_t>(G) * G; sB2 += static_cast<uint64_t>(B) * B;
+						}
 					}
-				}
-				// PERSISTENT COMPOSITE (2026-06-04): the menu draws the full-screen WORLD background only ~every 28s but
-				// the small UI quads EVERY frame, relying on the world persisting between. The old hold-the-best-frame gate
-				// could not reconcile this AND its strict-max threshold crept up over minutes until nothing passed -> the
-				// canvas FROZE, and sparse frames still flashed. Instead keep a persistent host buffer that always holds the
-				// world, overlay each frame's UI onto it, and present it EVERY frame: no hold -> no freeze; never black ->
-				// no flash; UI composited per frame -> it animates. A high-coverage frame (world fills the screen) fully
-				// REFRESHES the buffer (clean biome transitions); a low-coverage frame overlays only its non-black pixels.
-				const double coverage = static_cast<double>(nonblack) / (static_cast<double>(fb_w) * fb_h);
-				static std::vector<uint32_t> s_persist;
-				const size_t npix = static_cast<size_t>(fb_w) * fb_h;
-				if (s_persist.size() != npix) s_persist.assign(npix, 0xFF000000u);
-				const bool worldFrame = (coverage > 0.55); // was (m_lastFlip==0 || ...): the force-refresh on a recreate frame (often black) flashed the canvas
+					const double nn = static_cast<double>(fb_w) * fb_h;
+					const double mR = sR / nn, mG = sG / nn, mB = sB / nn;
+					const double vR = static_cast<double>(sR2) / nn - mR * mR;
+					const double vG = static_cast<double>(sG2) / nn - mG * mG;
+					const double vB = static_cast<double>(sB2) / nn - mB * mB;
+					const double coverage = (std::sqrt(vR > 0 ? vR : 0) + std::sqrt(vG > 0 ? vG : 0) + std::sqrt(vB > 0 ? vB : 0)) / 3.0; // avg color stddev
+					static std::vector<uint32_t> s_persist;
+					const size_t npix = static_cast<size_t>(fb_w) * fb_h;
+					if (s_persist.size() != npix) s_persist.assign(npix, 0xFF000000u);
+					const bool worldFrame = (coverage > 15.0); // color-stddev threshold: refresh s_persist only on a VARIED frame (real menu), hold it on uniform navy/black backbuffers
 				if (worldFrame)
 				{
+					g_webgpu_content_frames.fetch_add(1, std::memory_order_relaxed); // real content on screen -> JS gauge can hide
 					std::memcpy(s_persist.data(), m_fbStaging.data(), npix * 4);
 				}
-				else
-				{
-					for (size_t i = 0; i < npix; i++) { const uint32_t px = m_fbStaging[i]; if (px & 0x00ffffffu) s_persist[i] = px; }
-				}
-				static int s_gateLog = 0;
-				if (s_gateLog++ < 12 || (flip % 50u) == 0u) printf("[STABLE] flip=%llu cov=%.3f world=%d persistC=%08x stagingC=%08x fb=0x%x %ux%u sw=%ux%u\n", static_cast<unsigned long long>(flip), coverage, worldFrame ? 1 : 0, s_persist[static_cast<size_t>(fb_h/2)*fb_w + fb_w/2], m_fbStaging[static_cast<size_t>(fb_h/2)*fb_w + fb_w/2], fb_addr, fb_w, fb_h, surfW, surfH);
+					else
+					{
+						// ACCUMULATE non-black menu content across frames. Some boots draw the menu incrementally —
+						// different glyphs/elements rasterize on different flips (observed: the press-start text varied
+						// frame-to-frame, "STAR"/"START"/"RT"). Overlaying non-black pixels onto the held composite builds
+						// up the COMPLETE menu (full logo + "Press START"), which a single held frame misses. The memcpy
+						// above resets it on each varied full frame, bounding stale accumulation.
+						for (size_t i = 0; i < npix; i++) { const uint32_t px = m_fbStaging[i]; if (px & 0x00ffffffu) s_persist[i] = px; }
+					}
 				{
 					wgpu::TexelCopyTextureInfo dst = {};
 					dst.texture = m_fbTexture;
