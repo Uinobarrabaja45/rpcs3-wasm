@@ -31,8 +31,28 @@ const ignoreLog = new URLSearchParams(window.location.search).get('ignore_log') 
 // are pure noise — but they fire hundreds of times per boot and bury real
 // errors. Filter them at the printErr boundary; keep everything else.
 const SYSCALL_NOISE_RE = /^warning: unsupported syscall: __syscall_/;
+// Console rate-limiter (2026-06-04): the emulator core + leftover debug probes printf heavily every frame
+// ([GetConsumer], [SCALL], [SEMBLOCK], repeated [SYS] lwmutex errors via printErr, etc.). Each console.log/warn
+// gets progressively slower as the browser console buffer grows, so after a few minutes the worker/main thread
+// saturates on logging and the render loop crawls to a "freeze" (observed: flip rate 30/s -> ~2/s after ~5 min,
+// heap flat so it's not a leak). Cap output: a generous boot burst (so the capture trigger + init diagnostics
+// still appear), then a low steady rate; drop the rest. Dropping is cheap (no console call) so the wasm->JS
+// boundary returns immediately and never blocks the worker. Raise LOG_MAX_PER_SEC if you need verbose logs.
+let g_logBurst = 0, g_logWinStart = 0, g_logWinCount = 0;
+const LOG_BURST = 4000;       // first 4000 lines unlimited (boot diagnostics + the headless-capture trigger)
+const LOG_MAX_PER_SEC = 20;   // then at most ~20 console lines/sec — keeps the buffer small so console stays fast
+function logGate(): boolean {
+    if (g_logBurst < LOG_BURST) { g_logBurst++; return true; }
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    if (now - g_logWinStart > 1000) { g_logWinStart = now; g_logWinCount = 0; }
+    if (g_logWinCount >= LOG_MAX_PER_SEC) return false;
+    g_logWinCount++;
+    return true;
+}
+
 const printErrFiltered = (text: any) => {
     if (typeof text === 'string' && SYSCALL_NOISE_RE.test(text)) return;
+    if (!logGate()) return;
     // Fall back to console.warn for genuine wasm aborts / unhandled errors.
     // eslint-disable-next-line no-console
     console.warn(text);
@@ -46,8 +66,13 @@ let module_overrides: { [k: string]: any } = {
     mainScriptUrlOrBlob: "",
     printErr: printErrFiltered,
 };
+// Silence stdout entirely when ignore_log (default); otherwise still rate-limit it (logGate) so heavy per-frame
+// logging can't accumulate and freeze the render loop.
 if (ignoreLog) {
     module_overrides.print = () => {};
+} else {
+    // eslint-disable-next-line no-console
+    module_overrides.print = (text: any) => { if (logGate()) console.log(text); };
 }
 
 function getRAMFromURL(): string | null {
