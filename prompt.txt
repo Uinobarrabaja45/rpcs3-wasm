@@ -27,3 +27,18 @@ continue ./PLAN-first-frame.md ./PLAN-Vulkan-port-to-WebGPU.md if a decision ari
 Focus on game terraria.
 Use js/rpcs3_browser/public/terraria.png as a goal.
 Make sure the render is not frozen by captureing more than once (Terraria Menu is not still, it move)
+
+
+
+
+/loop 1 minute
+
+
+
+continue ./PLAN-first-frame.md ./PLAN-Vulkan-port-to-WebGPU.md if a decision arises, pick the best option and proceed autonomously — do not ask, just decide and keep going. 
+
+Focus on game terraria.
+
+the goal is canvas look like js/rpcs3_browser/public/terraria.png.
+
+also make sure the render is not flashy by capturing more than once.

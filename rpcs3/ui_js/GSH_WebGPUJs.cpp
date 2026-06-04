@@ -156,16 +156,27 @@ bool CGSH_WebGPUJs::Render()
 	const uint32_t fb_h     = g_webgpu_fb_height.load(std::memory_order_relaxed);
 	const uint32_t fb_pitch = g_webgpu_fb_pitch.load(std::memory_order_relaxed);
 
+	// Debounce resolution blips (2026-06-04): the menu occasionally flips its display-buffer size for just a frame
+	// or two; reconfiguring the surface + recreating m_fbTexture on each blip reset the persistent buffer and
+	// flashed the canvas BLACK ~once a minute. Only reconfigure after the new size persists a few flips; a transient
+	// blip makes haveFrame go false for that frame, so we just re-present the held menu.
+	static int s_pendingW = 0, s_pendingH = 0, s_pendingCount = 0;
 	if (fb_w > 0 && fb_h > 0 && (static_cast<int>(fb_w) != m_windowWidth || static_cast<int>(fb_h) != m_windowHeight))
 	{
-		m_windowWidth = fb_w;
-		m_windowHeight = fb_h;
-		ConfigureSurface();
-		// swapchain recreated above — the texture acquired earlier is stale; re-acquire it
-		// (otherwise it is a "destroyed texture used in a submit" the next render pass).
-		m_surface.GetCurrentTexture(&surfaceTex);
-		if (!surfaceTex.texture) return false;
+		if (static_cast<int>(fb_w) == s_pendingW && static_cast<int>(fb_h) == s_pendingH) s_pendingCount++;
+		else { s_pendingW = static_cast<int>(fb_w); s_pendingH = static_cast<int>(fb_h); s_pendingCount = 1; }
+		if (s_pendingCount >= 10)
+		{
+			printf("[GSH_WebGPUJs] resolution change %dx%d -> %ux%u (reconfigure)\n", m_windowWidth, m_windowHeight, fb_w, fb_h);
+			m_windowWidth = fb_w;
+			m_windowHeight = fb_h;
+			ConfigureSurface();
+			m_surface.GetCurrentTexture(&surfaceTex);
+			if (!surfaceTex.texture) return false;
+			s_pendingCount = 0;
+		}
 	}
+	else { s_pendingCount = 0; }
 
 	const uint32_t surfW = static_cast<uint32_t>(m_windowWidth);
 	const uint32_t surfH = static_cast<uint32_t>(m_windowHeight);
@@ -194,6 +205,7 @@ bool CGSH_WebGPUJs::Render()
 			m_fbTexW = fb_w;
 			m_fbTexH = fb_h;
 			m_lastFlip = 0; // force a re-upload into the new texture
+				printf("[GSH_WebGPUJs] m_fbTexture recreate -> %ux%u\n", fb_w, fb_h);
 		}
 
 		// Re-read VRAM only when a new frame was flipped (the splash is static,
@@ -224,7 +236,10 @@ bool CGSH_WebGPUJs::Render()
 					for (uint32_t x = 0; x < fb_w; x++)
 					{
 						const uint8_t* p = srcRow + static_cast<size_t>(x) * 4;
-						const uint32_t px = (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) | (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+						// Force A=0xFF (opaque). The present blit alpha-blends m_fbTexture against a black clear, so a
+						// frame whose display-buffer alpha is 0 (the game doesn't always write opaque alpha) blitted to
+						// PURE BLACK regardless of its RGB -> the canvas flashed black ~half the frames. Present is opaque.
+						const uint32_t px = 0xFF000000u | (static_cast<uint32_t>(p[1]) << 16) | (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
 						dstRow[x] = px;
 						if (px & 0x00ffffffu) nonblack++;
 					}
@@ -240,7 +255,7 @@ bool CGSH_WebGPUJs::Render()
 				static std::vector<uint32_t> s_persist;
 				const size_t npix = static_cast<size_t>(fb_w) * fb_h;
 				if (s_persist.size() != npix) s_persist.assign(npix, 0xFF000000u);
-				const bool worldFrame = (m_lastFlip == 0) || (coverage > 0.55);
+				const bool worldFrame = (coverage > 0.55); // was (m_lastFlip==0 || ...): the force-refresh on a recreate frame (often black) flashed the canvas
 				if (worldFrame)
 				{
 					std::memcpy(s_persist.data(), m_fbStaging.data(), npix * 4);
@@ -250,7 +265,7 @@ bool CGSH_WebGPUJs::Render()
 					for (size_t i = 0; i < npix; i++) { const uint32_t px = m_fbStaging[i]; if (px & 0x00ffffffu) s_persist[i] = px; }
 				}
 				static int s_gateLog = 0;
-				if (s_gateLog++ < 12 || (flip % 50u) == 0u) printf("[STABLE] flip=%llu coverage=%.3f world=%d (present every frame)\n", static_cast<unsigned long long>(flip), coverage, worldFrame ? 1 : 0);
+				if (s_gateLog++ < 12 || (flip % 50u) == 0u) printf("[STABLE] flip=%llu cov=%.3f world=%d persistC=%08x stagingC=%08x fb=0x%x %ux%u sw=%ux%u\n", static_cast<unsigned long long>(flip), coverage, worldFrame ? 1 : 0, s_persist[static_cast<size_t>(fb_h/2)*fb_w + fb_w/2], m_fbStaging[static_cast<size_t>(fb_h/2)*fb_w + fb_w/2], fb_addr, fb_w, fb_h, surfW, surfH);
 				{
 					wgpu::TexelCopyTextureInfo dst = {};
 					dst.texture = m_fbTexture;
@@ -265,6 +280,7 @@ bool CGSH_WebGPUJs::Render()
 			}
 		}
 
+		{ static int s_bd = 0; if (s_bd++ < 12 || (flip % 50u) == 0u) printf("[BLITDBG] flip=%llu haveFrame=%d fb=0x%x %ux%u sw=%ux%u mfb=%d\n", static_cast<unsigned long long>(flip), haveFrame?1:0, fb_addr, fb_w, fb_h, surfW, surfH, m_fbTexture?1:0); }
 		if (m_fbTexture)
 		{
 			// Phase-0 spike (2026-06-03): present via a REAL WGSL render pipeline (textured
