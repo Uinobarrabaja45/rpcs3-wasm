@@ -2512,7 +2512,38 @@ void ppu_thread::exec_task()
 			// REGSETUP (2026-06-03): is the register-setup fn 0x86a40 EVER called with a DYNAMIC id (r4>=0x200,
 			// e.g. main's targets 0x251-0x253) or only static manifest ids (<=0x15f)? Catches a gated dynamic/
 			// second-manifest register path (=> find why it fails) vs none-at-all (=> dynamic reg never coded/reached).
-			if (cia == 0x86a40u) { static thread_local u32 s_rs = 0; const u32 n = ++s_rs; if (n <= 6u || static_cast<u32>(gpr[4]) >= 0x200u || (n & 0xFFFu) == 0u) printf("[REGSETUP] #%u id=0x%x cnt=0x%x tid=0x%x lr=0x%x\n", n, static_cast<u32>(gpr[4]), static_cast<u32>(gpr[5]), static_cast<unsigned>(this->id), static_cast<u32>(lr)); }
+			if (cia == 0x86a40u && this->id == 0x1000000u) { static thread_local u32 s_rs = 0; const u32 n = ++s_rs; const u32 r3v = static_cast<u32>(gpr[3]); const u32 r1v = static_cast<u32>(gpr[1]); const bool danger = (r3v >= 0x50080640u && r3v <= 0x500806d0u); if (n <= 8u || danger || (n & 0xFFFu) == 0u) printf("[REGSETUP] #%u id=0x%x r1=0x%x r3=0x%x lr=0x%x%s\n", n, static_cast<u32>(gpr[4]), r1v, r3v, static_cast<u32>(lr), danger ? " <==DANGER(hits saved-LR slot)" : ""); }
+			if (cia == 0x1d44d0u && this->id == 0x1000000u) { static thread_local u32 s_rf = 0; const u32 n = ++s_rf; if (n <= 40u) printf("[REGFN-ENTRY] #%u r1=0x%x lr=0x%x r3=0x%x\n", n, static_cast<u32>(gpr[1]), static_cast<u32>(lr), static_cast<u32>(gpr[3])); }
+			// SESSION 9 RESOLUTION (2026-06-04): the 0x86a40 jump-table dispatch @0x86b90 is CORRECT in the
+			// interpreter — rldic computes r10=0x39c and bctr branches to 0x8b5cc, verified live via E7RLDIC/
+			// E7BCTR with STUCKSKIP disabled. The 9-session "mis-dispatch to LR (0x1d4798)" was NOT an
+			// interpreter bug: it was the STUCKSKIP band-aid (below, now disabled) hijacking cia=0x86b90 -> lr
+			// after 800 same-r3 reps — which triggered on LEGITIMATE repeated registration calls and thereby
+			// CAUSED the very null-loop it was meant to skip. With STUCKSKIP gone the dispatch runs natively and
+			// deterministically (flakiness also gone). The JTFIX workaround below is retired (disabled); it only
+			// ever "worked" by running before STUCKSKIP and continuing to the correct target.
+			if (false && cia == 0x86b90u && this->id == 0x1000000u) [[unlikely]] {  // JTFIX retired — dispatch is correct natively
+				const u32 r4v = static_cast<u32>(gpr[4]);
+				const u32 r9v = reinterpret_cast<be_t<u32>*>(mem_ + (u64{static_cast<u32>(gpr[2])} - 0x6e1cu))->value();
+				const u32 idx = r4v << 2;
+				const u32 entry = reinterpret_cast<be_t<u32>*>(mem_ + (u64{r9v} + u64{idx}))->value();
+				const u32 target = r9v + static_cast<u32>(static_cast<s32>(entry));
+				if (target >= 0x10000u && target < 0xc00000u) {
+					gpr[9] = r9v; gpr[10] = idx; gpr[11] = entry; gpr[5] = static_cast<u64>(static_cast<s64>(static_cast<s32>(entry))); gpr[4] = target;
+					static thread_local u32 s_jt = 0; if (s_jt++ < 10u) printf("[JTFIX] id=0x%x r2=0x%x eboot_toc=0x%x %s -> 0x%x\n", r4v, static_cast<u32>(gpr[2]), eboot_toc, (static_cast<u32>(gpr[2]) == eboot_toc) ? "(r2==eboot_toc)" : "(r2 DIFFERS!)", target);
+					cia = target; continue;
+				}
+			}
+			{ static thread_local bool s_arm = false; static thread_local u32 s_prev = 0, s_pcia = 0, s_cnt = 0; if (this->id == 0x1000000u) { if (!s_arm && cia == 0x86a40u && static_cast<u32>(lr) == 0x1d4798u && static_cast<u32>(gpr[4]) == 0xe7u) { s_arm = true; { extern bool g_e7mon; g_e7mon = true; } s_prev = static_cast<u32>(gpr[1]); s_pcia = cia; printf("[R1MON] ARMED id=0xe7 0x86a40 entry r1=0x%x\n", s_prev); } if (s_arm) { const u32 r1n = static_cast<u32>(gpr[1]); { static thread_local u32 s_blk = 0; if (s_blk++ < 40u) printf("[BLK] @0x%x r1=0x%x\n", cia, r1n); if (cia == 0x86b90u) { const u32 r4v = static_cast<u32>(gpr[4]); const u32 r2v = static_cast<u32>(gpr[2]); const u32 r9v = reinterpret_cast<be_t<u32>*>(mem_ + (u64{r2v} - 0x6e1cu))->value(); const u32 entry = reinterpret_cast<be_t<u32>*>(mem_ + (u64{r9v} + (u64{r4v} << 2)))->value(); const u32 tgt = r9v + static_cast<u32>(static_cast<s32>(entry)); printf("[DISPATCH] r4=0x%x r9base=0x%x entry[r4*4]=0x%x correct_target=0x%x (bctr actually went to 0x1d4798)\n", r4v, r9v, entry, tgt); const u64 r4full = gpr[4]; const u64 rot = (r4full << 2) | (r4full >> 62); const u64 our_r10 = rot & 0x3FFFFFFFCull; const u32 oe = reinterpret_cast<be_t<u32>*>(mem_ + (u64{r9v} + static_cast<u32>(our_r10)))->value(); const u32 ot = r9v + static_cast<u32>(static_cast<s32>(oe)); printf("[DISP2] r4FULL=0x%llx rldic_r10=0x%llx (want 0x39c) entry=0x%x our_target=0x%x\n", static_cast<unsigned long long>(r4full), static_cast<unsigned long long>(our_r10), oe, ot); } } if (r1n != s_prev) { if (s_cnt++ < 120u) printf("[R1CHG] instr@0x%x changed r1 0x%x -> 0x%x (%+d); now @0x%x\n", s_pcia, s_prev, r1n, static_cast<int>(static_cast<s32>(r1n) - static_cast<s32>(s_prev)), cia); s_prev = r1n; } s_pcia = cia; if (cia == 0x1d4798u) { printf("[R1MON] DISARM @0x1d4798 r1=0x%x %s\n", r1n, (r1n != 0x50080600u) ? "<==LEAKED" : "ok"); { extern bool g_e7mon; g_e7mon = false; } s_arm = false; } } } }
+			if (this->id == 0x1000000u && cia == 0x86a40u && static_cast<u32>(lr) == 0x1d4798u) { static thread_local u32 s_t0 = 0; const u32 n0 = ++s_t0; if (n0 <= 80u || static_cast<u32>(gpr[1]) != 0x50080600u) printf("[R1TRACE] A #%u 0x86a40-entry r1=0x%x%s\n", n0, static_cast<u32>(gpr[1]), static_cast<u32>(gpr[1])!=0x50080600u?" <==WRONG":""); }
+			if (this->id == 0x1000000u && cia == 0x928bcu) { static thread_local u32 s_t1 = 0; if (false) printf("[R1TRACE] B 0x928bc-before-poll r1=0x%x lr=0x%x\n", static_cast<u32>(gpr[1]), static_cast<u32>(lr)); }
+			if (this->id == 0x1000000u && cia == 0x928c0u) { static thread_local u32 s_t2 = 0; if (false) printf("[R1TRACE] C 0x928c0-after-poll r1=0x%x lr=0x%x\n", static_cast<u32>(gpr[1]), static_cast<u32>(lr)); }
+			if (this->id == 0x1000000u && cia == 0x1d4798u) { static thread_local u32 s_t3 = 0; const u32 n3 = ++s_t3; if (n3 <= 80u || static_cast<u32>(gpr[1]) != 0x50080600u) printf("[R1TRACE] D #%u 0x1d4798-returned r1=0x%x%s\n", n3, static_cast<u32>(gpr[1]), static_cast<u32>(gpr[1])!=0x50080600u?" <==WRONG(leaked)":""); }
+			if (this->id == 0x1000000u && cia == 0x2761cu && static_cast<u32>(lr) == 0x928c0u) { static thread_local u32 s_pi = 0; if (s_pi++ < 24u) printf("[POLL-IN] r1=0x%x lr=0x%x (reg-path poll entry)\n", static_cast<u32>(gpr[1]), static_cast<u32>(lr)); }
+			if (this->id == 0x1000000u && cia == 0x2761cu && static_cast<u32>(lr) == 0x928c0u) { static thread_local bool s_ss = false; if (!s_ss) { s_ss = true; const u32 sp = static_cast<u32>(gpr[1]); printf("[STKSCAN] reg-path poll r1=0x%x — stack return-addrs (frame chain):\n", sp); for (u32 a = sp; a < sp + 0x360u; a += 8u) { const u32 v = reinterpret_cast<be_t<u32>*>(mem_ + u64{a})->value(); if (v >= 0x10000u && v < 0x600000u) printf("  [STK] @0x%x = 0x%x\n", a, v); } } }
+			if (this->id == 0x1000000u && cia == 0x276fcu && static_cast<u32>(lr) == 0x928c0u) { static thread_local u32 s_po = 0; if (s_po++ < 24u) printf("[POLL-OUT] r1=0x%x lr=0x%x (reg-path poll blr; should equal POLL-IN)\n", static_cast<u32>(gpr[1]), static_cast<u32>(lr)); }
+			if (this->id == 0x1000000u && (cia == 0x1d4954u || cia == 0x1d4958u || cia == 0x2f2ecu)) { static thread_local u32 s_xe = 0; if (s_xe++ < 16u) printf("[REGFN-EXIT] cia=0x%x r1=0x%x lr=0x%x  (0x1d4954=after 0x32dd0 leaf; 0x1d4958=epilogue after 0x2f2ec; 0x2f2ec=entry)\n", cia, static_cast<u32>(gpr[1]), static_cast<u32>(lr)); }
+			if (this->id == 0x1000000u && static_cast<u32>(gpr[1]) == 0x50080590u && cia >= 0x1d47a0u && cia <= 0x1d4958u) { static thread_local bool s_rl = false; if (!s_rl) { s_rl = true; printf("[R1LOW] first r1=0x50080590 in REGFN at cia=0x%x lr=0x%x (the call returning here dropped r1 by 0x70)\n", cia, static_cast<u32>(lr)); } }
 			// REGGUARD (2026-06-03): at the commit guard 0x69070, log the resource id (obj+0x1250) and the
 			// guard values (obj+0x1150, obj+0x11d0). Hypothesis: main's targets (rid>=0x200) have a1150==0
 			// (data attributes never populated by the loader) -> commit SKIPPED -> not in index -> main waits.
@@ -2688,6 +2719,12 @@ void ppu_thread::exec_task()
 						{0x1d4700u, 0x1d4c80u},  // SESSION7: DYNAMIC register-setup path (0x86a40 callers 0x1d4798/0x1d49e0/0x1d4a84/0x1d4b1c) — does it commit?
 						{0x275c0u,  0x275f8u},  // SESSION7: poll pre-check 0x275f8 (data-loaded? returns 0=loaded)
 						{0x425680u, 0x425a00u},  // SESSION7: loader completion-dispatch ~0x4257b4 (LDRFINE lr=0x42570c) — the post-load callback that should register?
+						{0x4929c0u, 0x492c40u},  // SESSION9: the {u16,u16,0,0} table-writer loop (cia 0x492aa8 ~68x) — suspected stack-overrun corruptor of main's saved-LR slot
+						{0x8b800u, 0x92900u},  // SESSION9: the sth-loop (cia 0x90xxx-0x92xxx) writing 0x18/0x1c into stack scratch @frame+0xe0 that overruns the saved-LR slot @frame+0x120 (0x500806b0)
+						{0x8b400u, 0x8b800u},  // SESSION9: id=0xe7 jump-table HANDLER @0x8b5cc — does it restore r1 (+0x70)?
+						{0x3ff780u, 0x3ffa00u},  // SESSION9 post-breakthrough: NEW null-fn call site 0x3ff8a4 (r2=0xf00 garbage TOC -> unconstructed object); what object/dispatch?
+						{0x86a00u, 0x87400u},  // SESSION9: 0x86a40 = bridge REGFN scratch -> INIT (computes the +0xe0/+0x80 struct dest)
+						{0x1d4400u, 0x1d4710u},  // SESSION9: REGFN @0x1d48xx PROLOGUE (frame size + does it save LR to +0x120?)
 					};
 					for (const auto& rg : regions)
 						for (u32 b = rg[0]; b < rg[1]; b += 32)
@@ -3002,7 +3039,7 @@ void ppu_thread::exec_task()
 				// (stuck) and skip it: return success (r3=0) to the caller so the register loop
 				// advances to the next object and completes registration toward the flip. main is
 				// at the method ENTRY here (lr=caller), so this skips the whole method cleanly.
-				if ((cia == 0x86a40u || cia == 0x86b90u || cia == 0x492aa8u || cia == 0x492b64u || cia == 0x492be8u || cia == 0x492f34u) && this->id == 0x1000000u)
+				if (false && (cia == 0x86a40u || cia == 0x86b90u || cia == 0x492aa8u || cia == 0x492b64u || cia == 0x492be8u || cia == 0x492f34u) && this->id == 0x1000000u)  // STUCKSKIP RETIRED (2026-06-04): this WAS the null-loop root cause — `cia=lr` at 0x86b90 hijacked the (correct) jump-table dispatch on legit repeated registration calls. Dispatch runs natively now.
 				{
 					static thread_local u32 s_sk_r3 = 0xffffffffu;
 					static thread_local u32 s_sk_n = 0;

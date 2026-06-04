@@ -3,6 +3,7 @@
 #include "Emu/Memory/vm.h"
 #include "Emu/RSX/gcm_enums.h"
 #include "Emu/RSX/rsx_methods.h"
+#include "Emu/RSX/rsx_utils.h"   // get_vertex_offset_from_base (CUT-1 rasterizer vertex address resolution)
 
 #include <atomic>
 #include <cstdio>
@@ -28,6 +29,18 @@ std::atomic<u32> g_webgpu_fb_pitch{0};
 // vm/types headers. Valid on the browser main thread too — wasm pthreads
 // share one address space. 0 == no frame yet.
 std::atomic<u64> g_webgpu_fb_host{0};
+// M1a (record/replay): latest RSX clear color (A8R8G8B8), published by clear_surface on the RSX
+// worker, consumed by GSH::Render on the main thread for a real render-pass clear.
+std::atomic<u32> g_webgpu_clear_color{0xFF000000u};
+// M2a (record/replay): bound texture of the frame's last textured draw, published at flip() so
+// GSH samples the GAME's real texture via the GPU pipeline (not the software P2-DRAW VRAM copy).
+std::atomic<u64> g_webgpu_tex_host{0};
+std::atomic<u32> g_webgpu_tex_w{0};
+std::atomic<u32> g_webgpu_tex_h{0};
+std::atomic<u32> g_webgpu_tex_pitch{0};
+std::atomic<u64> g_webgpu_tex_flip{0}; // flip count this texture is valid for (0 = none)
+static u64 s_frame_tex_host = 0; static u32 s_frame_tex_w = 0, s_frame_tex_h = 0, s_frame_tex_pitch = 0;
+static bool s_frame_has_tex = false; // worker-only: set in end(), published in flip()
 
 u64 WebGPUGSRender::get_cycles()
 {
@@ -69,50 +82,187 @@ void WebGPUGSRender::end()
 				static_cast<unsigned>(rsx::method_registers.surface_clip_height()));
 		}
 	}
+	// DRAWDBG (2026-06-04): INLDUMP never fired across 157K draws ⇒ command != inlined_array. The menu draws
+	// are command=array/indexed and verts=0 is the dangling-barrier artifact: get_elements_count() returns the
+	// CURRENT range (a trailing count-0 barrier), while the REAL geometry is the sum over ALL ranges. Log
+	// UNCONDITIONALLY (first 8 + periodic): command, range totals, is_immediate (push-buffer vs DMA arrays),
+	// and the per-attribute layout (type/size/offset/stride) so we can locate the real vertex data next.
+	{
+		const auto& dcd = rsx::method_registers.current_draw_clause;
+		static thread_local u64 s_id = 0;
+		const u64 m = ++s_id;
+		if (m <= 8 || (m % 50000u) == 0u)
+		{
+			printf("[DRAWDBG] #%llu cmd=%u prim=%u empty=%d immediate=%d nranges=%u TOTAL=%u curcount=%u curfirst=%u\n",
+				static_cast<unsigned long long>(m), static_cast<unsigned>(dcd.command),
+				static_cast<unsigned>(dcd.primitive), dcd.empty() ? 1 : 0,
+				dcd.is_immediate_draw ? 1 : 0,
+				static_cast<unsigned>(dcd.debug_range_count()),
+				static_cast<unsigned>(dcd.debug_total_elements()),
+				dcd.empty() ? 0u : static_cast<unsigned>(dcd.get_elements_count()),
+				dcd.empty() ? 0u : static_cast<unsigned>(dcd.get_range().first));
+			char buf[640]; int bp = 0;
+			bp += snprintf(buf + bp, sizeof(buf) - bp, "[ATTRDBG] #%llu arrays:", static_cast<unsigned long long>(m));
+			for (u8 i = 0; i < rsx::limits::vertex_count; i++)
+			{
+				const auto& vi = rsx::method_registers.vertex_arrays_info[i];
+				if (vi.size() > 0)
+					bp += snprintf(buf + bp, sizeof(buf) - bp, " a%u(t=%u s=%u off=0x%x str=%u)",
+						static_cast<unsigned>(i), static_cast<unsigned>(vi.type()),
+						static_cast<unsigned>(vi.size()), static_cast<unsigned>(vi.offset()),
+						static_cast<unsigned>(vi.stride()));
+			}
+			for (u8 i = 0; i < rsx::limits::vertex_count; i++)
+			{
+				const auto& ri = rsx::method_registers.register_vertex_info[i];
+				if (ri.size > 0)
+					bp += snprintf(buf + bp, sizeof(buf) - bp, " R%u(t=%u s=%u)",
+						static_cast<unsigned>(i), static_cast<unsigned>(ri.type), static_cast<unsigned>(ri.size));
+			}
+			printf("%s\n", buf);
+			if (m == 1)
+			{
+				for (int r = 0; r < 4; r++)
+				{
+					union { u32 u; float f; } a, b, c, d;
+					a.u = rsx::method_registers.transform_constants[r][0];
+					b.u = rsx::method_registers.transform_constants[r][1];
+					c.u = rsx::method_registers.transform_constants[r][2];
+					d.u = rsx::method_registers.transform_constants[r][3];
+					printf("[VPCONST] c%d: %.4f %.4f %.4f %.4f\n", r, a.f, b.f, c.f, d.f);
+				}
+			}
+		}
+	}
 	// P2 REAL-DRAW PATH (2026-06-03): when the game issues a real textured-quad draw (the splash IS one),
 	// decode the bound texture (fragment_textures[0]) and rasterize it into the color surface, which flip()
 	// presents. This is the GAME-DRIVEN splash renderer — paired with the synthetic dev-test in
 	// clear_surface that validated the rasterize→VRAM→flip→canvas path. The game currently emits only
 	// degenerate draws (P1 gates the real ones); this is READY for the moment P1 lands. Handles
 	// A8R8G8B8 (the logo's format); scales the texture across the surface (full-screen quad).
+	// CUT-1 RASTERIZER (2026-06-04): the menu draws are REAL textured QUADS (cmd=array, prim=quads, DMA vertex
+	// arrays): a0=pos(2 float, SCREEN-space 0..960/0..540 per the ortho VPCONST), a3=color(4 unorm8), a8=uv(2
+	// float), stride 20. Decode the real geometry and fill each quad's screen AABB into the A8R8G8B8 color
+	// surface with its REAL vertex color, then point M2a at that surface so flip() blits it 1:1 (clean
+	// 960x540 — no green-noise format mismatch). Validates address-resolution + vertex-decode + rasterize +
+	// present. CUT-2 swaps the solid fill for per-pixel texture sampling (the real art).
 	{
-		const auto& dc  = rsx::method_registers.current_draw_clause;
-		const auto& tex = rsx::method_registers.fragment_textures[0];
-		const u32 toff = tex.offset();
-		const u32 tw = tex.width(), th = tex.height();
-		if (!dc.empty() && toff && tw && th)
+		const auto& dc = rsx::method_registers.current_draw_clause;
+		if (!dc.empty() && dc.command == rsx::draw_command::array && dc.primitive == rsx::primitive_type::quads)
 		{
-			const u32 taddr  = rsx::get_address(toff, tex.location());
 			const u32 saddr  = rsx::get_address(rsx::method_registers.surface_offset(0), CELL_GCM_LOCATION_LOCAL);
 			const u32 sw     = rsx::method_registers.surface_clip_width();
 			const u32 sh     = rsx::method_registers.surface_clip_height();
 			const u32 spitch = rsx::method_registers.surface_pitch(0);
-			const u32 tpitch = tex.pitch() ? tex.pitch() : tw * 4u;
-			if (taddr && saddr && sw && sh && spitch)
+			const auto& a0 = rsx::method_registers.vertex_arrays_info[0]; // position (2x float)
+			const auto& a3 = rsx::method_registers.vertex_arrays_info[3]; // color (4x unorm8)
+			const auto& a8 = rsx::method_registers.vertex_arrays_info[8]; // texcoord (2x float)
+			const u32 stride = a0.stride();
+			if (saddr && sw && sh && spitch && stride >= 20u && a0.size() >= 2u)
 			{
-				const u8* const tbase = static_cast<const u8*>(vm::base(taddr));
 				u8* const sbase = static_cast<u8*>(vm::base(saddr));
-				for (u32 y = 0; y < sh; y++)
+				const u32 vbase = rsx::method_registers.vertex_data_base_offset();
+				const auto resolve = [&](u32 rawoff) -> const u8* {
+					const u32 a = rsx::get_address(rsx::get_vertex_offset_from_base(vbase, rawoff & 0x7fffffffu), rawoff >> 31);
+					return a ? static_cast<const u8*>(vm::base(a)) : nullptr;
+				};
+				const u8* const pbase = resolve(a0.offset());
+				const u8* const cbase = (a3.size() >= 4u) ? resolve(a3.offset()) : nullptr;
+				const u8* const ubase = (a8.size() >= 2u) ? resolve(a8.offset()) : nullptr;
+				u32 nverts = dc.debug_total_elements();
+				if (nverts > 65536u) nverts = 65536u; // runaway guard
+				const auto rdf = [](const u8* p) -> float { return reinterpret_cast<const be_t<f32>*>(p)->value(); };
+				// CUT-2: per-pixel sampling of the bound texture (fragment_textures[0]). Handle the LINEAR
+				// (CELL_GCM_TEXTURE_LN, bit 0x20) formats the menu uses: A8R8G8B8(0x85), A1R5G5B5(0x82),
+				// A4R4G4B4(0x83). Swizzled/unhandled → flat vertex color (graceful fallback). The 1x1-white
+				// solid-fill quads are swizzled 0x85 → fall back to their vertex tint (the gray/fade fills).
+				const auto& tex = rsx::method_registers.fragment_textures[0];
+				const u32 tfmt = tex.format();
+				const u32 tbf = tfmt & ~0x60u;             // strip LN(0x20)/UN(0x40)
+				const bool tlin = (tfmt & 0x20u) != 0u;    // linear (row-major) vs swizzled
+				const u32 tw = tex.width(), th = tex.height();
+				const u32 tpitch = tex.pitch() ? tex.pitch() : tw * 4u;
+				const u32 taddr = (tex.offset() && tw && th) ? rsx::get_address(tex.offset(), tex.location()) : 0u;
+				const u8* const tbase = taddr ? static_cast<const u8*>(vm::base(taddr)) : nullptr;
+				const bool texOK = tbase && tlin && tw && th && (tbf == 0x85u || tbf == 0x82u || tbf == 0x83u);
+				const auto sampleTex = [&](float u, float v) -> u32 { // returns ARGB (real alpha)
+					int tx = static_cast<int>(u * static_cast<float>(tw)); int ty = static_cast<int>(v * static_cast<float>(th));
+					tx = tx < 0 ? 0 : (tx >= static_cast<int>(tw) ? static_cast<int>(tw) - 1 : tx);
+					ty = ty < 0 ? 0 : (ty >= static_cast<int>(th) ? static_cast<int>(th) - 1 : ty);
+					const u8* rp = tbase + static_cast<u64>(ty) * tpitch;
+					if (tbf == 0x85u) { const u8* p = rp + static_cast<u64>(tx) * 4u; return (u32(p[0])<<24)|(u32(p[1])<<16)|(u32(p[2])<<8)|u32(p[3]); }
+					const u8* p = rp + static_cast<u64>(tx) * 2u; const u32 w16 = (u32(p[0])<<8) | p[1];
+					if (tbf == 0x82u) { const u32 A=(w16&0x8000u)?255u:0u,R=((w16>>10)&0x1fu)<<3,G=((w16>>5)&0x1fu)<<3,B=(w16&0x1fu)<<3; return (A<<24)|(R<<16)|(G<<8)|B; }
+					const u32 A=((w16>>12)&0xfu)*17u,R=((w16>>8)&0xfu)*17u,G=((w16>>4)&0xfu)*17u,B=(w16&0xfu)*17u; return (A<<24)|(R<<16)|(G<<8)|B; // 0x83
+				};
+				static thread_local u64 s_rq = 0;
+				if (pbase)
+				for (u32 q = 0; q + 4u <= nverts; q += 4u)
 				{
-					be_t<u32>* srow = reinterpret_cast<be_t<u32>*>(sbase + static_cast<u64>(y) * spitch);
-					const u32 ty = static_cast<u32>(static_cast<u64>(y) * th / sh);
-					const be_t<u32>* trow = reinterpret_cast<const be_t<u32>*>(tbase + static_cast<u64>(ty) * tpitch);
-					for (u32 x = 0; x < sw; x++)
-						srow[x] = trow[static_cast<u32>(static_cast<u64>(x) * tw / sw)].value(); // A8R8G8B8 passthrough
+					float px[4], py[4], pu[4], pv[4];
+					for (int k = 0; k < 4; k++)
+					{
+						const u8* pp = pbase + static_cast<u64>(q + k) * stride;
+						px[k] = rdf(pp); py[k] = rdf(pp + 4);
+						if (ubase) { const u8* up = ubase + static_cast<u64>(q + k) * stride; pu[k] = rdf(up); pv[k] = rdf(up + 4); }
+						else { pu[k] = pv[k] = 0.0f; }
+					}
+					float minx=px[0],maxx=px[0],miny=py[0],maxy=py[0],minu=pu[0],maxu=pu[0],minv=pv[0],maxv=pv[0];
+					for (int k = 1; k < 4; k++)
+					{
+						minx=px[k]<minx?px[k]:minx; maxx=px[k]>maxx?px[k]:maxx; miny=py[k]<miny?py[k]:miny; maxy=py[k]>maxy?py[k]:maxy;
+						minu=pu[k]<minu?pu[k]:minu; maxu=pu[k]>maxu?pu[k]:maxu; minv=pv[k]<minv?pv[k]:minv; maxv=pv[k]>maxv?pv[k]:maxv;
+					}
+					const int x0 = minx<0.0f?0:static_cast<int>(minx);
+					const int y0 = miny<0.0f?0:static_cast<int>(miny);
+					const int x1 = maxx>static_cast<float>(sw)?static_cast<int>(sw):static_cast<int>(maxx+0.5f);
+					const int y1 = maxy>static_cast<float>(sh)?static_cast<int>(sh):static_cast<int>(maxy+0.5f);
+					u32 vR=255,vG=255,vB=255,vA=255; // vertex color (a3, vertex 0) modulator
+					if (cbase) { const u8* cp = cbase + static_cast<u64>(q)*stride; vR=cp[0];vG=cp[1];vB=cp[2];vA=cp[3]; }
+					const float wdt=(maxx>minx)?(maxx-minx):1.0f, hgt=(maxy>miny)?(maxy-miny):1.0f;
+					for (int y = y0; y < y1; y++)
+					{
+						be_t<u32>* row = reinterpret_cast<be_t<u32>*>(sbase + static_cast<u64>(y)*spitch);
+						const float vv = minv + ((static_cast<float>(y)+0.5f - miny)/hgt)*(maxv-minv);
+						for (int x = x0; x < x1; x++)
+						{
+							u32 fR,fG,fB,fA;
+							if (texOK)
+							{
+								const float uu = minu + ((static_cast<float>(x)+0.5f - minx)/wdt)*(maxu-minu);
+								const u32 t = sampleTex(uu, vv);
+								fA=(((t>>24)&0xffu)*vA)/255u; fR=(((t>>16)&0xffu)*vR)/255u; fG=(((t>>8)&0xffu)*vG)/255u; fB=((t&0xffu)*vB)/255u;
+							}
+							else { fA=vA; fR=vR; fG=vG; fB=vB; } // flat vertex color (swizzled/unhandled tex)
+							if (fA == 0u) continue;                                                     // fully transparent → skip
+							if (fA >= 250u) { row[x] = 0xff000000u | (fR<<16)|(fG<<8)|fB; continue; }   // opaque → overwrite
+							const u32 d = row[x];                                                       // else src-over blend onto surface
+							const u32 dR=(d>>16)&0xffu, dG=(d>>8)&0xffu, dB=d&0xffu, ia=255u-fA;
+							row[x] = 0xff000000u | (((fR*fA+dR*ia)/255u)<<16) | (((fG*fA+dG*ia)/255u)<<8) | ((fB*fA+dB*ia)/255u);
+						}
+					}
+					// Diagnostics: first 6 draws (full-screen composites) + first 12 SMALL quads (real sprites/atlas).
+					static thread_local u64 s_rq2 = 0;
+					const bool small = (maxx - minx) < static_cast<float>(sw) * 0.8f;
+					const u32 centerTexel = texOK ? sampleTex((minu + maxu) * 0.5f, (minv + maxv) * 0.5f) : 0u;
+					if (s_rq < 6u)
+					{
+						s_rq++;
+						printf("[RAST] q#%llu pos(%.0f,%.0f)-(%.0f,%.0f) uv(%.2f,%.2f)-(%.2f,%.2f) vcol=%02x%02x%02x%02x tfmt=0x%x texOK=%d %ux%u ctex=%08x\n",
+							static_cast<unsigned long long>(s_rq), minx, miny, maxx, maxy, minu, minv, maxu, maxv,
+							vR, vG, vB, vA, tfmt, texOK?1:0, tw, th, centerTexel);
+					}
+					if (small && s_rq2 < 12u)
+					{
+						s_rq2++;
+						printf("[RASTSP] s#%llu pos(%.0f,%.0f)-(%.0f,%.0f) uv(%.2f,%.2f)-(%.2f,%.2f) vcol=%02x%02x%02x%02x tfmt=0x%x texOK=%d %ux%u ctex=%08x\n",
+							static_cast<unsigned long long>(s_rq2), minx, miny, maxx, maxy, minu, minv, maxu, maxv,
+							vR, vG, vB, vA, tfmt, texOK?1:0, tw, th, centerTexel);
+					}
 				}
-				// Log each NEW texture offset (reveals the asset SEQUENCE: splash1, splash2, splash3,
-				// then any menu/title textures) + periodic. Tells us whether the game keeps feeding new
-				// art after the splashes (menu draws) or stalls on the last splash.
-				static thread_local u32 s_pd = 0;
-				static thread_local u32 s_lastoff = 0xFFFFFFFFu;
-				s_pd++;
-				if (toff != s_lastoff || (s_pd % 5000u) == 0u)
-				{
-					s_lastoff = toff;
-					printf("[P2-DRAW] draw#%u TEX off=0x%x %ux%u fmt=0x%x pitch=%u -> surf %ux%u\n",
-						static_cast<unsigned>(s_pd), static_cast<unsigned>(toff), tw, th,
-						static_cast<unsigned>(tex.format()), static_cast<unsigned>(tpitch), sw, sh);
-				}
+				// Present the rasterized surface via M2a: clean A8R8G8B8 sw×sh → flip blits it 1:1.
+				s_frame_tex_host = reinterpret_cast<uintptr_t>(sbase);
+				s_frame_tex_w = sw; s_frame_tex_h = sh; s_frame_tex_pitch = spitch; s_frame_has_tex = true;
 			}
 		}
 	}
@@ -138,6 +288,7 @@ void WebGPUGSRender::clear_surface(u32 arg)
 	const u32 b = rsx::method_registers.clear_color_b();
 	const u32 a = rsx::method_registers.clear_color_a();
 	const u32 argb = (a << 24) | (r << 16) | (g << 8) | b; // A8R8G8B8, stored big-endian below
+	g_webgpu_clear_color.store(argb, std::memory_order_release); // M1a: publish to main-thread renderer
 
 	const u32 off   = rsx::method_registers.surface_offset(0);
 	const u32 pitch = rsx::method_registers.surface_pitch(0);
@@ -226,6 +377,20 @@ void WebGPUGSRender::flip(const rsx::display_flip_info_t& info)
 		g_webgpu_fb_addr.store(addr, std::memory_order_release);
 	}
 
+	// M2a: pair this frame's captured texture with the new flip count (or clear it on a clear-only frame).
+	{
+		const u64 next = g_webgpu_flip_count.load(std::memory_order_relaxed) + 1;
+		if (s_frame_has_tex)
+		{
+			g_webgpu_tex_host.store(s_frame_tex_host, std::memory_order_relaxed);
+			g_webgpu_tex_w.store(s_frame_tex_w, std::memory_order_relaxed);
+			g_webgpu_tex_h.store(s_frame_tex_h, std::memory_order_relaxed);
+			g_webgpu_tex_pitch.store(s_frame_tex_pitch, std::memory_order_relaxed);
+			g_webgpu_tex_flip.store(next, std::memory_order_release);
+		}
+		else { g_webgpu_tex_flip.store(0, std::memory_order_release); }
+		s_frame_has_tex = false;
+	}
 	const u64 n = g_webgpu_flip_count.fetch_add(1, std::memory_order_release) + 1;
 
 	// PHASE-7 PROBE: does the display buffer in guest memory actually hold

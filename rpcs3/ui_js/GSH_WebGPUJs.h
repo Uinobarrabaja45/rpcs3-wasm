@@ -68,6 +68,27 @@ private:
 	uint64_t m_lastFlip = 0;          // last g_webgpu_flip_count we uploaded
 	uint64_t m_lastDrawnFlip = ~0ull; // last flip count we actually presented (idle throttle)
 	std::vector<uint32_t> m_fbStaging; // CPU scratch for the ARGB→BGRA swizzle
+	// Phase-0 spike (2026-06-03): present the front buffer via a REAL WGSL render
+	// pipeline (textured fullscreen triangle sampling m_fbTexture) instead of a raw
+	// CopyTextureToTexture. This validates the full WebGPU graphics path —
+	// ShaderModule(WGSL) → RenderPipeline → BindGroup(sampler+texture) → RenderPass —
+	// in our emscripten/Dawn build, which is the foundation for porting RPCS3's real
+	// Vulkan RSX renderer (VKGSRender) to WebGPU. Created lazily, then reused.
+	wgpu::RenderPipeline  m_blitPipeline;
+	wgpu::Sampler         m_blitSampler;
+	wgpu::BindGroupLayout m_blitBGL;
+	// Option-B step 1 (2026-06-04): positioned textured-quad pipeline — vertex buffer (pos.xy, uv.xy)
+	// + alpha blending. This is the real-geometry foundation: real RSX draws will feed per-vertex
+	// positions/UVs here. Validated now with a synthetic positioned+blended quad (no real scene
+	// geometry exists until the game-logic gate lands — see PLAN §M2c reality check).
+	wgpu::RenderPipeline  m_geomPipeline;
+	wgpu::Buffer          m_geomVbuf;
+	// M3 PoC: compile-validate the WGSL shader-interpreter pattern (the port's one real risk).
+	wgpu::RenderPipeline  m_interpPipeline;
+	wgpu::BindGroupLayout m_interpBGL;
+	wgpu::Buffer          m_interpInstr;
+	wgpu::Buffer          m_interpUni;
+	bool                  m_interpTried = false;
 #endif
 	std::string m_backend;
 	int m_windowWidth = 1280;

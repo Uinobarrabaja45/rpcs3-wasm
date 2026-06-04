@@ -100,6 +100,16 @@ namespace rsx
 
 		void append(u32 first, u32 count)
 		{
+#ifdef __EMSCRIPTEN__
+			// APPEND probe (2026-06-04): ground-truth of the vertex counts the game submits per
+			// draw, captured at the FIFO source (draw_arrays / draw_index_array / push-buffer) with
+			// zero dependence on iteration state. Confirms whether the menu's prim=8 (QUAD) draws
+			// carry real geometry or are genuinely count-0. Logs first 30 + periodic.
+			{ static thread_local u64 s_ap = 0; const u64 m = ++s_ap;
+			  if (m <= 30 || (m % 8000) == 0) printf("[APPEND] #%llu first=%u count=%u prim=%u cmd=%u\n",
+				static_cast<unsigned long long>(m), first, count,
+				static_cast<unsigned>(primitive), static_cast<unsigned>(command)); }
+#endif
 			const bool barrier_enable_flag = primitive_barrier_enable;
 			primitive_barrier_enable = false;
 
@@ -201,6 +211,16 @@ namespace rsx
 		{
 			return (command == rsx::draw_command::inlined_array) ? inline_vertex_array.empty() : draw_command_ranges.empty();
 		}
+
+		// Read-only access to the raw interleaved inline-array vertex words (NV4097 inline draws).
+		// Used by the WebGPU POC to decode the menu's self-contained sprite-batch geometry.
+		const rsx::simple_array<u32>& get_inline_vertex_array() const { return inline_vertex_array; }
+
+		// Debug-only (WebGPU POC): non-mutating totals across ALL draw ranges, so the renderer sees the REAL
+		// geometry even when current_range_index sits on a trailing count-0 dangling-barrier range (which is
+		// what get_elements_count() returns and the source of the misleading verts=0).
+		u32 debug_total_elements() const { u32 t = 0; for (const auto& r : draw_command_ranges) t += r.count; return t; }
+		u32 debug_range_count() const { return static_cast<u32>(draw_command_ranges.size()); }
 
 		u32 pass_count() const
 		{

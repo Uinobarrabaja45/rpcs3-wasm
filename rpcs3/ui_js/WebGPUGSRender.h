@@ -53,3 +53,13 @@ extern std::atomic<u32> g_webgpu_fb_width;
 extern std::atomic<u32> g_webgpu_fb_height;
 extern std::atomic<u32> g_webgpu_fb_pitch;
 extern std::atomic<u64> g_webgpu_fb_host; // host ptr of front buffer (wasm shared mem)
+
+// M1a: latest RSX clear color (A8R8G8B8); GSH::Render uses it as the render-pass clearValue.
+extern std::atomic<u32> g_webgpu_clear_color;
+
+// M2a: bound texture of the frame's last textured draw + the flip it pairs with (0 = none).
+extern std::atomic<u64> g_webgpu_tex_host;
+extern std::atomic<u32> g_webgpu_tex_w;
+extern std::atomic<u32> g_webgpu_tex_h;
+extern std::atomic<u32> g_webgpu_tex_pitch;
+extern std::atomic<u64> g_webgpu_tex_flip;

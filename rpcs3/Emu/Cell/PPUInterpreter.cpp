@@ -51,6 +51,31 @@ void ppubreak(ppu_thread& ppu)
 #define PPU_WRITE_64(addr, value) vm::write64(addr, value);
 #endif
 
+#ifdef __EMSCRIPTEN__
+// SESSION 9 (2026-06-04) stray-store hunt: the menu null-loop is caused by the poison value
+// 0x18001c00000000 (the code address 0x18001c shifted into the HIGH 32 bits, low 32 = 0) landing in
+// main's stack frame at the saved-LR slot (~0x500806b0). On epilogue `ld rN,disp(r1); mtlr rN; blr`
+// it returns to cia=0 -> ~1.7M-iteration null-loop. Catch WHOEVER writes it: (1) any doubleword store
+// of a code-address-shifted-into-the-high-half value (the poison class, address-independent), or (2) the
+// poison's high-word 0x18001c stw'd into main's stack page (the stw-pair case). Logs tid/cia/width/EA/val.
+static inline void ppu_straywatch(ppu_thread& ppu, u64 ea, u64 value, u32 bytes)
+{
+	const u32 a = static_cast<u32>(ea);
+	// SESSION 9 run #N: watch the REG-PATH POLL's saved-LR slot (~0x500805a0 = 0x86a40-frame r1+0x10).
+	// The poll prologue writes its return addr (0x928c0) there; something then CORRUPTS it (poll returns
+	// astray -> 0x86a40 epilogue skipped -> 0x70 r1 leak -> REGFN null-loop). Log EVERY write to that slot.
+	if (a >= 0x50080598u && a <= 0x500805a8u) [[unlikely]]
+	{
+		static thread_local u32 s_sw = 0;
+		if (s_sw++ < 80u)
+			printf("[POLLLR] tid=0x%x cia=0x%x st%u EA=0x%08x val=0x%016llx%s\n",
+				static_cast<u32>(ppu.id), static_cast<u32>(ppu.cia), bytes, a, static_cast<unsigned long long>(value),
+				(static_cast<u32>(value) == 0x928c0u) ? " (legit poll-LR save)" : " <==CORRUPTOR?");
+	}
+}
+#endif
+
+bool g_e7mon = false;  // SESSION9: interpreter-level r1 trace for id=0xe7's call
 extern bool is_debugger_present();
 
 extern const ppu_decoder<ppu_itype> g_ppu_itype;
@@ -3206,6 +3231,9 @@ auto ADDI()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	ppu.gpr[op.rd] = op.ra ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.rd == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x addi r1->0x%x si=%d\n", static_cast<u32>(ppu.cia), static_cast<u32>(ppu.gpr[1]), static_cast<int>(op.simm16));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -3509,6 +3537,9 @@ auto BCCTR()
 	{
 		const u32 target = static_cast<u32>(ppu.ctr) & ~3;
 #ifdef __EMSCRIPTEN__
+		if (g_e7mon && ppu.id == 0x1000000u) printf("[E7BCTR] @0x%x bctr -> target=0x%x\n", static_cast<u32>(old_cia), target);
+#endif
+#ifdef __EMSCRIPTEN__
 		// NULLCTR (2026-06-03): catch main's branch-to-null vtable call AT the call site (the exec_task
 		// null-fn DIAG fires post-jump with a garbage lr, so its call-site dump is useless). Dump the bctr
 		// site + the loads around it so we can decode which base pointer read back null (→ which singleton
@@ -3525,7 +3556,7 @@ auto BCCTR()
 					static_cast<unsigned long long>(ppu.gpr[11]), static_cast<unsigned long long>(ppu.gpr[12]),
 					static_cast<unsigned long long>(ppu.gpr[28]), static_cast<unsigned long long>(ppu.gpr[29]),
 					static_cast<unsigned long long>(ppu.gpr[30]), static_cast<unsigned long long>(ppu.gpr[31]));
-				for (u32 p = site - 0x40; p <= site + 0x10; p += 0x10)
+				for (u32 p = site - 0x1b0; p <= site + 0x10; p += 0x10)
 					printf("  [NULLCS] @0x%x: %08x %08x %08x %08x\n", p,
 						vm::read32(p), vm::read32(p + 4), vm::read32(p + 8), vm::read32(p + 0xc));
 			}
@@ -3700,6 +3731,9 @@ auto RLDIC()
 
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	ppu.gpr[op.ra] = std::rotl<u64>(ppu.gpr[op.rs], op.sh64) & ppu_rotate_mask(op.mbe64, op.sh64 ^ 63);
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && ppu.id == 0x1000000u) printf("[E7RLDIC] @0x%x rs=%u sh=%u mbe=%u rotl=0x%llx -> ra=0x%llx\n", static_cast<u32>(ppu.cia), static_cast<u32>(op.rs), static_cast<u32>(op.sh64), static_cast<u32>(op.mbe64), static_cast<unsigned long long>(std::rotl<u64>(ppu.gpr[op.rs], op.sh64)), static_cast<unsigned long long>(ppu.gpr[op.ra]));
+#endif
 	if constexpr (((Flags == has_rc) || ...))
 		ppu_cr_set<s64>(ppu, 0, ppu.gpr[op.ra], 0);
 	};
@@ -4152,6 +4186,9 @@ auto LDUX()
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	ppu.gpr[op.rd] = ppu_feed_data<u64, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4177,6 +4214,9 @@ auto LWZUX()
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	ppu.gpr[op.rd] = ppu_feed_data<u32, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4354,6 +4394,9 @@ auto LBZUX()
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	ppu.gpr[op.rd] = ppu_feed_data<u8, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4489,6 +4532,7 @@ auto STDX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE_64(vm::cast(addr), ppu.gpr[op.rs]);
+	ppu_straywatch(ppu, addr, ppu.gpr[op.rs], 8);
 	};
 	RETURN_(ppu, op);
 }
@@ -4515,6 +4559,7 @@ auto STWX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u32>(ppu.gpr[op.rs]), 4);
 	};
 	RETURN_(ppu, op);
 }
@@ -4542,7 +4587,11 @@ auto STDUX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	PPU_WRITE_64(vm::cast(addr), ppu.gpr[op.rs]);
+	ppu_straywatch(ppu, addr, ppu.gpr[op.rs], 8);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4556,7 +4605,11 @@ auto STWUX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u32>(ppu.gpr[op.rs]), 4);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4571,6 +4624,7 @@ auto STVEWX()
 	const u64 addr = (op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb]) & ~3ULL;
 	const u8 eb = (addr & 0xf) >> 2;
 	PPU_WRITE_32(vm::cast(addr), ppu.vr[op.vs]._u32[3 - eb]);
+	ppu_straywatch(ppu, addr, 0ull, 16);
 	};
 	RETURN_(ppu, op);
 }
@@ -4635,6 +4689,7 @@ auto STBX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE_8(vm::cast(addr), static_cast<u8>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u8>(ppu.gpr[op.rs])), 1);
 	};
 	RETURN_(ppu, op);
 }
@@ -4648,6 +4703,7 @@ auto STVX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb]) & ~0xfull;
 	PPU_WRITE(v128, vm::cast(addr), ppu.vr[op.vs]);
+	ppu_straywatch(ppu, addr, 0ull, 16);
 	};
 	RETURN_(ppu, op);
 }
@@ -4747,7 +4803,11 @@ auto STBUX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	PPU_WRITE_8(vm::cast(addr), static_cast<u8>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u8>(ppu.gpr[op.rs])), 1);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4830,6 +4890,9 @@ auto LHZUX()
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	ppu.gpr[op.rd] = ppu_feed_data<u16, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4953,6 +5016,9 @@ auto LWAUX()
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	ppu.gpr[op.rd] = ppu_feed_data<s32, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4978,6 +5044,9 @@ auto LHAUX()
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	ppu.gpr[op.rd] = ppu_feed_data<s16, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -4991,6 +5060,7 @@ auto STHX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE_16(vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u16>(ppu.gpr[op.rs])), 2);
 	};
 	RETURN_(ppu, op);
 }
@@ -5030,7 +5100,11 @@ auto STHUX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	PPU_WRITE_16(vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u16>(ppu.gpr[op.rs])), 2);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -5113,9 +5187,22 @@ auto MTSPR()
 		if ((ppu.gpr[op.rs] >> 32) != 0 && ppu.id == 0x1000000u) [[unlikely]]
 		{
 			static thread_local u32 s_lrhi = 0;
-			if (s_lrhi++ < 4)
-				printf("[LRHI] main mtlr r%u=0x%llx @cia=0x%x (PS3 LR should be 32-bit!)\n",
-					static_cast<u32>(op.rs), static_cast<unsigned long long>(ppu.gpr[op.rs]), static_cast<u32>(ppu.cia));
+			if (s_lrhi++ < 6)
+			{
+				// SESSION 9 run #4: the poison 0x18001c00000000 is LEGIT object-table data (0x008Axxxx) — it is
+				// NEVER std/stw'd to the stack (the exact-signature watch proved that). So either r1 is corrupted
+				// (this ld reads table data as the "saved LR") or the slot was stomped by an unwatched sub-word
+				// store. Dump r1 to decide which path to chase next.
+				const u32 r1v = static_cast<u32>(ppu.gpr[1]);
+				const u32 slot = r1v + 0x120u;
+				const unsigned long long slotval = reinterpret_cast<be_t<u64>*>(vm::base(slot))->value();
+				const u32 backchain = reinterpret_cast<be_t<u32>*>(vm::base(r1v))->value();
+				const bool r1_stack = (r1v >= 0x50000000u && r1v < 0x50200000u);
+				printf("[LRHI] main mtlr r%u=0x%llx @cia=0x%x  r1=0x%x [%s]  slot=0x%x *slot=0x%016llx *(r1)=0x%x\n",
+					static_cast<u32>(op.rs), static_cast<unsigned long long>(ppu.gpr[op.rs]), static_cast<u32>(ppu.cia),
+					r1v, r1_stack ? "STACK: slot stomped by unwatched store" : "NOT STACK: r1 CORRUPTED",
+					slot, slotval, backchain);
+			}
 		}
 #endif
 		ppu.lr = ppu.gpr[op.rs]; break;
@@ -5381,6 +5468,9 @@ auto LFSUX()
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	ppu.fpr[op.frd] = ppu_feed_data<f32, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -5420,6 +5510,9 @@ auto LFDUX()
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	ppu.fpr[op.frd] = ppu_feed_data<f64, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -5451,6 +5544,7 @@ auto STDBRX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE(le_t<u64>, vm::cast(addr), ppu.gpr[op.rs]);
+	ppu_straywatch(ppu, addr, ppu.gpr[op.rs], 8);
 	};
 	RETURN_(ppu, op);
 }
@@ -5490,6 +5584,7 @@ auto STWBRX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE(le_t<u32>, vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u32>(ppu.gpr[op.rs])), 4);
 	};
 	RETURN_(ppu, op);
 }
@@ -5503,6 +5598,7 @@ auto STFSX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(std::bit_cast<u32>(static_cast<float>(ppu.fpr[op.frs]))), 4);
 	};
 	RETURN_(ppu, op);
 }
@@ -5535,6 +5631,9 @@ auto STFSUX()
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -5584,6 +5683,7 @@ auto STFDX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	ppu_straywatch(ppu, addr, std::bit_cast<u64>(ppu.fpr[op.frs]), 8);
 	};
 	RETURN_(ppu, op);
 }
@@ -5597,7 +5697,11 @@ auto STFDUX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + ppu.gpr[op.rb];
 	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	ppu_straywatch(ppu, addr, std::bit_cast<u64>(ppu.fpr[op.frs]), 8);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -5752,6 +5856,7 @@ auto STHBRX()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra ? ppu.gpr[op.ra] + ppu.gpr[op.rb] : ppu.gpr[op.rb];
 	PPU_WRITE(le_t<u16>, vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u16>(ppu.gpr[op.rs])), 2);
 	};
 	RETURN_(ppu, op);
 }
@@ -5873,6 +5978,9 @@ auto LWZU()
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	ppu.gpr[op.rd] = ppu_feed_data<u32, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -5900,6 +6008,9 @@ auto LBZU()
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	ppu.gpr[op.rd] = ppu_feed_data<u8, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -5914,6 +6025,7 @@ auto STW()
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
 	const u32 value = static_cast<u32>(ppu.gpr[op.rs]);
 	PPU_WRITE_32(vm::cast(addr), value);
+	ppu_straywatch(ppu, addr, static_cast<u32>(ppu.gpr[op.rs]), 4);
 
 #ifdef __EMSCRIPTEN__
 	// IDXWRITE (2026-06-03): watch writes to the resource-registration COUNT @0x880694 (r10g=0x5f7630 +
@@ -5957,7 +6069,11 @@ auto STWU()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	PPU_WRITE_32(vm::cast(addr), static_cast<u32>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u32>(ppu.gpr[op.rs]), 4);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -5971,6 +6087,7 @@ auto STB()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
 	PPU_WRITE_8(vm::cast(addr), static_cast<u8>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u8>(ppu.gpr[op.rs])), 1);
 	};
 	RETURN_(ppu, op);
 }
@@ -5984,7 +6101,11 @@ auto STBU()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	PPU_WRITE_8(vm::cast(addr), static_cast<u8>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u8>(ppu.gpr[op.rs])), 1);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6012,6 +6133,9 @@ auto LHZU()
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	ppu.gpr[op.rd] = ppu_feed_data<u16, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6039,6 +6163,9 @@ auto LHAU()
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	ppu.gpr[op.rd] = ppu_feed_data<s16, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6052,6 +6179,7 @@ auto STH()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
 	PPU_WRITE_16(vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u16>(ppu.gpr[op.rs])), 2);
 	};
 	RETURN_(ppu, op);
 }
@@ -6065,7 +6193,11 @@ auto STHU()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	PPU_WRITE_16(vm::cast(addr), static_cast<u16>(ppu.gpr[op.rs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(static_cast<u16>(ppu.gpr[op.rs])), 2);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6125,6 +6257,9 @@ auto LFSU()
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	ppu.fpr[op.frd] = ppu_feed_data<f32, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6152,6 +6287,9 @@ auto LFDU()
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	ppu.fpr[op.frd] = ppu_feed_data<f64, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6165,6 +6303,7 @@ auto STFS()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
 	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
+	ppu_straywatch(ppu, addr, static_cast<u64>(std::bit_cast<u32>(static_cast<float>(ppu.fpr[op.frs]))), 4);
 	};
 	RETURN_(ppu, op);
 }
@@ -6179,6 +6318,9 @@ auto STFSU()
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	PPU_WRITE(f32, vm::cast(addr), static_cast<float>(ppu.fpr[op.frs]));
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6192,6 +6334,7 @@ auto STFD()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = op.ra || 1 ? ppu.gpr[op.ra] + op.simm16 : op.simm16;
 	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	ppu_straywatch(ppu, addr, std::bit_cast<u64>(ppu.fpr[op.frs]), 8);
 	};
 	RETURN_(ppu, op);
 }
@@ -6205,7 +6348,11 @@ auto STFDU()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + op.simm16;
 	PPU_WRITE(f64, vm::cast(addr), ppu.fpr[op.frs]);
+	ppu_straywatch(ppu, addr, std::bit_cast<u64>(ppu.fpr[op.frs]), 8);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6233,6 +6380,9 @@ auto LDU()
 	const u64 addr = ppu.gpr[op.ra] + (op.simm16 & ~3);
 	ppu.gpr[op.rd] = ppu_feed_data<u64, Flags...>(ppu, addr);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }
@@ -6259,6 +6409,7 @@ auto STD()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = (op.simm16 & ~3) + (op.ra ? ppu.gpr[op.ra] : 0);
 	PPU_WRITE_64(vm::cast(addr), ppu.gpr[op.rs]);
+	ppu_straywatch(ppu, addr, ppu.gpr[op.rs], 8);
 	};
 	RETURN_(ppu, op);
 }
@@ -6272,7 +6423,11 @@ auto STDU()
 	static const auto exec = [](ppu_thread& ppu, ppu_opcode_t op) {
 	const u64 addr = ppu.gpr[op.ra] + (op.simm16 & ~3);
 	PPU_WRITE_64(vm::cast(addr), ppu.gpr[op.rs]);
+	ppu_straywatch(ppu, addr, ppu.gpr[op.rs], 8);
 	ppu.gpr[op.ra] = addr;
+#ifdef __EMSCRIPTEN__
+	if (g_e7mon && op.ra == 1u && ppu.id == 0x1000000u) printf("[E7R1] @0x%x update r1->0x%x\n", static_cast<u32>(ppu.cia), static_cast<u32>(addr));
+#endif
 	};
 	RETURN_(ppu, op);
 }

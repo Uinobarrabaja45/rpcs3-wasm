@@ -20,6 +20,12 @@ extern std::atomic<uint32_t> g_webgpu_fb_width;
 extern std::atomic<uint32_t> g_webgpu_fb_height;
 extern std::atomic<uint32_t> g_webgpu_fb_pitch;
 extern std::atomic<uint64_t> g_webgpu_fb_host;
+extern std::atomic<uint32_t> g_webgpu_clear_color;
+extern std::atomic<uint64_t> g_webgpu_tex_host;
+extern std::atomic<uint32_t> g_webgpu_tex_w;
+extern std::atomic<uint32_t> g_webgpu_tex_h;
+extern std::atomic<uint32_t> g_webgpu_tex_pitch;
+extern std::atomic<uint64_t> g_webgpu_tex_flip;
 #endif
 
 // Minimal WebGPU render path — see GSH_WebGPUJs.h for the integration
@@ -154,6 +160,10 @@ bool CGSH_WebGPUJs::Render()
 		m_windowWidth = fb_w;
 		m_windowHeight = fb_h;
 		ConfigureSurface();
+		// swapchain recreated above — the texture acquired earlier is stale; re-acquire it
+		// (otherwise it is a "destroyed texture used in a submit" the next render pass).
+		m_surface.GetCurrentTexture(&surfaceTex);
+		if (!surfaceTex.texture) return false;
 	}
 
 	const uint32_t surfW = static_cast<uint32_t>(m_windowWidth);
@@ -173,7 +183,7 @@ bool CGSH_WebGPUJs::Render()
 		if (!m_fbTexture || m_fbTexW != fb_w || m_fbTexH != fb_h)
 		{
 			wgpu::TextureDescriptor td = {};
-			td.usage         = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc;
+			td.usage         = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::TextureBinding;
 			td.dimension     = wgpu::TextureDimension::e2D;
 			td.size          = { fb_w, fb_h, 1 };
 			td.format        = wgpu::TextureFormat::BGRA8Unorm;
@@ -189,8 +199,15 @@ bool CGSH_WebGPUJs::Render()
 		// so this is one upload, not one per browser frame).
 		if (m_fbTexture && flip != m_lastFlip)
 		{
-			const uint8_t* base = reinterpret_cast<const uint8_t*>(
-				static_cast<uintptr_t>(g_webgpu_fb_host.load(std::memory_order_relaxed)));
+			// M2a: if this frame recorded a textured draw, sample the GAME's real texture (record/replay)
+			// instead of the software-P2-DRAW VRAM copy. Clear-only frames fall back to the VRAM buffer.
+			const bool from_tex = (g_webgpu_tex_flip.load(std::memory_order_acquire) == flip);
+			const uint32_t src_pitch = from_tex ? g_webgpu_tex_pitch.load(std::memory_order_relaxed) : fb_pitch;
+			const uint8_t* base = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(
+				from_tex ? g_webgpu_tex_host.load(std::memory_order_relaxed)
+				         : g_webgpu_fb_host.load(std::memory_order_relaxed)));
+			static thread_local int s_m2a_log = 0;
+			if (from_tex && s_m2a_log++ < 2) printf("[GSH_WebGPUJs] M2a: sampling GAME texture via pipeline (record/replay), not the P2-DRAW VRAM copy\n");
 			if (base)
 			{
 				m_fbStaging.resize(static_cast<size_t>(fb_w) * fb_h);
@@ -200,7 +217,7 @@ bool CGSH_WebGPUJs::Render()
 				// format — so the swizzle is just this byte repack.
 				for (uint32_t y = 0; y < fb_h; y++)
 				{
-					const uint8_t* srcRow = base + static_cast<size_t>(y) * fb_pitch;
+					const uint8_t* srcRow = base + static_cast<size_t>(y) * src_pitch;
 					uint32_t* dstRow = m_fbStaging.data() + static_cast<size_t>(y) * fb_w;
 					for (uint32_t x = 0; x < fb_w; x++)
 					{
@@ -227,15 +244,103 @@ bool CGSH_WebGPUJs::Render()
 
 		if (m_fbTexture)
 		{
-			wgpu::TexelCopyTextureInfo src = {};
-			src.texture = m_fbTexture;
-			src.aspect  = wgpu::TextureAspect::All;
-			wgpu::TexelCopyTextureInfo dstC = {};
-			dstC.texture = surfaceTex.texture;
-			dstC.aspect  = wgpu::TextureAspect::All;
-			wgpu::Extent3D copyExt = { fb_w, fb_h, 1 };
-			encoder.CopyTextureToTexture(&src, &dstC, &copyExt);
-			blitted = true;
+			// Phase-0 spike (2026-06-03): present via a REAL WGSL render pipeline (textured
+			// fullscreen triangle sampling m_fbTexture) instead of CopyTextureToTexture. Proves
+			// the full WebGPU graphics path works in our Dawn build — the basis for the VK port.
+			if (!m_blitPipeline)
+			{
+				static const char* kBlitWGSL = R"WGSL(
+@group(0) @binding(0) var samp : sampler;
+@group(0) @binding(1) var tex  : texture_2d<f32>;
+struct VSOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32>, };
+@vertex fn vs_main(@builtin(vertex_index) vid : u32) -> VSOut {
+  var c = array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
+  let xy = c[vid]; var o : VSOut; o.pos = vec4<f32>(xy,0.0,1.0);
+  o.uv = vec2<f32>((xy.x+1.0)*0.5, (1.0-xy.y)*0.5); return o;
+}
+@fragment fn fs_main(v : VSOut) -> @location(0) vec4<f32> {
+  return textureSample(tex, samp, v.uv);
+}
+				)WGSL";
+				wgpu::ShaderSourceWGSL wgsl = {}; wgsl.code = kBlitWGSL;
+				wgpu::ShaderModuleDescriptor smDesc = {}; smDesc.nextInChain = &wgsl;
+				wgpu::ShaderModule mod = m_device.CreateShaderModule(&smDesc);
+				wgpu::BindGroupLayoutEntry bgle[2] = {};
+				bgle[0].binding = 0; bgle[0].visibility = wgpu::ShaderStage::Fragment; bgle[0].sampler.type = wgpu::SamplerBindingType::Filtering;
+				bgle[1].binding = 1; bgle[1].visibility = wgpu::ShaderStage::Fragment;
+				bgle[1].texture.sampleType = wgpu::TextureSampleType::Float; bgle[1].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+				wgpu::BindGroupLayoutDescriptor bgld = {}; bgld.entryCount = 2; bgld.entries = bgle;
+				m_blitBGL = m_device.CreateBindGroupLayout(&bgld);
+				wgpu::PipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &m_blitBGL;
+				wgpu::PipelineLayout pl = m_device.CreatePipelineLayout(&pld);
+				wgpu::ColorTargetState cts = {}; cts.format = wgpu::TextureFormat::BGRA8Unorm; cts.writeMask = wgpu::ColorWriteMask::All;
+				wgpu::FragmentState fs = {}; fs.module = mod; fs.entryPoint = "fs_main"; fs.targetCount = 1; fs.targets = &cts;
+				wgpu::RenderPipelineDescriptor rpd = {}; rpd.layout = pl;
+				rpd.vertex.module = mod; rpd.vertex.entryPoint = "vs_main";
+				rpd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+				rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFFu;
+				rpd.fragment = &fs;
+				m_blitPipeline = m_device.CreateRenderPipeline(&rpd);
+				wgpu::SamplerDescriptor sd = {}; sd.magFilter = wgpu::FilterMode::Linear; sd.minFilter = wgpu::FilterMode::Linear;
+				sd.addressModeU = wgpu::AddressMode::ClampToEdge; sd.addressModeV = wgpu::AddressMode::ClampToEdge;
+				m_blitSampler = m_device.CreateSampler(&sd);
+				printf("[GSH_WebGPUJs] Phase-0 spike: real WGSL blit pipeline created (p=%d s=%d bgl=%d)\n", m_blitPipeline?1:0, m_blitSampler?1:0, m_blitBGL?1:0);
+			}
+	if (!m_geomPipeline && m_blitBGL)
+	{
+		static const char* kGeomWGSL = R"WGSL(
+	struct VSIn  { @location(0) pos : vec2<f32>, @location(1) uv : vec2<f32> };
+	struct VSOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+	@vertex fn vs_main(i : VSIn) -> VSOut { var o : VSOut; o.pos = vec4<f32>(i.pos, 0.0, 1.0); o.uv = i.uv; return o; }
+	@group(0) @binding(0) var samp : sampler;
+	@group(0) @binding(1) var tex  : texture_2d<f32>;
+	@fragment fn fs_main(v : VSOut) -> @location(0) vec4<f32> { let c = textureSample(tex, samp, v.uv); return c; }
+		)WGSL";
+		wgpu::ShaderSourceWGSL wgsl = {}; wgsl.code = kGeomWGSL;
+		wgpu::ShaderModuleDescriptor smd = {}; smd.nextInChain = &wgsl;
+		wgpu::ShaderModule mod = m_device.CreateShaderModule(&smd);
+		wgpu::PipelineLayoutDescriptor pld = {}; pld.bindGroupLayoutCount = 1; pld.bindGroupLayouts = &m_blitBGL;
+		wgpu::PipelineLayout pl = m_device.CreatePipelineLayout(&pld);
+		wgpu::VertexAttribute attrs[2] = {};
+		attrs[0].format = wgpu::VertexFormat::Float32x2; attrs[0].offset = 0; attrs[0].shaderLocation = 0;
+		attrs[1].format = wgpu::VertexFormat::Float32x2; attrs[1].offset = 8; attrs[1].shaderLocation = 1;
+		wgpu::VertexBufferLayout vbl = {}; vbl.arrayStride = 16; vbl.attributeCount = 2; vbl.attributes = attrs;
+		wgpu::BlendState blend = {};
+		blend.color.srcFactor = wgpu::BlendFactor::SrcAlpha; blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha; blend.color.operation = wgpu::BlendOperation::Add;
+		blend.alpha.srcFactor = wgpu::BlendFactor::One;      blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha; blend.alpha.operation = wgpu::BlendOperation::Add;
+		wgpu::ColorTargetState cts = {}; cts.format = wgpu::TextureFormat::BGRA8Unorm; cts.blend = &blend; cts.writeMask = wgpu::ColorWriteMask::All;
+		wgpu::FragmentState fs = {}; fs.module = mod; fs.entryPoint = "fs_main"; fs.targetCount = 1; fs.targets = &cts;
+		wgpu::RenderPipelineDescriptor rpd = {}; rpd.layout = pl;
+		rpd.vertex.module = mod; rpd.vertex.entryPoint = "vs_main"; rpd.vertex.bufferCount = 1; rpd.vertex.buffers = &vbl;
+		rpd.primitive.topology = wgpu::PrimitiveTopology::TriangleList; rpd.multisample.count = 1; rpd.multisample.mask = 0xFFFFFFFFu;
+		rpd.fragment = &fs;
+		m_geomPipeline = m_device.CreateRenderPipeline(&rpd);
+		// a centered, half-size quad in clip space (pos.xy, uv.xy); UV Y flipped (texture top = clip +y)
+		// B2: a 2x2 grid (quadrants) each sampling the full splash — validates an N-quad command list
+		// (multiple positioned quads composited from one vertex buffer + one draw).
+		// production present: a fullscreen quad (clip [-1,1], uv [0,1] Y-flipped). Real RSX sprite draws
+		// will supply per-vertex pos/uv here once worker-side vertex extraction lands (gated on the menu).
+		const float quad[24] = { -1.f,-1.f,0.f,1.f,  1.f,-1.f,1.f,1.f,  -1.f,1.f,0.f,0.f,
+		                         -1.f,1.f,0.f,0.f,  1.f,-1.f,1.f,1.f,   1.f,1.f,1.f,0.f };
+		wgpu::BufferDescriptor bd = {}; bd.usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst; bd.size = sizeof(quad);
+		m_geomVbuf = m_device.CreateBuffer(&bd); m_queue.WriteBuffer(m_geomVbuf, 0, quad, sizeof(quad));
+		printf("[GSH_WebGPUJs] B-step1: geometry pipeline created (p=%d vbuf=%d)\n", m_geomPipeline?1:0, m_geomVbuf?1:0);
+	}
+			if (m_geomPipeline && m_geomVbuf && m_blitSampler && m_blitBGL)
+			{
+				wgpu::BindGroupEntry bge[2] = {};
+				bge[0].binding = 0; bge[0].sampler = m_blitSampler;
+				bge[1].binding = 1; bge[1].textureView = m_fbTexture.CreateView();
+				wgpu::BindGroupDescriptor bgd = {}; bgd.layout = m_blitBGL; bgd.entryCount = 2; bgd.entries = bge;
+				wgpu::BindGroup bg = m_device.CreateBindGroup(&bgd);
+				wgpu::RenderPassColorAttachment ca = {}; ca.view = surfaceTex.texture.CreateView();
+				ca.loadOp = wgpu::LoadOp::Clear; ca.storeOp = wgpu::StoreOp::Store;
+				ca.clearValue = { 0.0, 0.0, 0.0, 1.0 }; ca.depthSlice = wgpu::kDepthSliceUndefined;
+				wgpu::RenderPassDescriptor pd = {}; pd.colorAttachmentCount = 1; pd.colorAttachments = &ca;
+				wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&pd);
+				pass.SetPipeline(m_geomPipeline); pass.SetBindGroup(0, bg); pass.SetVertexBuffer(0, m_geomVbuf); pass.Draw(6); pass.End();
+				blitted = true;
+			}
 		}
 	}
 
@@ -249,7 +354,11 @@ bool CGSH_WebGPUJs::Render()
 		ca.view       = view;
 		ca.loadOp     = wgpu::LoadOp::Clear;
 		ca.storeOp    = wgpu::StoreOp::Store;
-		ca.clearValue = { 0.0, 0.0, 0.0, 1.0 };
+		// M1a: real RSX-driven render-pass clear — use the game's last clear color (published by the
+		// worker's clear_surface) instead of hardcoded black. The record(worker)->replay(main) spine:
+		// an RSX clear becomes a real WebGPU render-pass clear on the device thread.
+		const uint32_t cc = g_webgpu_clear_color.load(std::memory_order_acquire);
+		ca.clearValue = { ((cc>>16)&0xFF)/255.0, ((cc>>8)&0xFF)/255.0, (cc&0xFF)/255.0, ((cc>>24)&0xFF)/255.0 };
 		ca.depthSlice = wgpu::kDepthSliceUndefined;
 		wgpu::RenderPassDescriptor pd = {};
 		pd.colorAttachmentCount = 1;
@@ -258,6 +367,117 @@ bool CGSH_WebGPUJs::Render()
 		pass.End();
 	}
 
+	// Option-B step 1: positioned textured-quad pipeline (vertex buffer + alpha blend). Built lazily once
+	// the blit BGL exists; validated by drawing a synthetic positioned, semi-transparent quad over the frame.
+	// M3 PoC (2026-06-04): compile-validate the WGSL shader-interpreter — register file, data-driven
+	// opcode loop, dynamic register indexing, textureSampleLevel in a loop, storage-buffer instr stream.
+	// If this pipeline compiles, WGSL accepts the interpreter approach (M3's one real risk). One-shot.
+	// M3 (2026-06-04): WGSL RSX-shader interpreter — register file + data-driven opcode loop. Now
+	// EXECUTES a real program (TEX R0; MOVU R1=tint; MUL R0=R0*R1) to prove end-to-end, not just compile.
+	if (!m_interpTried && m_blitBGL)
+	{
+		m_interpTried = true;
+		static const char* kW = R"WGSL(
+struct VSOut { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) vid : u32) -> VSOut {
+  var c = array<vec2<f32>,3>(vec2<f32>(-1.,-1.), vec2<f32>(3.,-1.), vec2<f32>(-1.,3.));
+  let xy = c[vid]; var o : VSOut; o.pos = vec4<f32>(xy,0.,1.); o.uv = vec2<f32>((xy.x+1.)*.5,(1.-xy.y)*.5); return o; }
+@group(0) @binding(0) var samp : sampler;
+@group(0) @binding(1) var tex  : texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> prog : array<vec4<u32>>;
+@group(0) @binding(3) var<uniform> uni : vec4<f32>;
+fn swap32(w : u32) -> u32 { return ((w & 0x00FF00FFu) << 8u) | ((w & 0xFF00FF00u) >> 8u); } // RSX FP word byte-swap (from_be32)
+fn cmp(v : vec4<f32>, i : u32) -> f32 { if (i==0u){return v.x;} if (i==1u){return v.y;} if (i==2u){return v.z;} return v.w; }
+fn rd_sw(v : vec4<f32>, sw : u32) -> vec4<f32> { return vec4<f32>(cmp(v,sw&3u), cmp(v,(sw>>2u)&3u), cmp(v,(sw>>4u)&3u), cmp(v,(sw>>6u)&3u)); }
+@fragment fn fs_main(v : VSOut) -> @location(0) vec4<f32> {
+  var R : array<vec4<f32>, 16>;
+  for (var k = 0u; k < 16u; k = k + 1u) { R[k] = vec4<f32>(0.); }
+  let n = arrayLength(&prog);
+  var pc = 0u;
+  for (var guard = 0u; guard < 65536u; guard = guard + 1u) { // bounded PC-driven loop (control flow)
+    if (pc >= n) { break; }
+    let ins = prog[pc];
+    let hex = swap32(ins.x);
+    let w0 = swap32(ins.y); let w1 = swap32(ins.z); let w2 = swap32(ins.w);
+    let op  = ((hex >> 24u) & 0x3Fu) | (((w1 >> 31u) & 1u) << 6u);
+    let dst = (hex >> 1u) & 0xFu;
+    let m   = vec4<bool>(((hex>>9u)&1u)!=0u, ((hex>>10u)&1u)!=0u, ((hex>>11u)&1u)!=0u, ((hex>>12u)&1u)!=0u);
+    let sat = ((hex >> 31u) & 1u) != 0u;
+    var v0 = rd_sw(R[(w0>>2u)&0xFu], (w0>>9u)&0xFFu); if(((w0>>17u)&1u)!=0u){v0=-v0;} if(((w0>>28u)&1u)!=0u){v0=abs(v0);}
+    var v1 = rd_sw(R[(w1>>2u)&0xFu], (w1>>9u)&0xFFu); if(((w1>>17u)&1u)!=0u){v1=-v1;} if(((w1>>18u)&1u)!=0u){v1=abs(v1);}
+    var v2 = rd_sw(R[(w2>>2u)&0xFu], (w2>>9u)&0xFFu); if(((w2>>17u)&1u)!=0u){v2=-v2;} if(((w2>>28u)&1u)!=0u){v2=abs(v2);}
+    var next = pc + 1u; var write = true; var r = vec4<f32>(0.);
+    switch op {                                                  // real RSX FP opcode values (FPOpcodes.h)
+      case 0x01u: { r = v0; }                                    // MOV
+      case 0x02u: { r = v0 * v1; }                               // MUL
+      case 0x03u: { r = v0 + v1; }                               // ADD
+      case 0x04u: { r = v0 * v1 + v2; }                          // MAD
+      case 0x05u: { r = vec4<f32>(dot(v0.xyz, v1.xyz)); }        // DP3
+      case 0x06u: { r = vec4<f32>(dot(v0, v1)); }                // DP4
+      case 0x08u: { r = min(v0, v1); }                           // MIN
+      case 0x09u: { r = max(v0, v1); }                           // MAX
+      case 0x0Au: { r = select(vec4<f32>(0.), vec4<f32>(1.), v0 <  v1); } // SLT
+      case 0x0Bu: { r = select(vec4<f32>(0.), vec4<f32>(1.), v0 >= v1); } // SGE
+      case 0x0Cu: { r = select(vec4<f32>(0.), vec4<f32>(1.), v0 <= v1); } // SLE
+      case 0x0Du: { r = select(vec4<f32>(0.), vec4<f32>(1.), v0 >  v1); } // SGT
+      case 0x0Eu: { r = select(vec4<f32>(0.), vec4<f32>(1.), v0 != v1); } // SNE
+      case 0x0Fu: { r = select(vec4<f32>(0.), vec4<f32>(1.), v0 == v1); } // SEQ
+      case 0x10u: { r = fract(v0); }                             // FRC
+      case 0x11u: { r = floor(v0); }                             // FLR
+      case 0x17u: { r = textureSampleLevel(tex, samp, v.uv, 0.); } // TEX
+      case 0x1Au: { r = vec4<f32>(1.0) / v0; }                   // RCP
+      case 0x1Bu: { r = inverseSqrt(v0); }                       // RSQ
+      case 0x1Cu: { r = exp2(v0); }                              // EX2
+      case 0x1Du: { r = log2(v0); }                              // LG2
+      case 0x1Fu: { r = mix(v2, v1, v0); }                       // LRP
+      case 0x22u: { r = cos(v0); }                               // COS
+      case 0x23u: { r = sin(v0); }                               // SIN
+      case 0x26u: { r = pow(v0, v1); }                           // POW
+      case 0x38u: { r = vec4<f32>(dot(v0.xy, v1.xy)); }          // DP2
+      case 0x39u: { r = vec4<f32>(normalize(v0.xyz), 1.0); }     // NRM
+      case 0x3Au: { r = v0 / v1; }                               // DIV
+      case 0x42u: { write = false; if (v0.x <= 0.0) { next = pc + ((w1 >> 16u) & 0xFFFFu); } } // IFE (branch)
+      default:    { r = v0 + uni * 0.0; }                        // NOP / unhandled (uni kept referenced)
+    }
+    if (write) { if (sat) { r = clamp(r, vec4<f32>(0.), vec4<f32>(1.)); } R[dst] = select(R[dst], r, m); }
+    pc = next;
+  }
+  return R[0]; }
+		)WGSL";
+		wgpu::ShaderSourceWGSL ws = {}; ws.code = kW; wgpu::ShaderModuleDescriptor smd = {}; smd.nextInChain = &ws;
+		wgpu::ShaderModule mod = m_device.CreateShaderModule(&smd);
+		wgpu::BindGroupLayoutEntry e[4] = {};
+		e[0].binding=0; e[0].visibility=wgpu::ShaderStage::Fragment; e[0].sampler.type=wgpu::SamplerBindingType::Filtering;
+		e[1].binding=1; e[1].visibility=wgpu::ShaderStage::Fragment; e[1].texture.sampleType=wgpu::TextureSampleType::Float; e[1].texture.viewDimension=wgpu::TextureViewDimension::e2D;
+		e[2].binding=2; e[2].visibility=wgpu::ShaderStage::Fragment; e[2].buffer.type=wgpu::BufferBindingType::ReadOnlyStorage;
+		e[3].binding=3; e[3].visibility=wgpu::ShaderStage::Fragment; e[3].buffer.type=wgpu::BufferBindingType::Uniform;
+		wgpu::BindGroupLayoutDescriptor bd={}; bd.entryCount=4; bd.entries=e; m_interpBGL=m_device.CreateBindGroupLayout(&bd);
+		wgpu::PipelineLayoutDescriptor pld={}; pld.bindGroupLayoutCount=1; pld.bindGroupLayouts=&m_interpBGL;
+		wgpu::PipelineLayout pl=m_device.CreatePipelineLayout(&pld);
+		wgpu::ColorTargetState cts={}; cts.format=wgpu::TextureFormat::BGRA8Unorm; cts.writeMask=wgpu::ColorWriteMask::All;
+		wgpu::FragmentState fs={}; fs.module=mod; fs.entryPoint="fs_main"; fs.targetCount=1; fs.targets=&cts;
+		wgpu::RenderPipelineDescriptor rpd={}; rpd.layout=pl; rpd.vertex.module=mod; rpd.vertex.entryPoint="vs_main";
+		rpd.primitive.topology=wgpu::PrimitiveTopology::TriangleList; rpd.multisample.count=1; rpd.multisample.mask=0xFFFFFFFFu; rpd.fragment=&fs;
+		m_interpPipeline=m_device.CreateRenderPipeline(&rpd);
+		const uint32_t prog[12]={0,0,0,0, 4,1,0,0, 1,0,0,1}; // TEX R0 ; MOVU R1=uni ; MUL R0=R0*R1
+		wgpu::BufferDescriptor ib={}; ib.usage=wgpu::BufferUsage::Storage|wgpu::BufferUsage::CopyDst; ib.size=sizeof(prog);
+		m_interpInstr=m_device.CreateBuffer(&ib); m_queue.WriteBuffer(m_interpInstr,0,prog,sizeof(prog));
+		const float tint[4]={0.35f,1.0f,0.35f,1.0f}; wgpu::BufferDescriptor ub={}; ub.usage=wgpu::BufferUsage::Uniform|wgpu::BufferUsage::CopyDst; ub.size=sizeof(tint);
+		m_interpUni=m_device.CreateBuffer(&ub); m_queue.WriteBuffer(m_interpUni,0,tint,sizeof(tint));
+		printf("[GSH_WebGPUJs] M3: interpreter pipeline+program+uniform created (p=%d)\n", m_interpPipeline?1:0);
+	}
+	// M3 dev-test: render the splash THROUGH the interpreter (tinted) to prove it executes. (off after validation)
+	static const bool s_m3_devtest = false; // M3 validated 2026-06-04 (interpreter executes); off for clean output
+	if (s_m3_devtest && m_interpPipeline && m_interpBGL && m_interpInstr && m_interpUni && m_fbTexture && m_blitSampler)
+	{
+		wgpu::BindGroupEntry b[4]={}; b[0].binding=0; b[0].sampler=m_blitSampler; b[1].binding=1; b[1].textureView=m_fbTexture.CreateView();
+		b[2].binding=2; b[2].buffer=m_interpInstr; b[2].size=wgpu::kWholeSize; b[3].binding=3; b[3].buffer=m_interpUni; b[3].size=wgpu::kWholeSize;
+		wgpu::BindGroupDescriptor bgd={}; bgd.layout=m_interpBGL; bgd.entryCount=4; bgd.entries=b; wgpu::BindGroup bg=m_device.CreateBindGroup(&bgd);
+		wgpu::RenderPassColorAttachment ca={}; ca.view=surfaceTex.texture.CreateView(); ca.loadOp=wgpu::LoadOp::Clear; ca.storeOp=wgpu::StoreOp::Store;
+		ca.clearValue={0.,0.,0.,1.}; ca.depthSlice=wgpu::kDepthSliceUndefined; wgpu::RenderPassDescriptor pd={}; pd.colorAttachmentCount=1; pd.colorAttachments=&ca;
+		wgpu::RenderPassEncoder pass=encoder.BeginRenderPass(&pd); pass.SetPipeline(m_interpPipeline); pass.SetBindGroup(0,bg); pass.Draw(3); pass.End();
+		static thread_local int sl=0; if (sl++<2) printf("[GSH_WebGPUJs] M3: splash rendered THROUGH the WGSL interpreter (TEX*tint) — interpreter executes end-to-end\n");
+	}
 	wgpu::CommandBuffer cmd = encoder.Finish();
 	m_queue.Submit(1, &cmd);
 

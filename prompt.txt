@@ -13,3 +13,8 @@ I've let the other Ai work on this for a big while.
 But still I cant see the first frame (505 splash) on the WebGPU canvas.
 
 You think you can do that ?
+
+
+
+
+continue ./PLAN-first-frame.md if a decision arises, pick the best option and proceed autonomously — do not ask, just decide and keep going. (The WebGPU renderer in ./PLAN-Vulkan-port-to-WebGPU.md is already built + de-risked; the game-logic gate here is the only path to a rendered Terraria menu.)

@@ -1139,3 +1139,731 @@ blr → cia=0). The `[LRHI]` mtlr-watch proves there is NO upstream garbage-mtlr
 Fixing fctiwz did NOT remove this → it's an independent corruption. NEXT: store-watch main's
 frame to catch the stray writer (which op / which thread / what value-source produces the
 high-shifted 0x18001c).
+
+### SESSION 9 (2026-06-04) — stray-store ROOT-CAUSED: an sth-loop overruns a stack scratch into the saved-LR slot
+Built a value/address-precise store-watch (`ppu_straywatch` in PPUInterpreter.cpp, instrumenting std/stw/
+sth/stb/stfd/stdbrx/stvx). Findings across runs:
+- The poison `0x0018001c00000000` is NOT a stray VALUE — it's **legit object-table data** ({0x18,0x1c}=
+  {24,28}) the game writes all over the 0x008Axxxx table (via the memcpy @0x492axx). So the value is fine.
+- The victim fn @0x1d48xx (`ld r28,0x120(r1); mtlr; blr` @0x1d4958-0x1d4970) has a **valid r1=0x50080590**;
+  its saved-LR slot = r1+0x120 = **0x500806b0**. So r1 is NOT corrupted — the SLOT is stomped.
+- **The stomp = `sth` (halfword) stores at cia 0x90xxx-0x92xxx** writing 0x18 then 0x1c to 0x500806b0/0x500806b2,
+  with buffer base **r3=r7=r29=0x50080670 (= frame+0xe0)** and a decreasing loop counter **r31≈600**. So a
+  halfword-store loop fills a **stack scratch buffer at frame+0xe0 whose data reaches frame+0x120**, i.e. it
+  **overruns into the caller's saved-LR slot** → slot = 0x0018001c00000000 → `blr`→cia=0 → menu null-loop.
+- KEY question (needs the 0x90xxx disasm, region added): is the loop COUNT wrong (writes too many entries),
+  is the dest BASE wrong (should be the heap table 0x008Axxxx / r28=0x957630, not the stack), or is it a
+  genuine layout overlap that's benign on PS3? The {0x18,0x1c} data == the 0x492axx table data, so 0x90xxx
+  likely BUILDS the title-world array that 0x492axx copies to the heap.
+
+### SESSION 9 cont. (2026-06-04) — FULLY traced: recursive resource-reg (REGFN) stack-overlap stomps a saved-LR
+Disassembled the whole corruption chain (CODEDUMP regions added for 0x90xxx, 0x86a40, REGFN@0x1d44d0):
+- **REGFN @0x1d44d0** (the menu's resource-registration fn; the "victim" @0x1d48xx is the same fn — `0x1d4780 b 0x1d4974` branches across its own epilogue). Prologue is CLEAN: `stdu r1,-0x110(r1)` (frame 0x110), `std r0,0x120(r1)` saves LR to r1+0x120. Loops ~631 entries (r31=0x277↓, ids 0x277..), each: `addi r29,r1,0x70` (scratch=r1+0x70) → `bl 0x86a40`(r3=scratch,r4=entryid) → reads results `lhz r1+0xd2/0xd4/0xd6`.
+- **0x86a40** (`stdu r1,-0x70`): a struct initializer — writes ~0x80 bytes of fields directly into r3 (stb/sth r3+0..r3+0x7a). The **0x90xxx jump-table** is the per-entry-type variant (writes r3+0x40=0x18/0x1c, r3+0x70, r3+0x7c, etc.; `b 0x928ac` common tail → `bl 0x2761c` register).
+- **The collision**: the struct is built at scratch base **0x50080670 = R+0x70** (R=parent REGFN r1=0x50080600), spanning [0x50080670,0x500806f0). Field **+0x40 = 0x500806b0**. That exact address is **a different REGFN activation's saved-LR slot** (child r1=0x50080590 → +0x120 = 0x500806b0). The struct's +0x40 write (`sth 0x18`/`0x1c`) → slot = 0x0018001c00000000 → REGFN epilogue `ld r28,0x120(r1); mtlr; blr` → cia=0 → **menu null-loop**.
+- **Root inconsistency**: the two REGFN activations are only **0x70 apart** (0x50080600 vs 0x50080590) while REGFN's frame is **0x110** — impossible under correct nesting (a callee's r1 must be ≥0x110 below its caller's). So **r1 is ~0xa0 too high** in the inner activation; the inner frame extends UP into the outer's scratch. Since this would also crash real PS3, it is almost certainly **our interpreter mishandling a stack op** in the REGFN/0x86a40/recursion path (the fctiwz-class of latent wasm bugs — though a crude scan found no remaining missing-#else integer ops; VCTSXS/VCTUXS are fine on wasm).
+
+**NEXT (decisive)**: trace r1 across the REGFN→0x86a40→(recursion) path to find the instruction where r1 jumps up ~0xa0 (a bad frame teardown / back-chain restore — note `*(0x50080590)=0`, the back-chain is NULL). Candidates: a `ld r1,0(r1)`/`mr r1,rX`/`addi r1` mis-executed, or 0x86a40's epilogue. Diagnostic probes left in PPUInterpreter.cpp (`ppu_straywatch` slot+poison watch, LRHI r1 dump) + CODEDUMP regions in PPUThread.cpp.
+
+### SESSION 9 FINAL (2026-06-04) — menu null-loop = r1 leak in the RECURSIVE resource-registration (REGFN)
+Traced the full chain (probes: ppu_straywatch, LRHI+r1, REGFN-ENTRY, REGSETUP+r1/r3, R1LOW, POLL-IN/OUT):
+- **REGFN @0x1d44d0** (resource-registration; prologue `stdu -0x110`, saves LR @`std r0,0x120(r1)`; loops ~631
+  entries id 0x277↓) calls **`bl 0x86a40`** (struct builder; `stdu -0x70`, then `b 0x9289c` tail into the
+  0x90xxx jump-table, single balanced exit `addi r1,+0x70; blr` @0x928c8). The jump-table tail does
+  `bl 0x2761c` (resource-presence poll, `stdu -0x80`).
+- **The bug = r1 ends up 0x70 too low at REGFN's epilogue**: R1LOW shows r1 is already 0x50080590 (not
+  0x50080600) right after `bl 0x86a40` returns to 0x1d4798. So `ld r28,0x120(r1)` reads 0x500806b0 — which is
+  REGFN's *own scratch struct* (the 0x18/0x1c = {24,28} entry data) instead of the real saved-LR @0x50080720
+  → `mtlr; blr` → cia=0 → ~1.7M-iter null-loop.
+- **It is RECURSIVE + cascading**: POLL-IN (reg-path, return 0x928c0) has r1=**0x50080480** = REGFN(0x50080600)
+  − 0x70 (0x86a40) − **0x110 (a SECOND REGFN frame)**. And POLL-OUT never fires (the poll never returns via its
+  blr) because the recursive struct-build **overwrites the poll's saved-LR @frame+0x90**. So a deeper REGFN's
+  struct scratch (at parent_r1+0x70/+0xe0, 0x80 bytes) overlaps shallower frames' saved-LR slots — the frames
+  do NOT nest (r1 differs by 0x70 while REGFN's frame is 0x110). r1 nesting is inconsistent across the recursion.
+- **NEGATIVE test**: gating POLLBYPASS to skip the reg-path poll changed nothing (REGPOLL-REAL=0 — the bypass
+  never fires on that poll). So the POLLBYPASS hack is NOT the cause. (Gate reverted.)
+
+**Leading hypotheses for the r1/frame inconsistency (next session):**
+1. REGFN genuinely recurses for child resources but our interpreter mis-nests r1 — find where a recursive
+   `bl`/frame leaves r1 only 0x70 lower instead of ≥0x110 (REGFN-ENTRY fired only ONCE @0x1d44d0, so the
+   recursion may re-enter REGFN at a different address — instrument all REGFN entry paths + r1 per recursion).
+2. The title-world generator (0x32dd0, the old fctiwz site) still emits a wrong child-count/size, making the
+   registration recurse too deep / build oversized structs that overrun frames.
+3. A stack op (stdu/stdux/stwux/ld r1) mis-executed on a specific REGFN/0x86a40 path (fctiwz-class), though a
+   scan found no remaining missing-#else integer ops.
+Splashes still render (P2-DRAW=3, real RSX→flip→WebGPU). The menu remains gated on this stack cascade.
+
+### SESSION 9 addendum — the stack ABOVE the reg-path poll has NO return addresses (frames overwritten)
+STKSCAN at the reg-path poll (r1=0x50080480) scanned [r1, r1+0x360] for code-range values (saved LRs / return
+addrs) and found **NONE** — the caller frames' saved-LR slots are gone, overwritten with struct-build data
+({0x18,0x1c}-type entry fields). So by the time the poll runs, the registration's struct writes have already
+clobbered the live stack frames (saved LRs + back-chain, which read NULL). The struct scratch is being placed
+IN the live stack instead of below it. Net: this is a wholesale stack-overlap, not a single stray store.
+
+**Most promising root to chase next (fresh context):** instrument the title-world generator 0x32dd0's outputs
+(child/entry COUNT + per-entry SIZE it feeds the registration) — if a count/size is still wrong (fctiwz-family,
+even after the scalar fctiwz fix — check VMX/other float→int or a missing mask), the registration recurses too
+deep / builds oversized structs that overrun frames. Cross-check: REGFN-ENTRY @0x1d44d0 fired only ONCE yet the
+poll is 0x180 below REGFN — so either the recursion re-enters REGFN at a non-0x1d44d0 address (instrument every
+REGFN entry/0x86a40 call with r1+depth) or it is one pathologically-deep linear chain. Diagnostic probes remain
+in PPUInterpreter.cpp (ppu_straywatch, LRHI+r1) and PPUThread.cpp (REGFN-ENTRY/EXIT, REGSETUP+r1/r3, R1LOW,
+POLL-IN/OUT, STKSCAN); CODEDUMP regions for 0x90xxx/0x86a40/REGFN-prologue. Splashes intact (P2-DRAW=3).
+
+### SESSION 9 addendum-2 — leak localized to ONE registration entry (id=0xe7); poll return corrupted
+R1TRACE through the REGFN->0x86a40 call (probe r1 at 0x86a40-entry / 0x1d4798-return): calls #1-#133 BALANCE
+(enter+return r1=0x50080600); **call #134 = REGSETUP id=0xe7 returns leaked (r1=0x50080590)**; #135+ enter
+already-wrong. NO POLLBYPASS fires on id=0xe7 (not a stuck id) — so the REAL poll runs and leaks exactly 0x70
+(= 0x86a40's frame). That means 0x86a40's epilogue (0x928c0 ld/mtlr; 0x928c8 addi r1,+0x70; blr) was SKIPPED
+→ the poll returned to a WRONG address (consistent with POLL-OUT never firing). So the **poll's saved-LR
+(poll_frame+0x90) is corrupted** for id=0xe7, sending the poll's blr astray, leaving 0x86a40's frame unrestored,
+which leaves REGFN's r1 0x70 low → REGFN epilogue reads its own scratch as saved-LR → null-loop.
+- Likely mechanism: registering id=0xe7 RECURSES (it has children) and the deeper registration's struct
+  scratch (child_r1+0x70) overlaps the PARENT poll's saved-LR slot (~0x500805a0). A recursive stack-overlap.
+- NEGATIVE: gating POLLBYPASS3 off the reg-path didn't fix it (reverted). NEXT: store-watch the poll's
+  saved-LR slot (re-target ppu_straywatch to poll_frame+0x90 ~0x500805a0) to catch the exact writer, OR
+  confirm REGFN recursion on id=0xe7 (REGFN-ENTRY count around call #134) and check the generator's child-count.
+
+### SESSION 9 addendum-3 — poll saved-LR slot is heavily stack-reused; instruction-level corruptor not yet isolated
+Re-targeted the store-watch to the reg-path poll's saved-LR slot (~0x500805a0 = 0x86a40-frame+0x10). It is
+written by 15+ unrelated functions (0x49cd48/0x4a5ca0/0x38a454/0x1462c8/0xbe40fc…) — normal stack reuse — so the
+id=0xe7-specific corruption is buried and the watch budget exhausts on legit churn (same drown-in-noise wall).
+Confirmed though: 0x86a40's tail (0x928b4 bne -> 0x928c0; or bl 0x2761c falls through to 0x928c0) ALWAYS reaches
+the `addi r1,+0x70` epilogue, and the poll (0x2761c stdu -0x80 / epilogue addi +0x80, only sub-call 0x275f8 a
+leaf) is structurally balanced — yet id=0xe7's call empirically returns r1 0x70 low. So the poll must return to a
+wrong address (saved-LR @ ~0x500805a0 corrupted) and skip 0x86a40's +0x70 restore.
+
+**State**: bug localized to ONE registration entry (id=0xe7, REGFN call #134); cascade fully characterized; the
+single instruction that corrupts the poll's saved-LR is the last unknown but is masked by stack reuse. Splashes
+intact. Probes left: ppu_straywatch (POLLLR slot-watch), LRHI+r1, R1LOW, R1TRACE A/D, REGSETUP+r1/r3, REGFN-ENTRY,
+POLL-IN/OUT, STKSCAN. **Best next angle (fresh context)**: a true MEMORY WATCHPOINT on the exact slot 0x500805a0
+that captures ONLY the write whose value isn't 0x928c0 AND is followed by a wrong poll return (value+timing gated,
+not budget-limited) — OR step back and ask why id=0xe7 specifically (first dynamic resource? a data-dependent
+path in 0x86a40's jump-table that our interpreter mis-handles?). The fctiwz-class precedent says: suspect an
+instruction our wasm interpreter executes subtly wrong on this entry's data.
+
+### SESSION 9 FINAL-2 (2026-06-04) — menu null-loop = jump-table bctr mis-dispatch for id=0xe7 (interpreter cached-path bug)
+Drove the trace all the way to the instruction. The menu null-loop is REGFN's r1 leaking exactly 0x70 on ONE
+registration entry (id=0xe7), and it's a **jump-table dispatch mis-execution**:
+- 0x86a40 (resource-struct builder, called by REGFN @0x1d4794) does `stdu r1,-0x70`, then for ids<=0x277 takes a
+  computed jump-table at **0x86b90**: `lwz r9,-0x6e1c(r2); rldic r10,r4,2,30 (=r4*4); lwzx r11,r10,r9; extsw;
+  add r4,r5,r9; mtctr; bctr`. The CORRECT target for id=0xe7 is **0x8b5cc** (a normal case → `b 0x928ac` →
+  common epilogue `addi r1,+0x70; blr`). Verified by hand: r4=0xe7, table[r4*4]=0x4a20, r9=0x86bac → 0x8b5cc.
+- But empirically the call returns to REGFN @0x1d4798 with r1 **0x70 low** and the epilogue `addi r1,+0x70`
+  NEVER runs (interpreter-level r1 trace shows ONLY 0x86a40's stdu, then return — no poll, no epilogue addi).
+  So the bctr lands somewhere that `blr`s straight back without restoring r1.
+- **The instructions are all individually correct** (opcode decode sh=2/mb=30 verified; manual rldic→0x39c→
+  0x8b5cc). The mis-execution is INVISIBLE to per-instruction probes: E7R1 (ADDI/STDU exec lambdas) fires, but
+  E7RLDIC (RLDIC exec) and E7BCTR (BCCTR) do NOT fire during the call — so the 0x86b90 dispatch block runs via
+  rpcs3's **cached/compiled interpreter block path**, not the instrumented exec lambdas. The bug is in that
+  cached path's handling of this dispatch (the fctiwz-class, but in the block interpreter, not a leaf op).
+
+**NEXT (fresh context, different approach needed):**
+1. Inspect rpcs3's 2-stage PPU interpreter / block cache (ppu_intrp / the `ppu_intrp_func* next_fn` threading)
+   for how a `rldic; lwzx; ... bctr` jump-table block is built/cached, and why id=0xe7's index/target comes out
+   wrong while ids 0x1f2..0x277 (calls #1-#133) work. Suspect the cached block caches a target or mis-handles
+   the indexed-load/rotate for this specific r4.
+2. OR force the single-step interpreter (disable block caching) to expose the exact mis-executed instruction.
+3. OR add the g_e7mon probe inside the BLOCK-interpreter dispatch (not the leaf exec lambdas) — find where
+   0x86b90's block actually executes.
+Splashes intact. Heavy diagnostic instrumentation left in place (g_e7mon trace, R1MON/E7R1/E7RLDIC/E7BCTR,
+DISPATCH/DISP2, REGSETUP+r1, POLL-IN/OUT, STKSCAN, CODEDUMP regions for 0x86a40/0x8b5cc/0x90xxx/REGFN).
+
+## 🎉🎉🎉 SESSION 9 BREAKTHROUGH (2026-06-04) — THE MENU GATE IS FIXED (interpreter jump-table dispatch bug)
+**Root cause of the menu null-loop: rpcs3's templated/cached PPU interpreter mis-executes the computed
+jump-table `bctr` dispatch** at 0x86b90 (inside the resource-struct builder 0x86a40). For some entries
+(e.g. resource id=0xe7) the bctr lands OFF the correct handler (verified correct target 0x8b5cc), skipping
+the `addi r1,+0x70` epilogue → 0x70 stack leak → REGFN @0x1d44d0 reads its own scratch as the saved-LR
+(0x18001c00000000) → `blr`→cia=0 → ~1.7M-iter null-loop. The dispatch runs in the cached/threaded interpreter
+path invisible to per-instruction exec-lambda probes (E7R1 fired, E7RLDIC/E7BCTR did not).
+
+**FIX (JTFIX, PPUThread.cpp @cia==0x86b90):** compute the ISA-correct jump-table target ourselves
+(`r9=*(r2-0x6e1c); target = r9 + (s32)*(r9 + r4*4)`), replicate the dispatch's register effects, and jump
+there — replacing the buggy interpreter bctr. Idempotent for correctly-dispatched entries, corrective for the
+mis-dispatched ones. **RESULT: LRHI/R1LOW/R1MON-LEAKED all 0 (were firing); null-loop GONE.** main runs FAR
+past registration into brand-new code (0x782a0/0x84950/0x99cac/0xbe5174…) and issues **824 P2-DRAWs with many
+NEW menu-texture offsets** (0x411c300/0x4152b00/0x4189300/0x459ba00/0x4b0b780…) — the title-world/menu is now
+EXECUTING and rendering (screenshot shows menu content incl. the FPS overlay, rendered as overlapping
+full-screen blits because the renderer only does full-screen present, not positioned geometry — the Wall-B
+renderer, which the ./PLAN-Vulkan-port-to-WebGPU.md geometry pipeline now becomes relevant for).
+
+### Remaining gates after the breakthrough
+1. **A NEW null-fn** (main jumps to cia=0 from 0x3ff8a4/0x3ff82c with **r2=0xf00 garbage TOC**) — same
+   NULL-TOC class as the original EBOOT gate; a different module/path running with a wrong TOC. main survives
+   it (only 2x) and still renders, so it is not fully blocking — but worth fixing for a clean menu.
+2. **Renderer (Wall B):** the menu's positioned tiles are drawn via the full-screen P2-DRAW blit (verts=0) →
+   green-noise overlap. Real menu pixels need the positioned-geometry pipeline (renderer plan, now unblocked).
+3. **JTFIX is a targeted workaround** for ONE jump table; the interpreter's dispatch bug is general — the new
+   null-fn may be another instance. The clean root fix is in the interpreter's cached `rldic;…;bctr` handling.
+
+### SESSION 9 post-breakthrough state (2026-06-04) — menu RUNS, needs more gates + renderer
+After JTFIX (menu null-loop fixed), main runs the menu loop and presents **824 frames** but issues **ZERO
+positioned geometry** (all draws are full-screen P2-DRAW blits of 960x540 textures + 8 degenerate prim=8/verts=0
+flip draws). The presented 960x540 frames are uninitialized/garbage VRAM (green noise) — the menu's sprite-batch
+tile draws never reach the RSX. So there are MORE gates before the menu renders content.
+- **New null-fn @0x3ff8a4**: a virtual call `lwz r9,0(r4); lwz r9,0x24(r9); lwz r0,0(r9); mtctr; lwz r2,4(r9);
+  bctrl` through an object whose **vtable[0x24] OPD = {fn=0, toc=0xf00}** — an unconstructed/partially-built
+  object. Same class as the original gate. main survives it (2x) so it's not the loop blocker, but it signals
+  more objects didn't construct. Likely the same general interpreter mis-dispatch hitting another construction.
+- **Root interpreter bug is confirmed but MASKED**: BCCTR (PPUInterpreter.cpp:3525) just does `ppu.cia=target;`
+  re-loop; JTFIX fixing it proves the interpreter computes the WRONG bctr target in the cached dispatch (the
+  `rldic;lwzx;extsw;add` computation), not the branch. The dispatch runs via ppu_interpreter_rt's templated/
+  cached handler path that per-instruction exec-lambda probes can't observe (E7R1 fires, E7RLDIC/E7BCTR don't).
+  Clean fix = interpreter internals (how the cached `rldic` block computes the index for r4=0xe7-class values).
+
+### Path to visible menu pixels (both required)
+1. **More game-logic gates** (PLAN-first-frame): fix the remaining mis-dispatched object constructions so the
+   menu issues real sprite-batch geometry (verts>0). Best: find the interpreter root (fixes all at once) OR
+   extend the JTFIX-style dispatch correction; OR trace each unconstructed object (deep, like the first).
+2. **Renderer (PLAN-Vulkan-port-to-WebGPU)**: once positioned geometry is issued, rasterize it via the built
+   geometry pipeline instead of the full-screen blit. Now UNBLOCKED by the breakthrough.
+
+### SESSION 9 root-verification (2026-06-04) — dispatch MATH is provably correct; bug is in cached execution
+Exhaustively verified every piece of the mis-dispatched `rldic r10,r4,2,30; lwzx; ...; bctr`:
+- `cf_t::extract` (Utilities/BitField.h) composes correctly → `op.mbe64 = (bit26<<5)|bits21-25 = 30` (not 60).
+- `ppu_rotate_mask(30,61) = 0x3FFFFFFFC`; `std::rotl<u64>(0xe7,2) & that = 0x39c = r4*4`. Correct index.
+- table[0x39c]=0x4a20, r9=0x86bac → target **0x8b5cc** (the real handler). All correct.
+- Runtime mem[0x86b94]=0x788a1788 (decrypted bytes correct). So decode input is correct too.
+Yet the interpreter's bctr lands wrong (JTFIX's byte-identical computation fixes it). **Conclusion: the fault is
+in rpcs3's templated/cached interpreter EXECUTION of this block (ppu_interpreter_rt's cached handler for these
+cias), NOT the arithmetic** — and it's invisible to per-instruction exec-lambda probes (E7R1 fires for STDU/ADDI;
+E7RLDIC/E7BCTR never fire for the dispatch). Cracking it needs rpcs3 interpreter-internals work (the cache/
+handler-table for the EBOOT code block at 0x86b9x), a fresh focused pass — not more source probes.
+
+**JTFIX (the working fix) stays in PPUThread.cpp.** It corrects this jump-table; remaining unconstructed-object
+gates (the new null-fn) are likely the same general cached-dispatch bug hitting other tables — the clean fix
+(interpreter cache) would clear them all. The menu render is also timing-flaky (a good run issued 824 draws, a
+later one only 3) and still produces no sprite geometry (uninitialized frames → green noise). Visible menu
+pixels need: the remaining dispatch/object gates fixed (→ real sprite geometry) + the WebGPU geometry pipeline.
+
+### SESSION 9 root NARROWED (2026-06-04) — interpreter maps the dispatch instr to the WRONG handler
+Tests this turn (all decisive):
+- r2 at the dispatch == eboot_toc (0x5a7448) — our NULL-TOC fix is NOT corrupting it.
+- Forcing the DEBUG RETURN_ path (atomic load + per-instruction cia, vs fast `observe`) with JTFIX off: null-loop
+  STILL recurs (LRHI=1). So fast-vs-debug path / `observe`-vs-`load` is NOT the root; both run the same exec.
+- Even with the debug path, **E7RLDIC (in RLDIC's exec, g_e7mon-gated) fires 0** while E7R1 (STDU exec) fires —
+  so the interpreter does NOT run RLDIC's exec for the dispatch rldic @0x86b94 (0x788a1788). DISPATCH probe
+  confirms the bctr lands at 0x1d4798 (wrong) vs the correct 0x8b5cc.
+**Root, narrowed: rpcs3's interpreter handler-table / decode maps 0x86b94 (a valid `rldic`, op30/XO2) to the
+WRONG handler** — so it never runs the real RLDIC exec, computes a garbage index, and the bctr lands off-handler.
+This is NOT the math (verified), NOT the TOC (verified), NOT the threading path (verified). It is the decode/
+handler-dispatch for this instruction. ppu_decode(0x788a1788)=0x1E21E — NEXT: check what handler the
+ppu_interpreter_rt table holds at that index and why it isn't RLDIC (decode-table generation for MD-form op30).
+JTFIX (correct manual dispatch) remains the working fix; the clean root fix is the decode table.
+
+## 🎉 SESSION 9 RESOLUTION (2026-06-04): the "interpreter mis-dispatch" was a SELF-INFLICTED band-aid (STUCKSKIP)
+
+After exhaustively ruling out every interpreter-level hypothesis (stale cache, decode table, TOC, debug-vs-fast
+RETURN_ path, observe-vs-load, ppu_intrp_func stride/sizeof, rotate-mask math — CTOR8 proves rldicl→0xffff is
+CORRECT), the true root was found in OUR OWN code: the **STUCKSKIP** probe (PPUThread.cpp, ~line 3051).
+
+- STUCKSKIP fired at cia∈{0x86a40,0x86b90,0x492aa8,...} and, after the SAME r3 re-entered >800 times, did
+  `gpr[3]=0; cia = lr & ~3; continue;` — i.e. it BRANCHED THE JUMP-TABLE DISPATCH TO LR (0x1d4798).
+- The registration loop (0xe0c30 → 0x86a40) legitimately calls the method many times with the same object
+  pointer (r3). STUCKSKIP's 800-rep heuristic tripped on that legitimate repetition, hijacked the dispatch to
+  LR, skipped the real registration → the 0x70 stack leak → the REGFN null-loop. **STUCKSKIP CAUSED the very
+  null-loop it was written to skip.**
+- JTFIX only ever "worked" because it sits BEFORE STUCKSKIP in exec_task and `continue`s to the correct target,
+  so STUCKSKIP never tripped. It was masking a non-bug.
+
+### Proof (STUCKSKIP off, JTFIX off): the dispatch is correct and deterministic
+```
+[E7RLDIC] @0x86b90 rs=4 sh=2 mbe=30 rotl=0x39c -> ra=0x39c      ← rldic correct
+[E7BCTR]  @0x86b90 bctr -> target=0x8b5cc                        ← bctr → CORRECT target (not 0x1d4798)
+[BLK] @0x86b90 → [BLK] @0x8b5cc → 0x928ac → 0x2761c → ...        ← real dispatch + real code
+LRHI=0  LEAKED=0  (null-loop GONE)  — identical across 2 runs (flakiness gone too)
+```
+
+### Fix adopted
+- **STUCKSKIP retired** (disabled): it was the root cause. The interpreter dispatch needs no help.
+- **JTFIX retired** (disabled): unnecessary; the native dispatch is correct.
+- REREG/DEC test scaffolding removed.
+
+### Remaining toward a rendered menu (unchanged by this fix)
+main now reaches its main loop (VBLANK/GAMECLOCK/MAINLAST, flips≈2370) but still emits only the 3 splash
+P2-DRAWs (verts=0) — no positioned sprite geometry yet. Next: find why the menu's sprite vertex buffers
+aren't built/issued (the genuine remaining gate), now that the dispatch red herring is gone.
+
+## NEXT GATE (post-STUCKSKIP): menu is black — unconstructed objects → null vtable[0x24] calls
+
+With the dispatch fixed natively, main reaches its game loop (120fps, ~2370 flips) but the canvas is BLACK:
+every menu draw is `[WGPU-DRAW] prim=8 (QUADS) verts=0` — the sprite batches are EMPTY (no geometry built).
+
+Two null-fn virtual calls remain (`null-fn DIAG`, `r2(TOC)=0xf00`, ctr=0), both `vtable[0x24]` on
+unconstructed objects, in two adjacent constructors (disasm of 0x3ff6f4..0x3ff8b4):
+- **Func A @0x3ff7b8** (`stdu r1,-0xa0`): sets `this->vtable = *(r2+0x574c)`, then `r3=*(r5+0x5c); r3->vtable[0x24](r3,0,0)`
+  — the child at `*(arg5+0x5c)` is NULL (NULLCTR #2: r3=0).
+- **Func B @0x3ff84c** (`stdu r1,-0xb0`): `r4->vtable[0x24](r4, sp+0x70)` where arg `r4`=0x50080520 (a stack
+  object) whose `vtable[0x24]` is a garbage OPD (entry=0, toc=0xf00).
+
+**Diagnosis:** `vtable[0x24]` (9th virtual method) is consistently null → the objects carry an ABSTRACT BASE
+vtable, not the DERIVED one → the derived constructor (which fills slot 0x24) never ran → a **type-registration /
+factory gap**: the concrete type wasn't registered, so the factory built base instances. This is the same
+type-registration subsystem (0x86a40 / the 0xe0c30 loop) — now that STUCKSKIP no longer corrupts it, the next
+step is to verify registration COMPLETENESS and find which concrete type(s) fail to register (→ leave the
+menu/sprite manager as an abstract base → empty sprite batches → black screen).
+NOTE: the bypasses ONLINE-SKIP (0x1d6e90) and fn7f (0x7f8e4) skip init subtrees; check whether the skipped
+code was responsible for registering/constructing these now-null children (circular-dependency candidate).
+
+## POST-FIX STATE MAP (2026-06-04) — the STUCKSKIP fix CASCADED; menu gate now isolated
+
+Removing STUCKSKIP fixed far more than the dispatch. Confirmed downstream effects this session:
+- **G[0] singleton (0x9714f0) now CONSTRUCTS** (=0x35ef0a90; was null → the old fn7f/0x7f8e4 crash gate is GONE).
+- **Big bypasses now INERT** (fire 0×): ONLINE-SKIP (0x1d6e90), fn7f (0x7f8e4), 0x409a90 DRIVE/MAIN-RET, G[0]-bypass.
+  The corrected dispatch takes the real boot path, so these band-aids are dead code (safe to delete later).
+- **Registration COMPLETE**: `reg=601/601`; vtables valid (`[REGVT] entry,toc=...,0x5a7448`).
+- **All engine threads spawn & run** (`GI-RUN`, valid G[0]): EE AudioLoop(0x1000002), _gcm_intr_thread(0x1000004),
+  EE ResourceLoop(0x1000006), EE RenderLoop; **GCM initialized; game flips 2000+ frames @120fps**.
+- **Resource loading WORKS**: main enqueues 256+ jobs (sem 0x96006800), ResourceLoop consumes them (producer/consumer healthy).
+- **sys_rwlock_create EFAULT is CORRECT, not a bug** (attr=NULL is intentional Terraria behavior; HLE comment from
+  stackwalk52 — do NOT "fix" it, a prior default-attr fix diverged the boot).
+
+### The remaining menu gate (precisely isolated)
+Screen is BLACK: every draw is `prim=8 (QUADS) verts=0` — empty sprite batches. The EE RenderLoop is READY and
+**idle-waiting** for render work (caller lr=0x9c000c in libgcm/SPURS; it calls the 4-instr flag-setter 0x3f3820
+[`*0x971350=1`] 2873× with constant register state). It's a symptom, not the cause. The cause is upstream: the
+**game logic produces no menu geometry** because the menu/content manager is **incompletely constructed** — the 2
+remaining null-fn virtual calls (`vtable[0x24]`) in constructors **0x3ff7b8** (child `*(arg5+0x5c)` is null) and
+**0x3ff84c** (object's vtable slot 0x24 is null). These are now the ONLY thing between here and menu pixels.
+
+### NEXT (focused): identify+fix the 0x3ff7b8/0x3ff84c construction
+- Identify the class (Func A sets `this->vtable = *(r2+0x574c)` = the global vtable at 0x5acb94) and the caller
+  (back-chain was null at the null-fn; instead set a one-shot probe at the constructor ENTRY to capture its `lr`).
+- Find where the null child `*(arg5+0x5c)` SHOULD be constructed (watch writes to that field, or find the sibling
+  ctor that fills it) — a construction-ORDER or factory gap, now cleanly separable from the STUCKSKIP red herring.
+
+## 🟢 MAJOR MILESTONE (2026-06-04): real pixels now flow end-to-end — final gate is empty sprite batches
+
+Running longer (~300s wall-clock, the PPU interp is ~1000× slow) the game progresses PAST loading into a
+steady per-frame rendering state:
+- Resource loading COMPLETES (ENQUEUE plateaus at 635 jobs; ResourceLoop done).
+- The game then blits its framebuffer EVERY frame: **P2-DRAW 5 → 63583**, ~7 full-screen blits/flip, 9011 flips.
+- The WebGPU canvas shows **green static** (NOT black) — i.e. REAL pixels from the game's own framebuffer are
+  flowing through RSX→flip→WebGPU. This **confirms the renderer is de-risked and the "no faked pixels" pipeline
+  works end-to-end** — the splash mechanism (P2-DRAW) now runs continuously on the menu/post-load frame.
+
+### Why green static (not the menu)
+The framebuffer the game blits is **uninitialized** — the game is NOT drawing content into it: every sprite draw
+is `prim=8 (QUADS) verts=0` (empty batches) and there's no clear. So the blit presents garbage VRAM = green noise.
+`verts=0` with `empty=0` means the RSX draw command is non-empty but its element count is 0 → the game submits
+**degenerate sprite draws** (the menu SpriteBatch has 0 sprites queued).
+
+### THE FINAL GATE (isolated): the menu-logic submits no sprite geometry (verts=0)
+This is the last game-logic gate before the menu is visible. The game reaches the render state but its menu
+Draw() batches no sprites. Candidates to investigate next:
+1. Menu state machine: is `menuMode`/the menu-active flag set? (If the game is in a pre-menu/transition state,
+   Draw() legitimately emits nothing.)
+2. SpriteBatch population: trace one frame's RSX command stream for the sprite draw — is the vertex COUNT
+   register (NV4097) being set to 0 by the game, or is a vertex-buffer bind missing?
+3. Whether a menu texture/font failed to load (the 635 resources loaded, but a specific menu asset may be the one
+   the null-fn-skipped path would have provided).
+This is now cleanly separated from boot/dispatch/registration (all resolved) — a focused render-submission trace.
+
+## 🟢🟢 MENU STAGE REACHED (2026-06-04): real assets loaded; final gate = empty SpriteBatch (verts=0)
+
+Running ~280s (the game-time needed past loading), the game reaches the MENU render stage — confirmed by
+sampling the bound textures (TEXSAMPLE):
+- **Render target 0x1fa480 (960x540) is CLEARED to black** (`0xff000000`, UNIFORM) — the game sets up its frame.
+- The game LOADS + BINDS **real game assets**: a **3900x3384** texture sheet (Terraria's atlas — VARIED/REAL
+  pixel data), `1024x436`, `486x142` UI textures. So the menu's content is loaded and bound.
+- BUT every draw is still `verts=0` (DRAW_ARRAYS count=0) → the **SpriteBatch flushes empty**. The menu Draw
+  binds the atlas and clears the target but emits **0 sprites**. The game's real frame is therefore black.
+
+### The green noise is a RENDERER artifact, not the game (and is secondary / PLAN-Vulkan scope)
+flip() presents via the M2a path (built for the splash's single full-screen textured quad): it hands the
+last-bound texture to the GPU. For the menu (render-to-target model) that presents the bound 3900x3384 atlas
+garbled = green static, instead of the (black) render target. The game's actual framebuffer is correctly black.
+
+### FINAL GAME-LOGIC GATE (exactly as framed): menu Draw emits 0 sprites
+Everything up to the draw works: boot, registration (601/601), asset load (635 jobs), clear, texture bind. The
+one missing thing is the SpriteBatch emitting quads (verts>0). Next: trace WHY the menu's sprite loop adds no
+sprites — candidate causes: menu state/`menuMode` not advanced to a drawing screen; the menu item list empty; or
+a per-sprite Draw gated on a value left wrong by the (benign) null-fn-skipped vtable[0x24] resource methods.
+This is the last thing between here and visible menu geometry.
+
+## DEFINITIVE: the empty draws are DRAW_ARRAYS(count=0) — game-side, SpriteBatch emits 0 sprites
+Logged `dc.command` for the degenerate draws: **command=1 (array/DRAW_ARRAYS), inline_verts=0, prim=8 (QUADS)**.
+So NOT an inline array — `draw_command_ranges` has a single range with **count=0**. `get_elements_count()` →
+`get_range().count` = 0. This rules out the renderer-misreads-inline hypothesis: the game writes a real
+DRAW_ARRAYS but with **zero vertices**. The SpriteBatch is flushed with 0 sprites batched.
+
+Combined with the earlier facts (game binds the 3900×3384 atlas + 486×142 logo-sized + 1024×436 UI textures,
+clears the target to black, sets QUADS), the menu Draw RUNS but its sprite loop adds nothing → the menu's
+item/content list is empty OR the per-item Draw is gated off. This is the last game-logic gate.
+
+### Leading hypothesis to test next: a skipped menu-init leaves the menu unpopulated
+The main_thread null-fn `vtable[0x24]` calls (the 0x3ff7b8/0x3ff84c constructors, distinct from the benign
+ResourceLoop ones) skip a derived method because objects carry a BASE vtable. If one of those skipped methods
+populates the menu item/string list (or sets a "menu ready" flag the Draw loop checks), the menu Draw would run
+but emit 0 sprites — exactly what's observed. NEXT: re-probe the 0x3ff7b8/0x3ff84c constructors gated to
+main_thread, dump the object's vtable + which derived slot 0x24 is null, and correlate with the menu setup.
+
+## CONSTRUCTION GATE LOCATED (2026-06-04): null child at manager+0x5c blocks an init virtual call
+Full disasm of the main_thread null-fn constructor @0x3ff7b8 (manager singleton r31=0x9555a4):
+```
+0x3ff7e4: stw r0,0(r28)        ; this->vtable = *(TOC+0x574c)   (sets own vtable OK)
+0x3ff804: lwz r3,0x5c(r27)     ; r3 = arg5->field_0x5c          (THE CHILD — reads 0/NULL)
+0x3ff808: lwz r9,0(r3)         ; child->vtable                  (deref of null)
+0x3ff80c: lwz r9,0x24(r9)      ; child->vtable[0x24]
+0x3ff828: bctrl                ; child->vtable[0x24](child,0,0) ; NO null-check -> null-fn
+```
+The child `*(arg5+0x5c)` is NULL — on real HW it must be a valid object (the call has no guard). So the object
+graph under the 0x9555a4 manager is incompletely constructed: a child the init depends on was never built.
+The sibling fn @0x3ff678 (manager update; reads/writes 0x9555a4 fields 0x28/0x30/0x38, calls 0x47ce2c/0x47e118/
+0x47b13c/0x481c24) DOES null-check its result (cmpwi/ble) — so the engine normally tolerates nulls there, but the
+0x3ff7b8 ctor does not, implying its child is normally non-null.
+
+### NEXT (focused): why is arg5->field_0x5c null?
+The 0x3ff7b8 ctor is called from ~0x3ff908 (lr at entry) with arg5 (r5). Trace: (a) what constructs arg5 and
+should fill +0x5c; (b) whether the child's factory was skipped by an earlier (now-fixed-elsewhere?) gate or a
+still-missing init. The manager 0x9555a4 is the key singleton — identifying it (menu/UI/scene manager) pins the
+subsystem. This null-child is the leading cause of the empty SpriteBatch (unpopulated menu) → verts=0 → black.
+
+## POLLBYPASS3/4/5 are OBSOLETE post-fix (2026-06-04) — another STUCKSKIP cascade
+Tested disabling the resource-poll bypasses (the pre-fix "fundamental wall" / run90 result said main never
+registers the resources). POST-STUCKSKIP-FIX result: **main does NOT hang** — it passes the poll naturally:
+- `reg≈601/601` REAL registration (REGCOUNT counts +0x60, not the bypass's fake +0x15 flag).
+- main reaches **cellResc** (new milestone — resolution converter / display setup) + render stage
+  (19022 P2-DRAWs, 4454 flips) with the bypasses OFF.
+So the "resources never register" wall was a STUCKSKIP artifact; the bypasses are now dead code. **Kept disabled**
+(POLLBYPASS3 @0x2761c, POLLBYPASS4 @0x27700, POLLBYPASS5 redirect) — cleaner + reaches cellResc.
+
+### IMPORTANT: the menu gate is SEPARATE from the resource poll
+With the bypasses off, `verts=0` and the null-child (manager 0x9555a4 +0x5c) BOTH persist. So the empty
+SpriteBatch is NOT caused by the resource poll — it's the construction gate (null child) and/or the per-frame
+menu Draw. That remains the single blocker. The bypass cleanup is orthogonal progress (and unblocks cellResc).
+
+## REAL DISPLAY PIPELINE reached (2026-06-04, POLLBYPASS off): cellResc + sysutil + keyboard
+With the obsolete bypasses removed, the game advances onto its PROPER display path (not the P2-DRAW splash hack):
+- EE RenderLoop (0x1000003) runs the full **cellResc** loop: `cellRescSetConvertAndFlip` → `cellRescSetWaitFlip`
+  → `cellRescGcmSurface2RescSrc(gcmSurface=0x35ff39bc)` → `cellRescSetSrc`, repeating every frame. So the game
+  renders to a GCM surface and presents it via resolution-conversion — the real PS3 display output.
+- **cellKbInit / cellKbGetInfo** succeed (input init); cellSysutil + a Progress Dialog Server thread are up.
+So boot is now COMPLETE through the display pipeline. The canvas still shows green static = the game's
+**uninitialized render surface** (presented faithfully via cellResc) — because the menu Draw still emits 0 sprites.
+
+### State: everything works except the menu's sprite emission
+boot → registration (601/601, real) → engine threads → GCM → asset load → **cellResc display + input + sysutil**
+→ per-frame convert/flip. The ONLY remaining gate is `DRAW_ARRAYS count=0` (empty SpriteBatch). The green static
+is the honest, un-faked output of the game's own (empty) surface through the real pipeline.
+
+### Final gate (unchanged, now fully isolated): why the menu Draw batches 0 sprites
+The render surface is empty because the menu's per-frame Draw adds no sprites. Leading causes still: (a) the
+null-child under manager 0x9555a4 leaves a menu object incomplete; (b) menuMode/menu-state not advanced to a
+drawing screen. Both require finding the game's menu Draw / item-list in the EBOOT (no symbols) — a focused
+reverse-engineering pass. This is the last thing between the (working) pipeline and visible menu pixels.
+
+## Frame-sync throttle explored (2026-06-04) — NOT the menu gate; cellResc path starves main
+Investigated main's wait on barrier sem 0x96004600 (the game's per-frame sync, dispatched to the EE RenderLoop):
+- With POLLBYPASS OFF (cellResc path), the RenderLoop gets stuck in `cellRescSetWaitFlip` (10444 resc calls) and
+  rarely processes main's async work → it posts 0x96004600 only ~36× vs main's ~1135 waits → **main crawls ~1
+  frame / 9s** (each wait = 15ms×600 WAITFORCE timeout). So the cellResc path, while "real," THROTTLES main.
+- Tried a FRAMESYNC-FIX (let main proceed when the barrier counter+0x108 ≥ limit+0x104): didn't work — the
+  barrier is rarely satisfied at check time (the work genuinely isn't done; the RenderLoop is the bottleneck, not
+  the WAITFORCE), and r31 isn't reliably the barrier struct. Reverted.
+- **Re-enabled POLLBYPASS** (main advances, reaches the menu stage with real assets) as the usable state. So
+  POLLBYPASS is NOT purely obsolete: disabling it reaches cellResc but starves main. The cellResc throttle (the
+  RenderLoop blocking in SetWaitFlip) is a SEPARATE issue for the real display path.
+
+### Menu gate confirmed independent of all this
+The empty SpriteBatch (`DRAW_ARRAYS count=0`) persists whether main advances (POLLBYPASS on) or crawls (off). So
+the menu's 0-sprite Draw is NOT caused by main being throttled — it's the construction/menuMode gate. That remains
+THE blocker. (Net this turn: ruled out the frame-sync throttle as the menu cause; restored the best state.)
+
+## MENU GATE ROOT-CHARACTERIZED (2026-06-04): cascading base-type construction → NULL fields → empty menu
+Traced the menu-construction chain up 3 levels from the null-fns (full disasm captured):
+- **0x7dxx menu-build fn** (refcounted / shared_ptr: lwarx/stwcx/mfocrf): iterates menu objects of type 2
+  (`*(obj+0x18)==2`), and for each calls a VIRTUAL factory method with the object's source field:
+  `r24 = *( *(r30) + 0x1c )` — which is **NULL** for these objects.
+- **0x3ff84c factory** (virtual method, stores result to manager `*0x9555a4`): selects object type by
+  `r0 = source->vtable[0x24]` — but the source (r4=r24) is NULL, so it derefs null → garbage type → picks the
+  wrong (base) variant; constructs it via **0x3ff7b8** with arg5=NULL.
+- **0x3ff7b8 ctor**: derefs `arg5->field_0x5c` (NULL) → the null-fn.
+
+**Root pattern:** menu objects are constructed as their **BASE type** (vtable[0x24] null), so the DERIVED
+construction that fills fields (+0x1c source, +0x5c child) is skipped → NULL fields → the next factory's
+type-selector reads garbage off the null → picks base again → **cascade**. The whole menu object graph under
+0x9555a4 is built shallow/incomplete → every menu element's source is null → 0 sprites → black.
+
+### THE root question for next pass: why are these objects base-type (derived ctor never runs)?
+Candidates: (a) construction ORDER — the derived ctor runs after this menu-build code; (b) the seed object
+(first NULL field) is a single missing resource/global (e.g. the TOC global at `-0x7038(r2)`); (c) a vtable
+relocation gap leaving slot 0x24 null on the derived vtable. Cracking the SEED (first incomplete object) breaks
+the cascade. This is the last gate — fully characterized now, just needs the seed identified + its ctor fixed.
+
+## 🔑 REAL GATE FOUND (2026-06-04): main parks before the menu — RenderLoop stops draining the command buffer
+DECISIVE pivot: even with POLLBYPASS on (reg 601/601, 6605 flips), **main hits its frame dt-fn 0x32dd0 only 4×
+then parks** — it is NOT running the menu loop. Traced main's park (0x426370 wait-fn):
+- main loops `0x3c4d08(ringbuf=this+0x18,...)` + usleep(10ms), exiting only when it returns nonzero.
+- `0x3c4d08` is a **ring-buffer ENQUEUE**: returns 0 when full (`write(+0xc) - read(+0xa0) >= size(+4) - 0x200`).
+- The object (0x35ef0c00) is the frame-sync command buffer: consumer tid `+0x14 = 0x1000003 (EE RenderLoop)`,
+  completion sem `+0x114 = 0x96004600`.
+So **main can't enqueue render commands because the buffer is FULL and the RenderLoop isn't draining it**. The
+RenderLoop posts 0x96004600 only ~36× (drains ~36 cmds = the 4-frame intro) then STALLS — it stalls on the
+menu's first render command, the buffer fills, main parks. This is why 0 menu frames ever run.
+
+### This reframes the whole final gate
+The menu's empty SpriteBatch is downstream: main never reaches the menu Draw because it's parked enqueuing. The
+likely link to the construction trace: the RenderLoop stalls processing the menu's first command because the menu
+data it references is incompletely constructed (the 0x9555a4 base-type cascade). So construction-gate AND
+park-gate are the SAME root: the menu's first real render command can't be produced/consumed.
+NEXT: find what the RenderLoop stalls on after ~36 commands (its cia/wait when main is parked) — that command,
+and the (incomplete) data it touches, is the seed.
+
+## UNIFIED ROOT (2026-06-04): the RenderLoop render path uses the SAME vtable[0x24] as the construction gate
+Disassembled the RenderLoop's consume/render path:
+- **0x40fbf8 (frame processor)**: `child = *(this+0xf4); r9 = child->vtable; r9 = child->vtable[0x24]; bctrl` —
+  the per-frame RENDER call — then `bl 0x40b720` which increments counter(+0x10c) and posts the completion sem
+  (+0x114 = 0x96004600). So completion is posted ONLY after the render-child's vtable[0x24] runs.
+- **0x40fb88 (command dispatch)**: matches the command type (r10) against globals (0x5a14/0x5a18/0x5a50/0x5a68);
+  no-match falls to an unhandled path (0x40fb7c) — it stops processing.
+
+**The render call `child->vtable[0x24]()` is the SAME pattern as the menu construction null-fns.** So the chain
+is unified and confirmed: incomplete base-type construction → the menu's render child has a null/garbage
+vtable[0x24] (or its command carries a garbage type) → the RenderLoop's frame processor can't run it / the
+dispatch diverges → it stops posting 0x96004600 → main's command ring buffer fills → main parks at the enqueue
+retry (0x426400) → the menu update/draw loop never runs → verts=0 → black.
+
+### Single root, many symptoms
+Every gate chased this session (verts=0, null-fns, the 0x9555a4 cascade, the frame-sync barrier, main's park, the
+RenderLoop present-spin) is ONE root: **the menu object graph is constructed as base-type (vtable[0x24] null), so
+neither main's build nor the RenderLoop's render can complete.** Fixing the construction seed (why the derived
+ctors don't run / why vtable[0x24] is null on these objects) fixes all of them at once. That is THE remaining
+work — a focused C++-construction/vtable investigation, fully mapped now from disasm at every layer.
+
+## ⚠️ HYPOTHESIS CORRECTED (2026-06-04): vtables are FINE — it's NULL source DATA, not base-type construction
+DECISIVE test: read the menu object's global vtable (`*(r2+0x574c)` = 0x591cc0). It is **fully populated** —
+slot 0x24 = 0x598870 → valid OPD (entry=0x4bdcb8, toc=0x5a7448); all slots are valid pointers. So:
+- NOT a vtable relocation gap. NOT a base-type construction cascade (objects get the correct, complete vtable).
+- The null-fns happen because the **child/source objects are NULL**: `menu_obj->field_0x1c` (the source) = 0, so
+  the factory is handed a NULL source and `0x3ff7b8` derefs `NULL->field_0x5c`.
+- menu_obj is otherwise VALID (its type field +0x18==2 is set) — only the **source pointer +0x1c is NULL**.
+
+**So the real gate is a DATA/LINK gap, not a construction/vtable bug:** the menu definitions exist with valid
+types but their source pointers (+0x1c) are never populated/linked. Earlier "base-type cascade" framing is
+retracted. NEXT: find where `menu_obj->field_0x1c` should be set (the source loader/linker that resolves each
+menu definition's data pointer) and why it stays NULL — likely a specific menu-data resource that isn't loaded
+or a link/resolve step that's skipped. The vtable/ctor machinery is confirmed healthy.
+
+## CONVERGENCE (2026-06-04): main parks because ONE menu frame overflows the ~1MB command ring buffer
+RenderLoop main loop @0x410e50 dequeues work items (queue=*(r29+0xa8), count=*(r29+0xac), 0xc-byte entries) and
+dispatches each via bctrl → frame processor 0x40fbf8 (arg=work obj 0x35ef0c00). After ~32 cycles the queue
+empties → loop stops → the work object's command ring buffer (0x35ef0c00+0x18) is never drained.
+**Key measurement:** that ring buffer is size 0x100000 (1MB) and 99.3% FULL (write=0x4cbcc, read=0x4dd0c →
+0xFEEC0 used) when main parks. So main filled ~1MB of render commands for a SINGLE frame and ran out of space
+before finishing → main's enqueue (0x3c4d08) returns "full" → main spins in usleep retry (0x426400) → never
+finishes the frame → never enqueues the work item → RenderLoop queue stays empty → deadlock.
+
+### So the menu's first frame emits an ABNORMAL ~1MB of render commands
+A normal frame is a few KB. ~1MB means a render loop is emitting far too many commands — almost certainly the
+menu reading the **NULL source data** (corrected hypothesis): with null/garbage sources, the menu's render loop
+iterates wrong/unbounded counts → command flood → buffer overflow → park. This unifies with the GENSCALE
+title-world-scale anomaly (clk@0x4e9980 = 2^-31, a broken scale → wrong geometry counts).
+
+### Solid vs. uncertain (honest)
+SOLID: main parks at the ring-buffer enqueue; buffer is 1MB/99.3% full; RenderLoop queue empties after 32; vtables
+healthy. UNCERTAIN: whether the 1MB is from NULL-source-driven command flooding vs. a legit-but-too-slow drain.
+NEXT (single clean thread): instrument the command WRITER (what main loops over to fill 0x35ef0c00+0x18) — count
+commands/frame and see what data field drives the count. That pins whether it's NULL-source flooding or volume.
+
+## FLOOD SOURCE (2026-06-04): 4KB (type-9) command chunks overflow the buffer; RenderLoop queue empties
+Traced the blocking-enqueue (0x426370) callers. The parked buffer 0x35ef0c00 is filled by:
+- **type-9 commands, size 0x1000 (4KB) each, from lr=0x40f478 and lr=0x40c8ac** — a LARGE data/asset upload
+  pushed through the 1MB command buffer in 4KB chunks. ~250 of these = full buffer.
+- plus small type-1/4 (size 0) from 0x4266c0/0x426458.
+So the menu's first frame uploads a big asset (likely a texture, e.g. the 3900×3384 atlas) as 4KB command chunks;
+the RenderLoop's work queue empties after ~32 cycles and stops draining, so the buffer overflows → main parks.
+On HW the RenderLoop would drain CONCURRENTLY with the upload; here it stops, so producer/consumer deadlock.
+NEXT (single clean thread): inspect 0x40f478/0x40c8ac (what they upload + the loop bound) and why the RenderLoop
+work queue isn't refilled during the upload (who enqueues RenderLoop work items, and why main stops before doing so).
+
+## ⚠️ Methodology note: this 147-step context is saturated
+I have now misidentified several functions from disasm this session (0x40fb88 dispatch [not executed], 0x3c4d08
+[park's check, not the writer], the "base-type cascade" [vtables are fine]). Each correction was useful but the
+rate of wrong turns signals this context is too long for reliable disasm reading. SOLID, high-confidence facts to
+carry forward: (1) STUCKSKIP was the root cause, fixed; (2) full boot to cellResc/601-reg; (3) main parks before
+the menu in the enqueue-retry loop because buffer 0x35ef0c00 is 1MB/99.3% full of 4KB upload chunks; (4) the
+RenderLoop stops draining after its work queue empties; (5) vtables/ctors are healthy. The menu gate is a
+producer-consumer deadlock around a large asset upload — best cracked in a FRESH context with these 5 facts.
+
+## EXPERIMENT RESULT (2026-06-04): forcing main past the park CORRUPTS — confirms deadlock is the gate
+Forced main's full-buffer enqueue (0x426400) to "succeed": fired only ONCE then caused 10 crashes. Conclusions:
+- The buffer's commands are REAL and NEEDED — dropping them corrupts the game (can't bypass main's side).
+- The deadlock IS the gate, but the fix MUST be on the consumer side: make the RenderLoop DRAIN the command
+  buffer 0x35ef0c00+0x18. cellResc HLE is confirmed healthy (SetWaitFlip returns CELL_OK, SetConvertAndFlip posts
+  the frame-sync sem) — NOT the throttle.
+- Reverted (it was a regression).
+
+### Confirmed final gate + the one thing left to crack
+Producer-consumer deadlock: main fills the render-command ring buffer faster than the EE RenderLoop drains it;
+the RenderLoop's work queue empties (~32 cycles) and it stops draining → buffer fills → main stalls before the
+menu loop. cellResc is fine; vtables/ctors are fine; dispatch/registration/boot are fine. The ONLY remaining
+work is the RenderLoop's drain/work-item model: who enqueues RenderLoop work items, why the queue stops being
+refilled, and whether the emulator's PPU-thread scheduling lets the RenderLoop drain concurrently with main's
+fill. This needs a FRESH context — I have repeatedly misread the symbol-less disasm this session (the park spin,
+the 0x40fb88 dispatch, 0x3c4d08-as-writer, the base-type cascade were all wrong), a clear saturation signal at
+150 steps. The 6 solid facts are recorded above; the tree is clean (dispatch native, boots to cellResc, no regressions).
+
+## RELIABLE NARROWING (2026-06-04): emulator side RULED OUT — the deadlock is game-logic
+Verified via readable emulator C++ (NOT the unreliable disasm):
+- **Atomics/barriers correct:** SYNC/LWSYNC → `atomic_fence_seq_cst()`; LWARX/STWCX implemented with reservations.
+  So the cross-thread ring-buffer sync is sound — main and RenderLoop see a CONSISTENT buffer state (the buffer
+  really IS full; it's not a memory-ordering desync).
+- **PPU threads are parallel** (wasm pthreads/workers) — the RenderLoop CAN run concurrently with main; not a
+  scheduling-starvation issue.
+- **cellResc HLE healthy** (SetWaitFlip→OK, SetConvertAndFlip posts the frame sem) — not the throttle.
+- **File loading** not the issue (cellFs unlogged; progs.dat/snapshot.dat are emulator ELF-loader internals).
+So the deadlock is purely GAME-LOGIC: main's menu frame produces a >1MB command batch (4KB type-9 chunks) and the
+RenderLoop's work queue stops being refilled, so it stops draining. Neither side is an emulator bug.
+
+Useful facts surfaced from existing code comments:
+- Assets are **zlib-compressed, streamed by EE ResourceLoop** (200+). They DO load (reg 601/601).
+- A prior investigation found a **busy-spin at 0x41c294** (lwz r11,0x28(r3); polling [r3+0x28]; "never reaching a
+  GCM flip") — possibly the same or an adjacent gate to the 0x426400 park. Worth correlating in a fresh pass.
+
+### Definitive handoff
+The gate is a game-logic producer-consumer issue (RenderLoop work-queue refill / >1MB command batch), NOT any
+emulator subsystem (dispatch, atomics, scheduling, cellResc, file IO — all verified healthy). Reading the
+symbol-less PPU disasm reliably is the blocker, and this 155-step context is saturated for it. The right next
+method remains a **native-rpcs3 differential trace** (how does the EE RenderLoop drain/refill its work queue on a
+working build?) — pursued in a fresh context. All layers are mapped; the emulator is exonerated; the menu is one
+game-logic deadlock from rendering.
+
+---
+
+# ★★★ MAJOR PIVOT (2026-06-04): THE GAME-LOGIC GATE IS PASSED — the menu RUNS. The blocker is the RENDERER. ★★★
+
+Everything above this line that frames the problem as a **producer-consumer deadlock / game-logic gate** is
+**REFUTED** by direct, reliable evidence captured this session (real run logs + the actual screenshot, not disasm).
+Recorded here so no future session re-chases the deadlock red herring.
+
+## What a 120s capture (fcmd.png / fcmd_run.log) actually shows
+- **The game runs the menu loop.** `[P2-DRAW]` fires **8584 times**, cycling a *stable per-frame set of REAL
+  Terraria textures*: `0x7e9080 3900x3384` (main atlas), `0x4df0900 2048x2048`, two `486x142` (logo halves),
+  many `1024x436 / 1024x348 / 1024x372` panels, and a **`1x1` white texture** (`0x459ba00`). That 1×1-white +
+  atlas + panels pattern is the unmistakable signature of a **2D sprite batcher** — Terraria's title menu,
+  rendering every frame.
+- **3552 flips, frame=14403, 120 FPS, framebuffer `<CHANGED>`.** The display pipeline is alive and presenting
+  changing frames continuously to the end of the run.
+- **The "deadlock" was a misread.** main↔RenderLoop run a healthy two-semaphore ping-pong:
+  `0x96004500` (main→RenderLoop) and `0x96004600` (RenderLoop→main) **alternate cleanly all the way to the last
+  log line**. main's large "blocked-on-0x96004600 sample count" is just **normal per-frame vsync waiting**, not a
+  stall. The `[PARKCMD]` "park" detected earlier was transient, not terminal.
+- The earlier `[FRAMECMD]` "menu frame enqueues 1865 < normal 3821" was real but irrelevant — both frames
+  complete; the menu simply has a smaller command batch.
+
+## What is ACTUALLY on the canvas: green structured noise (NOT black, NOT the menu)
+The screenshot is **green horizontal-streak noise** with a live "120 FPS" overlay. That is the fingerprint of a
+texture being presented with the **wrong format/swizzle/pitch decode** — real data, wrong interpretation.
+
+## Why: the WebGPU renderer's `end()` is a NOP draw — there is no geometry rasterizer
+`rpcs3/ui_js/WebGPUGSRender.cpp::end()` (line ~130) calls **`execute_nop_draw()`** — *"Same body as NullGSRender —
+no actual draw. Phase 7+ will replace this with WGSL pipeline dispatch translated from RSX FP/VP."* The `P2-DRAW`
+block does **not** rasterize the scene; it only **captures the frame's last bound texture** (`s_frame_tex_host`)
+so `flip()` can blit that one texture full-screen via the M2a record/replay path. So:
+- The prior "the WebGPU renderer is built + de-risked" only covers the **clear → flip → present plumbing**, NOT
+  RSX **draw translation**. Real geometry is dropped on the floor; a single texture is blitted as a stand-in,
+  and even that blit mis-decodes the format → green noise.
+
+## The `verts=0` puzzle, resolved in source (NOT a real "no geometry" signal)
+All sampled draws log `[WGPU-DRAW] prim=8 verts=0 empty=0`. Per `NV47/FW/draw_call.hpp`:
+- `prim=8` = **QUADS** (sprite batch).
+- `empty=0` ⇒ the draw clause is **non-empty** (it HAS ranges).
+- `verts` comes from `get_elements_count()`, which returns **only the CURRENT range's count** (`get_range().count`),
+  not the total. `append()` (line 110) and `pass_count()` (line 214) show **count-0 "dangling barrier" ranges are
+  an expected state**. If `current_range_index` lands on a trailing barrier range, `get_elements_count()` returns 0
+  **while earlier ranges hold real geometry**. ⇒ `verts=0` is a **logging artifact**, not absence of geometry.
+- An `[APPEND]` probe was added to `draw_clause::append()` (the FIFO source) to capture the ground-truth per-draw
+  vertex counts the game submits — see verdict appended below.
+
+## The corrected roadmap to REAL menu pixels (no faked pixels)
+The game side is DONE. Two renderer-side pieces remain, both consuming **real** RSX state:
+1. **Recover the real draw geometry** — the QUAD vertex positions + UVs from the bound vertex arrays
+   (`vertex_data` / `register_vertex_info`), using the draw clause's real ranges (count confirmed by `[APPEND]`).
+2. **Rasterize textured quads in the WebGPU/flip path** — replace the NOP `end()` (or extend the M2a present) with
+   a real textured-quad raster that samples `fragment_textures[0]` with the **correct GCM format decode**
+   (0xa2=A1R5G5B5-LN, 0xa5=A8R8G8B8-LN, 0xa6, 0x83=A4R4G4B4, etc.) at the quads' UVs. That composites the real
+   sprites from the real atlas at their real positions = the real menu.
+
+Net: the menu is **one renderer (geometry + texture-decode) implementation away**, not one game-logic deadlock
+away. The emulator/game boot is fully working; focus all further effort on the RSX→WebGPU draw translation.
+
+## ★ verts=0 RESOLVED (2026-06-04): the menu draws are NV4097 INLINE ARRAYS (geometry was never missing)
+A clean run measurement settled it. With an `[APPEND]` probe on `draw_clause::append()` (the FIFO range path):
+- **159,864 draws → ZERO `[APPEND]` calls.** `append()` is never invoked for the menu.
+- Yet `[P2-DRAW]` fires (it requires `!dc.empty()`). The only way `empty()` is false without `append()` is
+  `command == inlined_array` with a populated `inline_vertex_array`.
+
+⇒ **Terraria's menu sprite batcher submits geometry via `NV4097` inline arrays** (`draw_inline_array`, nv4097.cpp
+:370 — sets `command=inlined_array`, pushes each word into `inline_vertex_array`, never calls `append()`).
+And `get_elements_count()` **returns 0 by design for inline arrays** (`draw_call.hpp:159`) — *that* is the entire
+source of the bogus `verts=0`. **The geometry was never missing.** It is sitting, self-contained, in
+`inline_vertex_array` (raw interleaved vertex words), with the per-attribute layout in `vertex_arrays_info[]`.
+
+### The decode recipe (already implemented in rpcs3 — `RSXDrawCommands.cpp::analyse_inputs_interleaved`)
+- For `command==inlined_array`: one interleaved block. For each attr `i` in `0..15` with `vertex_arrays_info[i].size()>0`:
+  it contributes `get_vertex_type_size_on_host(type,size)` bytes to the per-vertex **stride**.
+- `nverts = inline_vertex_array.size()*4 / stride`. Each vertex = the attrs concatenated at their offsets.
+- Attribute semantics (which index = position / texcoord / color) come from the vertex program inputs; a 2D
+  sprite batch is typically attr0=position, a texcoord attr, and a packed color attr.
+
+### Renderer roadmap to REAL menu pixels (belongs in PLAN-Vulkan-port-to-WebGPU.md)
+1. **Decode** `inline_vertex_array` → per-vertex position + UV (+ color) using `vertex_arrays_info[]`.
+2. **Transform** positions to clip space — apply the VP's MVP (the ortho matrix lives in `transform_constants`;
+   the `[VPCONST]` dump will show it) OR detect positions already in clip/screen space.
+3. **Rasterize** QUADS (prim=8): every 4 verts = 1 quad; sample `fragment_textures[0]` at the UVs with the
+   **correct GCM format decode** (0xa2=A1R5G5B5-LN, 0xa5=A8R8G8B8-LN, 0xa6, 0x83=A4R4G4B4 — the current M2a
+   whole-texture blit mis-decodes these → green noise). Composite into the color surface `flip()` presents.
+The `[INLDUMP]/[INLRAW]/[VPCONST]` probe (WebGPUGSRender::end) captures the exact format + sample values to drive
+this. This is real RSX state → real pixels; no faked pixels.
+
+## ⚠ RETRACTION (2026-06-04): the "inline arrays" conclusion was WRONG — a build-methodology error
+The section above concluding "the menu draws are NV4097 inline arrays" is **RETRACTED**. It rested on an
+`[APPEND]` probe showing 0 calls — but that probe was **never compiled into the running build**.
+
+**Root cause (methodology lesson — important):** the WASM build is TWO steps:
+  1. `cmake --build build_cmake/build/wasm-ninja --target rpcs3_emu`  ← rebuilds the EMUCORE static lib
+  2. `./build_wasm.sh 2048`                                            ← rebuilds ui_js + links EMUCORE → wasm
+`build_wasm.sh` uses `-DHAS_EMUCORE=ON` and only recompiles the `ui_js` TUs (WebGPUGSRender.cpp, Rpcs3VmJs.cpp).
+The `[APPEND]` probe lives in `draw_clause::append()`, which is only *called* from EMUCORE (`nv4097.cpp`). I ran
+only step 2, so `append()`-with-probe was never instantiated — `grep -a APPEND` on the served wasm = **0**. A null
+result from an uncompiled probe is meaningless. **RULE: for any probe in an EMUCORE file (PPUThread.cpp,
+draw_call.hpp::append, nv4097.cpp, sys_*.cpp …) you MUST run step 1 first; and ALWAYS `grep -a <TAG>` the served
+wasm to confirm the probe is actually present before trusting its output.**
+
+**What is reliably true:** the `INLDUMP` probe (in WebGPUGSRender.cpp = step-2, verified present in the served
+wasm via `grep -a INLDUMP`=1) is gated on `command == inlined_array`. It **never fired across 157,336 draws** ⇒
+**the draws are NOT inline arrays.** So `command = array` (or indexed) with a non-empty range list, and the
+universal `verts=0` is the **dangling-barrier artifact**: `get_elements_count()` returns only the CURRENT range,
+which is a trailing count-0 execution barrier, while the REAL geometry is the sum over all ranges. A `DRAWDBG`
+probe (command + `debug_total_elements()` across all ranges + `is_immediate` + per-attr layout) is now running to
+pin the exact model (DMA vertex arrays vs push-buffer immediate) and the real vertex count — the basis for the
+rasterizer. Net correction: geometry is in **draw ranges + vertex arrays/push-buffer**, NOT inline_vertex_array.
+
+## ★★★ CUT-1 SUCCESS (2026-06-04): REAL menu geometry on the canvas — the green noise is GONE ★★★
+The verified draw model (from the DRAWDBG/ATTRDBG/VPCONST run):
+- `cmd=array`, `prim=QUADS`, `immediate=0` (DMA vertex arrays), 1 range, 4–8 verts/draw (1–2 quads).
+- Vertex stride 20: **a0 = position (2 float)**, **a3 = color (4 unorm8)**, **a8 = texcoord (2 float)**.
+- `[VPCONST]` = orthographic matrix (`2/960`, `-2/540`, w=∓1) ⇒ **positions are SCREEN PIXELS (0..960, 0..540)**.
+
+Implemented a software quad rasterizer in `WebGPUGSRender::end()` (was `execute_nop_draw`): resolve the vertex
+stream address (`get_vertex_offset_from_base(vertex_data_base_offset, offset()&0x7fffffff)`, location = `offset()>>31`),
+read each quad's 4 vertices (BE floats), fill its screen-space AABB into the A8R8G8B8 color surface, and point M2a
+at that **clean 960×540 surface** so `flip()` blits it 1:1 (no format mismatch → no green noise).
+
+**The `[RAST]` dump confirmed the decode is EXACT:**
+```
+[RAST] q#1 pos[(0,0)(0,540)(960,540)(960,0)] uv0(0,0) uv2(1,1) col=2f2f2f2f surf=960x540
+[RAST] q#3 pos[(0,0)(0,540)(960,540)(960,0)] uv0(0,0) uv2(1,1) col=ffffffff surf=960x540
+```
+Positions are perfectly screen-space; UVs perfectly 0..1; vertex colors are real grayscale fade layers. The
+screenshot shows REAL colored rectangles at real menu positions (a white panel + a yellow UI element) at 120 FPS,
+no crash. **The whole chain is validated: vertex-address resolution → BE-float decode → rasterize → surface →
+present.** This is real RSX→pixels — no faked pixels.
+
+### CUT-2 (in progress): per-pixel texture sampling
+Swap the solid AABB fill for per-pixel sampling of `fragment_textures[0]` at the interpolated UVs, decode the
+LINEAR GCM formats the menu uses (A8R8G8B8=0x85, A1R5G5B5=0x82, A4R4G4B4=0x83; the big atlas is 0xa2 = A1R5G5B5
+linear), modulate by vertex color, alpha-test transparent atlas padding. Swizzled/unhandled formats (incl. the
+1×1-white solid-fill quads at 0x85 non-linear) gracefully fall back to flat vertex color. This turns the flat
+rectangles into the real menu art (logo, buttons, text). Remaining after Cut-2: alpha blending for fades, swizzle
+de-tiling for the swizzled atlases, and eventually a true GPU pipeline.
