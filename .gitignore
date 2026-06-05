@@ -147,3 +147,4 @@ js/rpcs3_browser/src/Rpcs3*.wasm
 # scripts/extract_pup.py / public/dev_flash docs.
 js/rpcs3_browser/public/dev_flash
 js/rpcs3_browser/public/PS3UPDAT.PUP
+js/rpcs3_browser/build
