@@ -7,9 +7,15 @@ module.exports = {
 
       // COOP/COEP are required for SharedArrayBuffer (pthread-backed WASM
       // workers) which the RPCS3 PPU/SPU JIT needs at runtime.
+      // no-store: the 14MB wasm was getting cached across rebuilds, so users kept
+      // running a stale (pre-fix) build no matter what we deployed. Forbid caching
+      // so every reload fetches the freshly-built wasm/js.
       config.headers = {
         'Cross-Origin-Embedder-Policy': 'require-corp',
-        'Cross-Origin-Opener-Policy': 'same-origin'
+        'Cross-Origin-Opener-Policy': 'same-origin',
+        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+        'Pragma': 'no-cache',
+        'Expires': '0'
       }
 
       return config;

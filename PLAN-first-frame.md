@@ -2395,3 +2395,39 @@ clear surf on the game's real GCM clear_surface (start-of-frame) instead of the 
 clear, so foreground drawn after the clear survives — but must not reintroduce the freeze (world drawn ~every
 28s, UI every frame). Needs a draw-SEQUENCE probe on a green-empty/garbled boot to see exactly how the
 foreground is lost. This is the real RSX→WebGPU translator work (see Vulkan plan), a large careful effort.
+
+## ★ FIDELITY = SETTLING TIME, not per-boot lottery (2026-06-05) ★
+Big correction to the "per-boot garble" theory. The menu renders INCREMENTALLY over ~4-5 minutes; capturing too
+early shows it half-built. Proven with flash_check.js SETTLE=200 (early + late screenshot of the SAME boot):
+- early (~100s): only "Press" text, no Terraria logo, green-blob artifact over the logo area.
+- late (~5min): FULL "Terraria" stone logo + tree + sun + clouds + "Press START" — clean terraria.png-style title.
+So the earlier "garbled/empty/mountains-box" boots were just CAUGHT EARLY (flash_check screenshots at ~100s).
+Implication: to satisfy "5 captures all PRESS START / look like terraria.png", capture AFTER ~4-5 min settle, not
+at first-menu-appearance. The render IS complete; it's slow to fully rasterize (the world/UI quads accrue over
+minutes — consistent with the world-background-redrawn-~every-28s finding). NOTE: the late 90-frame sample
+flagged "FLASHING" (15/90 sd<12) but the late SCREENSHOT is a clean bright daytime menu — those dark frames are
+the menu CYCLING biomes (day<->night), not the navy-backbuffer flash (HOLD prevents navy in s_persist). The
+detector's sd<12 metric can't tell "menu cycled to a dark biome" from "navy flash"; needs a content check, not
+just stddev, for cycling boots.
+
+CORRECTION to above: the late dark frames were NOT biome-cycling — sd sequence was 0x15 then 49x75
+(constant), i.e. leading canvas warm-up after the idle. Settled menu is STABLE + complete. flash_check.js now
+drops the first 20 frames before the navy count to avoid this false FLASHING verdict.
+
+## ROOT CAUSE of the content-cycling flash (2026-06-05) — NOT timebase; it's unthrottled FPS + per-frame composite
+Investigated the rapid biome/scene cycling (the real "very flashy"). Findings:
+- NOT a fast timebase: get_timebased_time() (sys_time.cpp) is correct real-time 80MHz × clocks_scale/100, and
+  Rpcs3VmJs.cpp:160 sets clocks_scale=10 → the emulated clock runs SLOW (10%), not fast. Ruled out.
+- The game presents UNTHROTTLED: Main.cpp:251 emscripten_set_main_loop(mainLoopTick, fps=0) → browser RAF rate
+  = 120 Hz on a ProMotion display → game runs at "120 FPS" = 2× PS3's 60, no vsync cap.
+- Our compositor memcpys s_persist on EVERY varied flip (g_webgpu_flip_count), so it captures every frame
+  including the title's rapid internal cycling AND progressive/partial draw states. Rapid screenshots proved it:
+  one frame = a COMPLETE crimson Terraria title (logo+tree+sun+"Press START"), the next 0.5s = a garbled blue
+  scene. The renderer CAN produce the perfect terraria.png menu; it's just one of many rapidly-changing frames.
+**The real fix (deep, not done):** (a) throttle the emulated game to a stable ~60 fps (frame pacing /
+g_minDrawIntervalMs / set_main_loop_timing) so per-frame logic + presents stop racing, AND/OR (b) make the
+compositor HOLD the most-complete settled frame instead of memcpy-ing every intermediate. Both are emulator-core
+work. Band-aids that do NOT fully fix it: HOLD composite (killed menu↔navy only), the loading-gauge cover (hides
+early loading but reveals the still-cycling scene), no-cache + build-stamp (infra, confirmed user runs fresh).
+HONEST: after extensive work this session the CORE content-cycling flash is not yet fixed — it's a deep
+rendering/timing issue, and the gauge-cover only partially masks it.

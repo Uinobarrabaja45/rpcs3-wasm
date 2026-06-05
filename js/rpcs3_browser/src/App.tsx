@@ -42,24 +42,40 @@ function LoadingGauge() {
   const [unmount, setUnmount] = useState(false);
   const startRef = useRef<number>(Date.now());
 
-  // End loading when real content is actually ON SCREEN. The signal is
-  // getContentFrames() — the count of VARIED composited frames, which stays 0
-  // through the all-black/navy boot and goes non-zero only once the game is
-  // visible. (getFrames counts boot keep-alive presents; getFlipCount counts the
-  // game's black boot flips — both fire too early, so neither works here.)
+  // End loading only when the SCENE VISUALLY STABILIZES — not at the first content
+  // frame. The title screen cycles violently between different biome renders for
+  // minutes while loading (the real "flashy" the user sees). getContentFrames /
+  // color-variance can't detect it (every cycling scene is high-variance), so we
+  // sample the canvas directly and watch frame-to-frame DIFFERENCE: large while
+  // cycling, near-zero once it settles. Hide the gauge after it holds steady.
   useEffect(() => {
     if (done) return;
     const start = startRef.current;
+    const W = 32, H = 18;
+    const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
+    const ctx = tmp.getContext('2d', { willReadFrequently: true });
+    let prev: Uint8ClampedArray | null = null;
+    let steady = 0;
     const id = setInterval(() => {
-      const m = Rpcs3Module as { getContentFrames?: () => number } | undefined;
-      const content = m && typeof m.getContentFrames === 'function' ? m.getContentFrames() : -1;
       const elapsed = (Date.now() - start) / 1000;
-      // content > 0 → a real (non-black) frame is on screen. content < 0 → older
-      // wasm without the accessor; fall back to a generous boot budget.
-      if (content > 0 || (content < 0 && elapsed > 300)) {
-        setDone(true);
+      const cv = document.getElementById('outputCanvas') as HTMLCanvasElement | null;
+      if (!cv || !ctx) { if (elapsed > 420) setDone(true); return; }
+      let cur: Uint8ClampedArray;
+      try { ctx.drawImage(cv, 0, 0, W, H); cur = ctx.getImageData(0, 0, W, H).data; }
+      catch { if (elapsed > 420) setDone(true); return; }
+      let sum = 0; for (let i = 0; i < cur.length; i += 4) sum += cur[i] + cur[i + 1] + cur[i + 2];
+      const mean = sum / (W * H * 3);
+      if (mean < 8) { steady = 0; prev = cur; if (elapsed > 420) setDone(true); return; } // still black/booting
+      if (prev) {
+        let diff = 0;
+        for (let i = 0; i < cur.length; i += 4) diff += Math.abs(cur[i] - prev[i]) + Math.abs(cur[i + 1] - prev[i + 1]) + Math.abs(cur[i + 2] - prev[i + 2]);
+        const avg = diff / (W * H * 3);
+        if (avg < 6) steady++; else steady = 0; // settled scene vs biome-cycling
       }
-    }, 250);
+      prev = cur;
+      // Settled ~1.5s steady → reveal the stable title. Hard 7-min cap as a backstop.
+      if (steady >= 7 || elapsed > 420) setDone(true);
+    }, 220);
     return () => clearInterval(id);
   }, [done]);
 
@@ -81,8 +97,11 @@ function LoadingGauge() {
   if (unmount) return null;
   const pct = Math.round(Math.min(100, progress));
   return (
-    <div
-      className={`loading-gauge${done ? ' loading-gauge--done' : ''}`}
+    <>
+      {/* Opaque full-screen backdrop hides the biome-cycling canvas behind the gauge until settled. */}
+      <div className={`loading-backdrop${done ? ' loading-backdrop--done' : ''}`} aria-hidden="true" />
+      <div
+        className={`loading-gauge${done ? ' loading-gauge--done' : ''}`}
       role="progressbar"
       aria-valuenow={pct}
       aria-valuemin={0}
@@ -95,8 +114,27 @@ function LoadingGauge() {
         <div className="loading-gauge__fill" style={{ width: `${pct}%` }} />
       </div>
       <div className="loading-gauge__pct">{pct}%</div>
-    </div>
+      </div>
+    </>
   );
+}
+
+// Shows the wasm's compile time (getBuildTag) in a corner. Its very presence means
+// the browser loaded the freshly-built wasm — a stale/old wasm has no getBuildTag,
+// so the tag stays hidden. Lets the user confirm they're not on a cached old build.
+function BuildTag() {
+  const [tag, setTag] = useState<string | null>(null);
+  useEffect(() => {
+    const id = setInterval(() => {
+      const m = Rpcs3Module as { getBuildTag?: () => string } | undefined;
+      if (m && typeof m.getBuildTag === 'function') {
+        try { const t = m.getBuildTag(); if (t) { setTag(t); clearInterval(id); } } catch { /* not ready */ }
+      }
+    }, 500);
+    return () => clearInterval(id);
+  }, []);
+  if (!tag) return null;
+  return <div className="build-tag">wasm&nbsp;{tag}</div>;
 }
 
 function App() {
@@ -189,6 +227,7 @@ function App() {
 
   return (
     <div className="App">
+      <BuildTag />
       {showFPS && state.value === 'loaded' && <Stats />}
       {bootHidden && <LoadingGauge />}
       {showPanel && (

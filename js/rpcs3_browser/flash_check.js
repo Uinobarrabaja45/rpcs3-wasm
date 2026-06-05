@@ -96,11 +96,17 @@ function run(wsUrl) {
         }
         if (!menu) { console.log('MENU NEVER APPEARED (timeout)'); ws.close(); chromeProcess.kill('SIGKILL'); process.exit(2); }
         console.log('menu detected — sampling 90 frames at full rate...');
+        // Early screenshot (right at menu detection), to compare against the settled one.
+        { const sh = await new Promise((res) => { const id = ++evalId; pending[id] = res; ws.send(JSON.stringify({ id, method: 'Page.captureScreenshot', params: { format: 'png' } })); }); const d = sh && sh.result && sh.result.data; if (d) { require('fs').writeFileSync('/Users/bank23232525/.gemini/antigravity/scratch/flashcheck_menu_early.png', Buffer.from(d, 'base64')); console.log('saved EARLY screenshot'); } }
+        // Optional settle wait (SETTLE seconds) before the sample/late-screenshot — tests whether the menu
+        // keeps rendering for minutes after first appearing (incremental completion).
+        const SETTLE = parseInt(process.env.SETTLE || '0', 10);
+        if (SETTLE > 0) { console.log(`settling ${SETTLE}s before final sample...`); await new Promise(r => setTimeout(r, SETTLE * 1000)); }
         const r = await evalInPage(ws, SAMPLER(90), true);
         const val = r && r.result && r.result.result ? r.result.result.value : undefined;
         let arr; try { arr = JSON.parse(val); } catch (e) { console.log('sample parse fail; raw=', JSON.stringify(r && r.result).slice(0, 200)); process.exit(3); }
         if (!Array.isArray(arr) || arr.some(x => x.err)) { console.log('canvas read errors:', JSON.stringify(arr).slice(0, 200)); }
-        const sds = arr.map(x => x.sd).filter(x => x != null);
+        const sds = arr.map(x => x.sd).filter(x => x != null).slice(20); // drop leading canvas warm-up frames (false navy)
         const navy = sds.filter(x => x < 12).length;   // uniform navy/black frame
         const varied = sds.filter(x => x > 18).length;  // real menu frame
         const min = Math.min(...sds), max = Math.max(...sds);

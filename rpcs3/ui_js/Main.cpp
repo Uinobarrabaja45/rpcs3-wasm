@@ -315,6 +315,9 @@ namespace
 		return 0;
 #endif
 	}
+	// Compile time of this wasm — shown in the UI so the user can tell at a glance
+	// whether their browser loaded the freshly-built (flash-fixed) wasm or a stale one.
+	std::string getBuildTag() { return std::string(__DATE__ " " __TIME__); }
 	void setResolution(int w, int h)
 	{
 		g_renderWidth = w;
@@ -340,6 +343,7 @@ EMSCRIPTEN_BINDINGS(rpcs3_js_module)
 	emscripten::function("getFrames",               &getFrames);
 	emscripten::function("getFlipCount",            &getFlipCount);
 	emscripten::function("getContentFrames",        &getContentFrames);
+	emscripten::function("getBuildTag",             &getBuildTag);
 	emscripten::function("clearStats",              &clearStats);
 	emscripten::function("setResolution",           &setResolution);
 	emscripten::function("setFrameskip",            &setFrameskip);

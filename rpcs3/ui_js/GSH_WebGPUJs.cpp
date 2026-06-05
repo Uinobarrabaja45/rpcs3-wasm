@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -221,10 +222,16 @@ bool CGSH_WebGPUJs::Render()
 		{
 			// M2a: if this frame recorded a textured draw, sample the GAME's real texture (record/replay)
 			// instead of the software-P2-DRAW VRAM copy. Clear-only frames fall back to the VRAM buffer.
-			const bool from_tex = (g_webgpu_tex_flip.load(std::memory_order_acquire) == flip);
+			// ALWAYS read the draw-surface snapshot (the asset we actually rasterized), NOT the raw flipped
+			// display buffer. The game double-buffers and flips an UNDRAWN/stale buffer on ~half its flips;
+			// reading g_webgpu_fb_host on those shows the WRONG asset, alternating right<->wrong frame-to-frame
+			// (user: "picking up the wrong asset and right one back-and-forth"). The snapshot holds the last
+			// drawn frame, so using it on EVERY flip removes the alternation. fb_host only before 1st snapshot.
+			const uint64_t s_texHost = g_webgpu_tex_host.load(std::memory_order_relaxed);
+			const bool from_tex = (s_texHost != 0);
 			const uint32_t src_pitch = from_tex ? g_webgpu_tex_pitch.load(std::memory_order_relaxed) : fb_pitch;
 			const uint8_t* base = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(
-				from_tex ? g_webgpu_tex_host.load(std::memory_order_relaxed)
+				from_tex ? s_texHost
 				         : g_webgpu_fb_host.load(std::memory_order_relaxed)));
 			static thread_local int s_m2a_log = 0;
 			if (from_tex && s_m2a_log++ < 2) printf("[GSH_WebGPUJs] M2a: sampling GAME texture via pipeline (record/replay), not the P2-DRAW VRAM copy\n");
@@ -264,7 +271,14 @@ bool CGSH_WebGPUJs::Render()
 				if (worldFrame)
 				{
 					g_webgpu_content_frames.fetch_add(1, std::memory_order_relaxed); // real content on screen -> JS gauge can hide
-					std::memcpy(s_persist.data(), m_fbStaging.data(), npix * 4);
+					// Throttle composite updates ~2.5s: the title cycles scenes every frame (unthrottled 120fps);
+					// memcpy-ing each one is the "very flashy". Holding each frame ~2.5s makes it change slowly.
+					static std::chrono::steady_clock::time_point s_lastUpd{}; static bool s_firstUpd = true;
+					const auto s_nowt = std::chrono::steady_clock::now();
+					if (s_firstUpd || std::chrono::duration<double>(s_nowt - s_lastUpd).count() > 2.5) {
+						std::memcpy(s_persist.data(), m_fbStaging.data(), npix * 4);
+						s_lastUpd = s_nowt; s_firstUpd = false;
+					}
 				}
 					// else: HOLD s_persist (the last varied/menu frame). Do NOT overlay low-variance frames — those ARE
 					// the game's uniform navy/black backbuffers (it double-buffers menu<->navy ~50/50). Overlaying their

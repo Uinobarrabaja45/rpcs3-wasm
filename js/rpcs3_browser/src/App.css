@@ -213,3 +213,37 @@ canvas {
   opacity: 0.7;
   letter-spacing: 0.02em;
 }
+
+/* Build-time stamp (bottom-left) — confirms the loaded wasm is the fresh build. */
+.build-tag {
+  position: fixed;
+  bottom: max(8px, env(safe-area-inset-bottom));
+  left: max(8px, env(safe-area-inset-left));
+  z-index: 1100;
+  padding: 3px 8px;
+  background-color: rgba(28, 28, 30, 0.55);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  color: rgba(255, 255, 255, 0.7);
+  border-radius: 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Full-screen opaque backdrop behind the loading gauge — hides the violently
+   cycling title canvas until the scene settles. Fades out with the gauge. */
+.loading-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1040;
+  background: radial-gradient(ellipse at center, #14151c 0%, #08090d 100%);
+  opacity: 1;
+  transition: opacity 0.6s ease;
+  pointer-events: none;
+}
+.loading-backdrop--done {
+  opacity: 0;
+}
