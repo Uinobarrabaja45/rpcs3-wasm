@@ -2358,3 +2358,40 @@ per-boot/per-biome draw-order-sensitive heuristics. **Fixing reliably = replacin
 composite tweak. trev proves the pipeline CAN produce the full terraria.png-style menu when the draw order is
 favorable. The flashing/consistency fix (variance gate + present throttle + accumulate-overlay) is INDEPENDENT
 and remains solid.
+
+## ★★★ FLASH — REAL ROOT CAUSE + FIX (2026-06-05, supersedes earlier "flashing fixed" claims above) ★★★
+The earlier "flashing fixed" sections were WRONG — they trusted 12s timelapse captures, which ALIAS the ~30/s
+menu↔navy flash and look stable while the LIVE canvas flashes hard. User confirmed twice it was "still very flashy".
+
+**Actual cause:** the GSH `Render` composite's `else` (low-variance) branch was an ACCUMULATE-OVERLAY
+(`for(i) if(px&0xffffff) s_persist[i]=px`). Low-variance frames ARE the game's uniform navy backbuffers, so the
+overlay copied navy into the held menu → every navy flip went navy, next menu flip restored it → flash. (I had
+even reverted TO this overlay earlier "for completeness" — it never helped; menu content comes from the
+high-variance memcpy, not the navy overlay.) Old `[STABLE]` data showed it: `persistC` alternated `fff088a0`
+(menu) ↔ `ff0d1710` (navy).
+
+**Fix:** HOLD — delete the overlay; on low-variance frames do nothing, so `s_persist` is only ever written by the
+menu memcpy and is always the menu → `m_fbTexture` always menu → every present is menu → no flash. Keep the
+variance gate, opaque-alpha repack, and present-throttle (necessary, not sufficient).
+
+**Verification (the right way):** `js/rpcs3_browser/flash_check.js` — headless boot with renderer/timer
+throttling disabled (full-rate rAF), wait for menu, sample the canvas per-frame via drawImage→getImageData for
+~90 frames, report per-frame color stddev. HOLD build result: 87/90 frames stddev>18 (varied menu), 0 navy
+frames interspersed → VERDICT STABLE. (12s captures can't see this — never trust them for flash.)
+
+## POST-FLASH-FIX STATUS (2026-06-05): flash done; fidelity is the deep remaining issue
+With the flash fixed (HOLD composite), `flash_check.js` across 3 fresh boots = 3/3 STABLE (no flash). BUT the
+menu CONTENT varies wildly per boot, now clearly visible since it no longer flashes:
+- boot A: real menu (sky/mountains/pines, varied sd 24-66)
+- boot B: night/corruption, "START" clear but "PRESS" garbled, no clean logo
+- boot C: near-EMPTY mint-green fill + a few gray artifact boxes + garbled glyphs (foreground didn't render)
+All three are STABLE (the flash fix works); the difference is rasterizer FIDELITY, not flash.
+
+Key fact for the fidelity work: per-frame color STDDEV does NOT distinguish good-menu from garbage — boot C's
+green/gray contrast reads sd up to 75 (higher than a real menu). So the compositor's variance gate can't reject
+garbage frames; this MUST be fixed at the rasterizer (end()), where the foreground quads are wiped/overwritten
+(draw-order + PERSIST-THE-WORLD clear, tangled with the anti-freeze world-persist model). Likely direction:
+clear surf on the game's real GCM clear_surface (start-of-frame) instead of the heuristic per-fullscreen-quad
+clear, so foreground drawn after the clear survives — but must not reintroduce the freeze (world drawn ~every
+28s, UI every frame). Needs a draw-SEQUENCE probe on a green-empty/garbled boot to see exactly how the
+foreground is lost. This is the real RSX→WebGPU translator work (see Vulkan plan), a large careful effort.

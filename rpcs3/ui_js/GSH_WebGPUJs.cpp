@@ -266,15 +266,11 @@ bool CGSH_WebGPUJs::Render()
 					g_webgpu_content_frames.fetch_add(1, std::memory_order_relaxed); // real content on screen -> JS gauge can hide
 					std::memcpy(s_persist.data(), m_fbStaging.data(), npix * 4);
 				}
-					else
-					{
-						// ACCUMULATE non-black menu content across frames. Some boots draw the menu incrementally —
-						// different glyphs/elements rasterize on different flips (observed: the press-start text varied
-						// frame-to-frame, "STAR"/"START"/"RT"). Overlaying non-black pixels onto the held composite builds
-						// up the COMPLETE menu (full logo + "Press START"), which a single held frame misses. The memcpy
-						// above resets it on each varied full frame, bounding stale accumulation.
-						for (size_t i = 0; i < npix; i++) { const uint32_t px = m_fbStaging[i]; if (px & 0x00ffffffu) s_persist[i] = px; }
-					}
+					// else: HOLD s_persist (the last varied/menu frame). Do NOT overlay low-variance frames — those ARE
+					// the game's uniform navy/black backbuffers (it double-buffers menu<->navy ~50/50). Overlaying their
+					// non-black navy pixels overwrites the held menu with navy, and the next menu flip restores it: that
+					// menu<->navy alternation, ~30/s, IS the live flash (12s timelapse captures alias it and look stable).
+					// The menu's real content arrives in the high-variance memcpy above, so holding loses no content.
 				{
 					wgpu::TexelCopyTextureInfo dst = {};
 					dst.texture = m_fbTexture;
