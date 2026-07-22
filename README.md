@@ -11,6 +11,12 @@ This browser build is packaged and shipped as part of **RTM EMU**:
 
 [**RTM EMU — PS3, PS2, PC Games on the App Store**](https://apps.apple.com/us/app/rtm-emu-ps3-ps2-pc-games/id6756944097)
 
+## Please support the people who actually built the emulator
+
+Every bit of real emulation in this project is their work — this fork only carries it to the browser. If you get value out of it, please support them directly:
+
+* **RPCS3** — [rpcs3.net](https://rpcs3.net/) · [Patreon](https://www.patreon.com/Nekotekina)
+
 ## Running
 
 ### Prerequisites
