@@ -1,48 +1,88 @@
-RPCS3
-=====
+RPCS3-WASM
+==========
 
-[![GitHub Actions](https://img.shields.io/github/actions/workflow/status/RPCS3/rpcs3/rpcs3.yml?branch=master&logo=github&label=Actions)](https://github.com/RPCS3/rpcs3/actions/workflows/rpcs3.yml)
-[![RPCS3 Discord Server](https://img.shields.io/discord/272035812277878785?color=5865F2&label=RPCS3%20Discord&logo=discord&logoColor=white)](https://discord.gg/rpcs3)
+A fork of [**RPCS3**](https://github.com/RPCS3/rpcs3) — the open-source PlayStation 3 emulator — focused on compiling to **WebAssembly** so it runs directly in a web browser.
 
-The world's first free and open-source PlayStation 3 emulator/debugger, written in C++ for Windows, Linux, macOS and FreeBSD.
+The emulator core is built with [Emscripten](https://emscripten.org/) and driven by a React front-end that renders through **WebGPU**. PPU/SPU JIT execution runs on pthread-backed WASM workers, which is why the app requires `SharedArrayBuffer` (and therefore COOP/COEP headers) at runtime.
 
-You can find some basic information on our [**website**](https://rpcs3.net/). Game info is being populated on the [**Wiki**](https://wiki.rpcs3.net/).
-For discussion about this emulator, PS3 emulation, and game compatibility reports, please visit our [**forums**](https://forums.rpcs3.net) and our [**Discord server**](https://discord.gg/RPCS3).
+## RTM EMU on the App Store
 
-[**Support Lead Developers Nekotekina and kd-11 on Patreon**](https://www.patreon.com/Nekotekina)
+This browser build is packaged and shipped as part of **RTM EMU**:
 
-## Contributing
-
-If you want to help the project but do not code, the best way to help out is to test games and make bug reports. See:
-* [Quickstart](https://rpcs3.net/quickstart)
-
-If you want to contribute as a developer, please take a look at the following pages:
-
-* [Coding Style](https://github.com/RPCS3/rpcs3/wiki/Coding-Style)
-* [Developer Information](https://github.com/RPCS3/rpcs3/wiki/Developer-Information)
-
-You should also contact any of the developers in the forums or in the Discord server to learn more about the current state of the emulator.
-
-### AI Use
-
-Use of AI tools for research and reverse engineering purposes is permitted. However, contributors are expected to fully own and understand all code they submit. Any communication with the team — including code, code comments, and GitHub comments — must come from the human contributor, not an AI agent acting autonomously.
-
-We have unfortunately seen a rise in untested and unverified AI-generated slop being submitted to this project. This wastes maintainer time and, in worse cases, such changes get merged and break functionality for all users. Repeated violations will result in a ban from the repository. Please be respectful of everyone's time.
-
-**Pull requests opened by AI agents or automated tools must include a disclosure in the PR description** stating the scope of AI involvement — which parts were AI-generated and what human testing or review was performed prior to submission. PRs that omit this disclosure may be closed without review.
-
-If you are unsure about your work, open a discussion issue to talk it through with the team, or reach out to a maintainer on [Discord](https://discord.gg/RPCS3).
-
-## Building
-
-See [BUILDING.md](BUILDING.md) for more information about how to setup an environment to build RPCS3.
+[**RTM EMU — PS3, PS2, PC Games on the App Store**](https://apps.apple.com/us/app/rtm-emu-ps3-ps2-pc-games/id6756944097)
 
 ## Running
 
-Check our friendly [quickstart](https://rpcs3.net/quickstart) guide to make sure your computer meets the minimum system requirements to run RPCS3.
+### Prerequisites
 
-Don't forget to have your graphics driver up to date and to install the [Visual C++ Redistributable Packages for Visual Studio 2022](https://aka.ms/vs/17/release/VC_redist.x64.exe) if you are a Windows user.
+| Tool | Purpose |
+| --- | --- |
+| [Emscripten SDK (emsdk)](https://emscripten.org/docs/getting_started/downloads.html) | Compiles the C++ core to WASM |
+| CMake + Ninja | Build system for the WASM target |
+| Python 3 | Used by the build script (and the static server) |
+| Node.js (18+ recommended) | Runs the React front-end |
+
+### 1. Build the WASM core
+
+The `.wasm` / `.js` artifacts are **not committed** to this repo (they're ~30 MB per variant), so you must build them before the front-end will run.
+
+```bash
+# Point the shell at your emsdk install
+source /path/to/emsdk/emsdk_env.sh
+
+# Build a memory variant — 1024 is the recommended default
+./build_wasm.sh 1024
+```
+
+Recognised variants are `512`, `1024`, `2048`, and `Dyna`. Passing no arguments builds all four.
+
+| Variant | Memory | Notes |
+| --- | --- | --- |
+| `512` | 0.5 GB | Size-optimised (`-Oz`) for low-RAM devices |
+| `1024` | 1.0 GB | **Default** — comfortable floor for JIT + Emscripten overhead |
+| `2048` | 2.0 GB | Headroom for commercial games |
+| `Dyna` | growable | Starts small and grows; for memory-constrained devices |
+
+> A PS3 baseline is 256 MB main RAM + 256 MB RSX VRAM. Once the JIT translation cache and Emscripten overhead are added, 1 GB is the practical minimum.
+
+The script deploys the built `Rpcs3<variant>.js` and `Rpcs3<variant>.wasm` into `js/rpcs3_browser/src/` and `js/rpcs3_browser/public/`.
+
+### 2. Run the front-end
+
+```bash
+cd js/rpcs3_browser
+npm install
+npm start
+```
+
+Then open:
+
+```
+http://localhost:3030/?ram=1024&webgpu=true
+```
+
+The `ram` parameter must match a variant you actually built. Other supported URL parameters include `game`, `hd`, `mute`, and `compare`.
+
+The dev server sets the required `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` headers automatically (see `config-overrides.js`) — without them `SharedArrayBuffer` is unavailable and the emulator will not start.
+
+### Production build
+
+```bash
+npm run build
+```
+
+The output **must** be served with the same COOP/COEP headers. A minimal static server that sets them is included:
+
+```bash
+python3 server.py 8000
+```
+
+## Building the native emulator
+
+For the standard desktop builds of RPCS3, see [BUILDING.md](BUILDING.md).
 
 ## License
 
-Most files are licensed under the terms of GNU GPL-2.0-only License; see LICENSE file for details. Some files may be licensed differently; check appropriate file headers for details.
+Most files are licensed under the terms of the GNU GPL-2.0-only License; see the [LICENSE](LICENSE) file for details. Some files may be licensed differently; check the appropriate file headers for details.
+
+All credit for the underlying emulator goes to the [RPCS3 team](https://github.com/RPCS3/rpcs3) and its contributors.
