@@ -1,0 +1,42 @@
+name: Browser frontend build
+
+on:
+  push:
+    paths:
+      - 'js/rpcs3_browser/**'
+      - '.github/workflows/browser-build.yml'
+  pull_request:
+    paths:
+      - 'js/rpcs3_browser/**'
+      - '.github/workflows/browser-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: js/rpcs3_browser
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: js/rpcs3_browser/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build browser application
+        run: npm run build
+        env:
+          CI: "false"
