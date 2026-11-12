@@ -215,9 +215,59 @@ function App() {
     if (extension === '.ps3z') {
       setPs3zMessage('Comprobando archivo PS3Z...');
 
+
       try {
         const reader = await Ps3zReader.open(file);
         const eboots = reader.findFilesByName('EBOOT.BIN');
+
+        const normalizePath = (path: string) =>
+          path.replace(/\\/g, '/').replace(/^\/+/, '');
+
+        const normalizedEboots = eboots.map(entry => ({
+          path: normalizePath(entry.path),
+        }));
+
+        // Preferimos la ubicación habitual de un juego de PS3.
+        const selectedEboot =
+          normalizedEboots.find(item =>
+            /(^|\/)PS3_GAME\/USRDIR\/EBOOT\.BIN$/i.test(item.path)
+          ) ??
+          normalizedEboots.find(item =>
+            /(^|\/)USRDIR\/EBOOT\.BIN$/i.test(item.path)
+          ) ??
+          normalizedEboots.find(item =>
+            /(^|\/)EBOOT\.BIN$/i.test(item.path)
+          );
+
+        let expectedParamSfo = '';
+        let hasParamSfo = false;
+
+        if (selectedEboot) {
+          const ebootPath = selectedEboot.path;
+          const lowerPath = ebootPath.toLowerCase();
+          const suffix = 'usrdir/eboot.bin';
+          const suffixIndex = lowerPath.lastIndexOf(suffix);
+
+          let gameDirectory = '';
+
+          if (
+            suffixIndex >= 0 &&
+            (suffixIndex === 0 || lowerPath[suffixIndex - 1] === '/')
+          ) {
+            gameDirectory = ebootPath.slice(0, suffixIndex).replace(/\/$/, '');
+          } else {
+            const lastSlash = ebootPath.lastIndexOf('/');
+            gameDirectory = lastSlash >= 0
+              ? ebootPath.slice(0, lastSlash)
+              : '';
+          }
+
+          expectedParamSfo = gameDirectory
+            ? `${gameDirectory}/PARAM.SFO`
+            : 'PARAM.SFO';
+
+          hasParamSfo = !!reader.getFile(expectedParamSfo);
+        }
 
         const ebootMessage = eboots.length > 0
           ? eboots.slice(0, 10).map(entry => entry.path).join('\n')
@@ -229,8 +279,11 @@ function App() {
           'Archivos: ' + reader.totalFiles + '\n' +
           'Tamaño: ' + (reader.totalBytes / 1024 / 1024 / 1024).toFixed(2) + ' GB\n' +
           'EBOOT.BIN encontrados: ' + eboots.length + '\n' +
+          'EBOOT seleccionada: ' + (selectedEboot?.path || 'No encontrada') + '\n' +
+          'PARAM.SFO: ' + (hasParamSfo ? 'Encontrado' : 'No encontrado') + '\n' +
+          'Ruta PARAM.SFO esperada: ' + (expectedParamSfo || 'No determinada') + '\n\n' +
           ebootMessage +
-          '\n\nTodavía no está conectado al sistema de arranque de RPCS3.'
+          '\n\nTodavía no se ha iniciado el juego: falta conectar el dispositivo virtual PS3Z.'
         );
       } catch (error) {
         setPs3zMessage(
