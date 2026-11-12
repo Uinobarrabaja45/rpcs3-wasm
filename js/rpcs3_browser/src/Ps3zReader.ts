@@ -37,6 +37,13 @@ export interface Ps3zFileEntry {
   chunks: Ps3zChunk[];
 }
 
+export interface Ps3zDirectoryEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size: number;
+}
+
 interface Ps3zManifest {
   format: 'PS3Z';
   version: 1;
