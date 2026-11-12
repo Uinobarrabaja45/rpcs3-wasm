@@ -36,6 +36,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Create temporary WASM stubs for frontend check
+        run: |
+          for variant in Rpcs3512 Rpcs31024 Rpcs32048 Rpcs3Dyna; do
+            cat > "src/${variant}.js" <<'EOF'
+          export default async function () {
+            throw new Error("WASM module not present in frontend-only CI build.");
+          }
+          EOF
+          done
+
       - name: Build browser application
         run: npm run build
         env:
