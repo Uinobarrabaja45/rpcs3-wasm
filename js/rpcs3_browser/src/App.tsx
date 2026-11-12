@@ -3,6 +3,7 @@ import { ChangeEvent, useState, useEffect, useRef } from 'react';
 import { Rpcs3Module } from './Rpcs3Module';
 import { useAppDispatch, useAppSelector, bootFile, init } from "./Actions";
 import { getRunnableGame } from './Games';
+import Ps3zReader from './Ps3zReader';
 
 // Fixed-ROM fileserver — matches Play!'s `loadFixedRomAndState=true` flow
 // but on port 8008 (Play! uses :3000 for its CI server). Run a local static
@@ -155,6 +156,7 @@ function App() {
 
   const [bootHidden, setBootHidden] = useState(false);
   const [fixedRomTriggered, setFixedRomTriggered] = useState(false);
+  const [ps3zMessage, setPs3zMessage] = useState('');
 
   // Auto-initialize the WASM module on mount unless explicitly disabled.
   // The Play! flow used dispatch(init()) from index.tsx; here we do the
@@ -204,12 +206,45 @@ function App() {
     })();
   }, [state.value, loadFixedRom, fixedRomTriggered, fixedGameKey, dispatch]);
 
-  const onPickFile = (e: ChangeEvent<HTMLInputElement>) => {
+  const onPickFile = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      dispatch(bootFile(file));
-      setBootHidden(true);
+    if (!file) return;
+
+    const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+
+    if (extension === '.ps3z') {
+      setPs3zMessage('Comprobando archivo PS3Z...');
+
+      try {
+        const reader = await Ps3zReader.open(file);
+        const eboots = reader.findFilesByName('EBOOT.BIN');
+
+        const ebootMessage = eboots.length > 0
+          ? eboots.slice(0, 10).map(entry => entry.path).join('\n')
+          : 'No se ha encontrado EBOOT.BIN.';
+
+        setPs3zMessage(
+          'PS3Z reconocido. Índice verificado.\n' +
+          'Carpeta: ' + reader.rootName + '\n' +
+          'Archivos: ' + reader.totalFiles + '\n' +
+          'Tamaño: ' + (reader.totalBytes / 1024 / 1024 / 1024).toFixed(2) + ' GB\n' +
+          'EBOOT.BIN encontrados: ' + eboots.length + '\n' +
+          ebootMessage +
+          '\n\nTodavía no está conectado al sistema de arranque de RPCS3.'
+        );
+      } catch (error) {
+        setPs3zMessage(
+          'Error al comprobar PS3Z: ' +
+          (error instanceof Error ? error.message : String(error))
+        );
+      }
+
+      return;
     }
+
+    setPs3zMessage('');
+    dispatch(bootFile(file));
+    setBootHidden(true);
   };
 
   const onBootXmb = () => {
@@ -239,11 +274,26 @@ function App() {
           <div>
             <input
               type="file"
-              accept=".iso,.bin,.pkg,.elf,.self"
+              accept=".iso,.bin,.pkg,.elf,.self,.ps3z"
               onChange={onPickFile}
               disabled={state.value !== 'initialized'}
             />
           </div>
+
+          {ps3zMessage && (
+            <pre style={{
+              marginTop: 12,
+              padding: 12,
+              background: '#222',
+              color: '#fff',
+              whiteSpace: 'pre-wrap',
+              overflowWrap: 'anywhere',
+              fontSize: 12
+            }}>
+              {ps3zMessage}
+            </pre>
+          )}
+
           <div style={{ marginTop: 12 }}>
             <button onClick={onBootXmb} disabled={state.value !== 'initialized'}>
               Boot XMB
