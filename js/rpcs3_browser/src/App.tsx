@@ -4,6 +4,7 @@ import { Rpcs3Module } from './Rpcs3Module';
 import { useAppDispatch, useAppSelector, bootFile, init } from "./Actions";
 import { getRunnableGame } from './Games';
 import Ps3zReader from './Ps3zReader';
+import Ps3zDevice from './Ps3zDevice';
 
 // Fixed-ROM fileserver — matches Play!'s `loadFixedRomAndState=true` flow
 // but on port 8008 (Play! uses :3000 for its CI server). Run a local static
@@ -218,6 +219,21 @@ function App() {
 
       try {
         const reader = await Ps3zReader.open(file);
+
+        // Registrar el dispositivo PS3Z en el objeto JS del módulo WASM.
+        // Esto prepara el lado JavaScript; todavía no conecta el VFS de C++.
+        if (!Rpcs3Module || !Rpcs3Module.HEAPU8) {
+          throw new Error('El módulo WASM no está preparado.');
+        }
+
+        const ps3zDevice = new Ps3zDevice(Rpcs3Module, reader);
+        Rpcs3Module.ps3zDevice = ps3zDevice;
+
+        const rootInfo = ps3zDevice.getPathInfo('');
+        console.log('[PS3Z] Dispositivo JS registrado:', {
+          hasBundle: ps3zDevice.hasBundle(),
+          root: rootInfo,
+        });
         const eboots = reader.findFilesByName('EBOOT.BIN');
 
         const normalizePath = (path: string) =>
